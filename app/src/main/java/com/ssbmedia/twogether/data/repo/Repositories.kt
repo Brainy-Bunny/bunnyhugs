@@ -119,8 +119,12 @@ class MomentRepository(private val dao: MomentDao) {
     suspend fun getAll(): List<Moment> = dao.getAll()
     suspend fun getBySyncId(syncId: String): Moment? = dao.getBySyncId(syncId)
 
-    suspend fun add(photoUri: String, sessionId: Long?): Long =
-        dao.insert(Moment(photoUri = photoUri, takenAt = System.currentTimeMillis(), sessionId = sessionId))
+    /** [takenAt] defaults to "now" for a live camera capture (CameraScreen); a gallery backfill
+     * (GalleryImportFlow) passes the date the user picked instead, so the resulting Moment groups under
+     * that PAST day everywhere takenAt is read (MomentsScreen's day grouping, CalendarScreen's
+     * daysWithPhotos), never under today. */
+    suspend fun add(photoUri: String, sessionId: Long?, takenAt: Long = System.currentTimeMillis()): Long =
+        dao.insert(Moment(photoUri = photoUri, takenAt = takenAt, sessionId = sessionId))
 
     /** Feature 2: called once GattSyncManager has fully received a photo's bytes, written them to a temp
      * file, and successfully renamed that into place at the Moment's real photoUri - see

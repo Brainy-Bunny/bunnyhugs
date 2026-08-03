@@ -23,6 +23,7 @@ import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -40,6 +41,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.events.AppEvents
+import com.ssbmedia.twogether.ui.moments.GalleryImportHost
 import kotlinx.coroutines.launch
 import java.io.File
 import java.text.SimpleDateFormat
@@ -85,6 +87,12 @@ fun CameraScreen(onSaved: () -> Unit, onCancel: () -> Unit) {
         }
     }
 
+    // "Choose from gallery instead" reuses the exact same pick -> copy-to-local-storage ->
+    // date-assignment flow MomentsScreen's gallery FAB triggers (see GalleryImportFlow.kt) - a
+    // gallery-backfilled Moment is a legitimate alternative to a live capture right from this screen,
+    // not just from Moments. onImported reuses the existing showSaved/LaunchedEffect(showSaved) ->
+    // onSaved() path below exactly like a successful live capture does.
+    GalleryImportHost(onImported = { showSaved = true }) { launchGalleryPicker ->
     Box(modifier = Modifier.fillMaxSize()) {
         if (hasPermission) {
             AndroidView(
@@ -149,6 +157,7 @@ fun CameraScreen(onSaved: () -> Unit, onCancel: () -> Unit) {
                 if (isSaving) {
                     CircularProgressIndicator()
                 } else {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     FloatingActionButton(
                         onClick = {
                             val capture = imageCapture ?: return@FloatingActionButton
@@ -193,9 +202,19 @@ fun CameraScreen(onSaved: () -> Unit, onCancel: () -> Unit) {
                     ) {
                         Text("📸")
                     }
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f)),
+                        modifier = Modifier.padding(top = 12.dp)
+                    ) {
+                        TextButton(onClick = launchGalleryPicker) {
+                            Text("Choose from gallery instead")
+                        }
+                    }
+                    }
                 }
             }
         }
+    }
     }
 
     LaunchedEffect(showSaved) {

@@ -20,6 +20,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
@@ -30,6 +31,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -84,21 +86,32 @@ fun MomentsScreen(onBack: () -> Unit, onNavigateCamera: () -> Unit) {
         moments.groupBy { Instant.ofEpochMilli(it.takenAt).atZone(zone).toLocalDate() }
     }
 
-    Scaffold(
-        topBar = {
-            CenterAlignedTopAppBar(
-                title = { Text("Our Moments") },
-                navigationIcon = {
-                    IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "Back") }
+    // Backfill entry point: "Choose from gallery" sits as a small companion FAB above the existing
+    // camera FAB (a lightweight speed-dial rather than a menu, since there are only ever two actions
+    // here) - see GalleryImportFlow.kt for the pick -> copy-to-local-storage -> date-assignment flow
+    // this triggers. New Moments land in the same observeAll() Flow this screen already collects, so
+    // nothing else here needs to change once GalleryImportHost's onImported fires.
+    GalleryImportHost(onImported = {}) { launchGalleryPicker ->
+        Scaffold(
+            topBar = {
+                CenterAlignedTopAppBar(
+                    title = { Text("Our Moments") },
+                    navigationIcon = {
+                        IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "Back") }
+                    }
+                )
+            },
+            floatingActionButton = {
+                Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    SmallFloatingActionButton(onClick = launchGalleryPicker) {
+                        Icon(Icons.Filled.PhotoLibrary, contentDescription = "Choose from gallery")
+                    }
+                    FloatingActionButton(onClick = onNavigateCamera) {
+                        Icon(Icons.Filled.PhotoCamera, contentDescription = "Take a photo")
+                    }
                 }
-            )
-        },
-        floatingActionButton = {
-            FloatingActionButton(onClick = onNavigateCamera) {
-                Icon(Icons.Filled.PhotoCamera, contentDescription = "Take a photo")
             }
-        }
-    ) { padding ->
+        ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
             if (transferring.isNotEmpty()) {
                 Row(
@@ -157,6 +170,7 @@ fun MomentsScreen(onBack: () -> Unit, onNavigateCamera: () -> Unit) {
         selected?.let { moment ->
             MomentFullScreen(moment = moment, isTransferring = moment.syncId in transferring, onDismiss = { selected = null })
         }
+    }
     }
 }
 
