@@ -26,6 +26,13 @@
          release exists, download its signed APK asset - never used for anything else. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Auto-update: needed both to query packageManager.canRequestPackageInstalls() and to actually
+         launch the ACTION_VIEW install intent for the downloaded APK (see UpdateInstallActivity) -
+         without this declared, canRequestPackageInstalls() itself throws SecurityException. Normal
+         (not dangerous/runtime) permission - the real user-facing gate is the separate per-app
+         "install unknown apps" toggle that canRequestPackageInstalls() reflects. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 

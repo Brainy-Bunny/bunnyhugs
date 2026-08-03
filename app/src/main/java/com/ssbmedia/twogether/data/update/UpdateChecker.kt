@@ -92,9 +92,14 @@ object UpdateChecker {
             }
             val downloadUrl = apkUrl ?: return null
 
+            // Deliberately NOT the release's free-text "name" field (e.g. "Twogether v1.1") - that's
+            // written by whoever cuts the release and already tends to include the app's own name,
+            // which would double up awkwardly wherever this versionName gets embedded in UI text (the
+            // notification body, the manual-check dialog). The tag itself (e.g. "v2") is guaranteed
+            // short and consistently formatted, since it's exactly what checkAndNotify just parsed.
             UpdateInfo(
                 versionCode = versionCode,
-                versionName = json.optString("name", tagName).ifBlank { tagName },
+                versionName = tagName,
                 downloadUrl = downloadUrl
             )
         } catch (e: Exception) {
