@@ -37,7 +37,7 @@ object ServiceLocator {
     val sessionRepository: SessionRepository by lazy { SessionRepository(database.sessionDao()) }
     val dateIdeaRepository: DateIdeaRepository by lazy { DateIdeaRepository(database.dateIdeaDao()) }
     val timeCapsuleRepository: TimeCapsuleRepository by lazy { TimeCapsuleRepository(database.timeCapsuleDao()) }
-    val momentRepository: MomentRepository by lazy { MomentRepository(database.momentDao()) }
+    val momentRepository: MomentRepository by lazy { MomentRepository(database.momentDao(), appContext) }
     val momentNoteRepository: MomentNoteRepository by lazy { MomentNoteRepository(database.momentNoteDao()) }
     val milestoneRepository: MilestoneRepository by lazy { MilestoneRepository(database.milestoneDao()) }
 

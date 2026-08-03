@@ -1,5 +1,6 @@
 package com.ssbmedia.twogether.data.repo
 
+import android.content.Context
 import com.ssbmedia.twogether.data.db.DateIdea
 import com.ssbmedia.twogether.data.db.DateIdeaDao
 import com.ssbmedia.twogether.data.db.Milestone
@@ -13,6 +14,7 @@ import com.ssbmedia.twogether.data.db.TimeCapsuleDao
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.data.db.TogetherSessionDao
 import kotlinx.coroutines.flow.Flow
+import java.io.File
 import java.util.UUID
 
 class SessionRepository(private val dao: TogetherSessionDao) {
@@ -114,7 +116,7 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
     }
 }
 
-class MomentRepository(private val dao: MomentDao) {
+class MomentRepository(private val dao: MomentDao, private val context: Context) {
     fun observeAll(): Flow<List<Moment>> = dao.observeAll()
     suspend fun getAll(): List<Moment> = dao.getAll()
     suspend fun getBySyncId(syncId: String): Moment? = dao.getBySyncId(syncId)
@@ -142,11 +144,57 @@ class MomentRepository(private val dao: MomentDao) {
      * OTHER device's database and is meaningless (and potentially misleading/coincidentally-colliding)
      * here. isRemote is always forced true for anything inserted by this path, regardless of what the
      * sender claimed, since by definition anything we didn't already have locally originated elsewhere.
+     *
+     * SECURITY / DATA-INTEGRITY (was the top blocker of this pass): [it.photoUri] here is WIRE DATA from
+     * the partner device and is NEVER trusted as a local filesystem path - the local `photoUri` column is
+     * always overwritten below with [localPhotoFile], a path deterministically derived from the moment's
+     * own [Moment.syncId] (a UUID, already trusted as an identifier for merge/dedup). This is the ONLY
+     * place a remote-stub row's local photoUri is ever set, so it's correct from the very first
+     * metadata-only insert onward - GattSyncManager.savePhotoBytes later just writes bytes to this same
+     * already-safe path (see its own doc + canonical-path assertion for the defense-in-depth half of
+     * this fix). Previously the raw wire value was stored verbatim, which (a) let two devices' Moments
+     * silently collide onto the SAME local file when both captured a photo in the same clock second
+     * (CameraScreen names files by second-granularity timestamp, and both phones share the same
+     * filesDir/moments/ layout under the same applicationId) - overwriting a real local photo with the
+     * partner's incoming bytes with zero attacker involved - and (b) let a malicious authenticated peer
+     * (anyone who knows the pairing handshake token) point photoUri at an arbitrary app-writable path
+     * (e.g. the Room DB file) for savePhotoBytes to later overwrite.
      */
     suspend fun mergeRemoteStubs(remote: List<Moment>) {
         val localSyncIds = dao.getAll().mapNotNull { it.syncId.takeIf { id -> id.isNotBlank() } }.toSet()
         val toInsert = remote.filter { it.syncId.isNotBlank() && it.syncId !in localSyncIds }
-        toInsert.forEach { dao.insert(it.copy(id = 0, sessionId = null, isRemote = true)) }
+        toInsert.forEach {
+            // The wire's photoUri string is used for NOTHING but a best-effort file-extension hint here -
+            // extensionFromHint() only ever extracts and validates a short suffix against a hardcoded
+            // allowlist, so even a maliciously-crafted string (path traversal, absolute path, etc.) can
+            // never influence the actual destination directory - see localPhotoFile()/sanitizeExtension().
+            val safePath = localPhotoFile(context, it.syncId, extensionFromHint(it.photoUri)).absolutePath
+            dao.insert(it.copy(id = 0, sessionId = null, isRemote = true, photoUri = safePath))
+        }
+    }
+
+    companion object {
+        private val SAFE_PHOTO_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp")
+
+        /** Extracts a bare extension (no dots/slashes/path separators) from an untrusted hint string and
+         * validates it against a small hardcoded allowlist - defaults to "jpg" (what CameraX always
+         * produces) for anything unrecognized, blank, or unsafe. Never used to build a directory, only a
+         * file suffix on an already-safe base path - see [localPhotoFile]. */
+        fun extensionFromHint(hint: String): String {
+            val ext = File(hint).extension.lowercase()
+            return if (ext in SAFE_PHOTO_EXTENSIONS) ext else "jpg"
+        }
+
+        /** The ONE place a remote Moment's local photo destination is computed: deterministic, keyed only
+         * by the moment's own syncId (a UUID) inside this app's own filesDir/moments/ directory - never
+         * influenced by anything the network peer sent beyond the sanitized extension. Because every
+         * remote-stub row gets its own unique syncId-derived path, two moments can never collide onto the
+         * same file the way second-granularity capture-timestamp filenames could. */
+        fun localPhotoFile(context: Context, syncId: String, extension: String): File {
+            val safeExt = if (extension in SAFE_PHOTO_EXTENSIONS) extension else "jpg"
+            val dir = File(context.filesDir, "moments")
+            return File(dir, "$syncId.$safeExt")
+        }
     }
 }
 

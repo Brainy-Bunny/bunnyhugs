@@ -26,7 +26,9 @@ import com.ssbmedia.twogether.data.repo.SessionRepository
 import com.ssbmedia.twogether.events.AppEvents
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
@@ -207,6 +209,12 @@ class GattSyncManager(
         return arr
     }
 
+    /** SECURITY: `photoUri` here is UNTRUSTED wire data from the network peer and must NEVER be used as a
+     * local filesystem path - it's carried through only so MomentRepository.mergeRemoteStubs can pull a
+     * best-effort, allowlist-sanitized file-EXTENSION hint out of it (see that function's doc for the
+     * full story of why, and MAX_PHOTO_FRAME_BYTES-style reasoning). The actual local photoUri column is
+     * always overwritten by mergeRemoteStubs with a path deterministically derived from [syncId] before
+     * this Moment is ever inserted into Room. */
     private fun deserializeMoments(arr: JSONArray?): List<Moment> {
         if (arr == null) return emptyList()
         return (0 until arr.length()).mapNotNull { i ->
@@ -404,18 +412,48 @@ class GattSyncManager(
         AppEvents.setMomentsTransferring(AppEvents.momentsTransferring.value - syncId)
         if (moment.photoDownloaded) return
         val destFile = File(moment.photoUri)
+
+        // BLOCKER fix, defense-in-depth layer: moment.photoUri is ALWAYS derived from syncId now (never
+        // the wire value - see MomentRepository.mergeRemoteStubs's doc, which is where this is actually
+        // guaranteed), but this hard assertion is what stops a future regression anywhere upstream from
+        // ever turning back into an arbitrary-file-write - refuse to write anywhere outside this app's
+        // own filesDir/moments/ directory, checked via the CANONICAL path (not a naive string prefix, so
+        // ".." components can't fool it).
+        val momentsDirCanonical = try {
+            File(context.filesDir, "moments").canonicalFile
+        } catch (e: Exception) {
+            Log.w(TAG, "Refusing to save photo for moment $syncId - couldn't canonicalize moments dir", e)
+            return
+        }
+        val destCanonical = try {
+            destFile.canonicalFile
+        } catch (e: Exception) {
+            Log.w(TAG, "Refusing to save photo for moment $syncId - couldn't canonicalize destination path", e)
+            return
+        }
+        if (destCanonical.parentFile != momentsDirCanonical) {
+            Log.w(TAG, "Refusing to save photo for moment $syncId - resolved path $destCanonical is outside $momentsDirCanonical")
+            return
+        }
+
         val tempFile = File(destFile.parentFile ?: context.filesDir, "${destFile.name}.part")
         try {
-            destFile.parentFile?.mkdirs()
-            tempFile.outputStream().use { it.write(bytes) }
-            if (!tempFile.renameTo(destFile)) {
-                tempFile.copyTo(destFile, overwrite = true)
-                tempFile.delete()
+            // MAJOR fix: this file I/O previously ran on whatever dispatcher GattSyncManager was
+            // constructed with (ProximityForegroundService passes lifecycleScope, i.e.
+            // Dispatchers.Main.immediate) - risking jank/ANR. GalleryImportFlow/BackupManager already
+            // correctly use Dispatchers.IO for their own file work; this matches that.
+            withContext(Dispatchers.IO) {
+                destFile.parentFile?.mkdirs()
+                tempFile.outputStream().use { it.write(bytes) }
+                if (!tempFile.renameTo(destFile)) {
+                    tempFile.copyTo(destFile, overwrite = true)
+                    tempFile.delete()
+                }
             }
             momentRepository.markPhotoDownloaded(syncId)
         } catch (e: Exception) {
             Log.w(TAG, "Failed to save received photo for moment $syncId", e)
-            tempFile.delete()
+            withContext(Dispatchers.IO) { tempFile.delete() }
         }
     }
 
@@ -735,7 +773,10 @@ class GattSyncManager(
             if (!moment.photoDownloaded) continue
             val file = File(moment.photoUri)
             if (!file.isFile) continue
-            val bytes = try { file.readBytes() } catch (e: Exception) { continue }
+            // MAJOR fix: file reads inherit this class's dispatcher (Dispatchers.Main.immediate via
+            // ProximityForegroundService's lifecycleScope) unless explicitly moved off it - see
+            // savePhotoBytes's doc.
+            val bytes = try { withContext(Dispatchers.IO) { file.readBytes() } } catch (e: Exception) { continue }
             framesToSend += buildPhotoDataFrame(id, bytes)
         }
         framesToSend += buildPhotoDoneFrame()
@@ -979,7 +1020,17 @@ class GattSyncManager(
 
                 if (characteristic.uuid == BleConstants.PHOTO_CHARACTERISTIC_UUID) {
                     val flag = value[0]
-                    if (value.size > 1) clientPhotoIncoming.write(value, 1, value.size - 1)
+                    if (value.size > 1) {
+                        // MINOR fix: mirror the server-side serverPhotoIncoming cap (see
+                        // handleServerPhotoChunk) - without this, a malformed/malicious peer that never
+                        // sends the LAST flag could grow this buffer unbounded.
+                        if (clientPhotoIncoming.size() + value.size - 1 > MAX_PHOTO_FRAME_BYTES) {
+                            Log.w(TAG, "Incoming photo frame from server exceeded sanity cap - dropping")
+                            clientPhotoIncoming.reset()
+                        } else {
+                            clientPhotoIncoming.write(value, 1, value.size - 1)
+                        }
+                    }
                     if (flag == BleConstants.CHUNK_FLAG_LAST) {
                         val frame = clientPhotoIncoming.toByteArray()
                         clientPhotoIncoming.reset()
@@ -1086,9 +1137,25 @@ class GattSyncManager(
         withTimeoutOrNull(PHOTO_PHASE_TIMEOUT_MILLIS) {
             if (toRequestIds.isNotEmpty()) AppEvents.setMomentsTransferring(toRequestIds.toSet())
 
+            // MINOR fix (E): arm the DONE/received-count signal BEFORE any frames are sent, not right
+            // before done.await() further down. Pushes (our writes) and the server's response
+            // (notifications back to us) are two independent GATT-level channels that can interleave -
+            // the server can start responding to our PHOTO_REQUEST (and even finish, notifying its own
+            // DONE marker) while we're still mid-flight sending our own push frames/the request itself.
+            // Arming late used to mean an early DONE/DATA frame arriving before this was set just got
+            // silently dropped (processPhotoFrame's `photoDoneSignal?.complete` is a safe no-op on a null
+            // reference), stalling the client for the full PHOTO_PHASE_TIMEOUT_MILLIS instead of
+            // completing promptly. Completing a CompletableDeferred before anyone awaits it is fine -
+            // done.await() below just returns immediately in that case.
+            val done = if (toRequestIds.isNotEmpty()) CompletableDeferred<Unit>() else null
+            photoDoneSignal = done
+            clientPhotoExpectedCount = toRequestIds.size
+            clientPhotoReceivedCount = 0
+
             val frames = mutableListOf<ByteArray>()
             for (moment in toSend) {
-                val bytes = try { File(moment.photoUri).readBytes() } catch (e: Exception) { null } ?: continue
+                // MAJOR fix: keep this file read off the Main dispatcher - see savePhotoBytes's doc.
+                val bytes = try { withContext(Dispatchers.IO) { File(moment.photoUri).readBytes() } } catch (e: Exception) { null } ?: continue
                 frames += buildPhotoDataFrame(moment.syncId, bytes)
             }
             if (toRequestIds.isNotEmpty()) frames += buildPhotoRequestFrame(toRequestIds)
@@ -1102,13 +1169,7 @@ class GattSyncManager(
                 sendComplete.await()
             }
 
-            if (toRequestIds.isNotEmpty()) {
-                val done = CompletableDeferred<Unit>()
-                photoDoneSignal = done
-                clientPhotoExpectedCount = toRequestIds.size
-                clientPhotoReceivedCount = 0
-                done.await()
-            }
+            done?.await()
         }
 
         // Whether we finished cleanly, timed out, or the connection dropped mid-phase - always clear any
@@ -1150,8 +1211,13 @@ class GattSyncManager(
 
         /** Feature 2: hard ceiling on the whole photo phase (push + request/receive combined) so a
          * stalled connection or an unexpectedly huge single photo can never hang a sync indefinitely -
-         * see runPhotoPhaseAsClient's doc. */
-        private const val PHOTO_PHASE_TIMEOUT_MILLIS = 45_000L
+         * see runPhotoPhaseAsClient's doc. MAJOR fix: bumped from 45s to 100s as a second layer of safety
+         * margin on top of ImageDownscaler's pre-transfer resize (~1280px/78% JPEG, typically well under
+         * 500KB) - real BLE conditions vary (obstacles, interference, other radio traffic), and even a
+         * downscaled photo at the low end of real-world throughput (~5 kB/s) deserves more headroom than
+         * 45s, especially now that up to MAX_PHOTOS_PER_DIRECTION_PER_SESSION*2 photos can share one
+         * phase. */
+        private const val PHOTO_PHASE_TIMEOUT_MILLIS = 100_000L
 
         /** Feature 2: sanity ceiling on a single reassembled photo frame's size, purely defensive against
          * a bug or a misbehaving already-authenticated peer sending chunks without ever sending a LAST

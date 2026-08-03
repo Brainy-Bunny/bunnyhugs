@@ -135,26 +135,45 @@ object UpdateChecker {
      * Streams [downloadUrl] to this app's app-specific external files directory (falls back to
      * cacheDir if external storage isn't mounted) - no storage permission needed either way, since
      * this is app-private storage, and it's exactly what file_paths.xml exposes via FileProvider for
-     * the install intent. Overwrites any previously-downloaded update.
+     * the install intent.
+     *
+     * MAJOR fix: downloads to a temp ".part" file first and only renames it onto the real, fixed,
+     * notification-linked [APK_FILE_NAME] path once the download is FULLY successful - same
+     * temp-file-then-rename pattern already used by GattSyncManager.savePhotoBytes and
+     * BackupManager.createBackup/publishBackup. Previously this wrote straight onto the final path,
+     * truncating it immediately - so a later re-check (the daily UpdateWorker, or a manual re-check)
+     * that starts downloading again while an earlier COMPLETE download is still sitting there
+     * un-installed, and then fails partway (network drop), left the file corrupted while the "Update
+     * available" notification still pointed at it. Now only a fully successful download ever touches the
+     * real path, so an already-good, notification-linked APK can never be clobbered by a failed re-try.
      */
     private fun downloadApk(context: Context, downloadUrl: String): File? {
         var connection: HttpURLConnection? = null
+        val dir = context.getExternalFilesDir(null) ?: context.cacheDir
+        val outFile = File(dir, APK_FILE_NAME)
+        val tempFile = File(dir, "$APK_FILE_NAME.part")
         return try {
-            val dir = context.getExternalFilesDir(null) ?: context.cacheDir
-            val outFile = File(dir, APK_FILE_NAME)
             connection = (URL(downloadUrl).openConnection() as HttpURLConnection).apply {
                 connectTimeout = 15_000
                 readTimeout = 30_000
                 instanceFollowRedirects = true
             }
             connection.connect()
-            if (connection.responseCode !in 200..299) return null
+            if (connection.responseCode !in 200..299) {
+                tempFile.delete()
+                return null
+            }
             connection.inputStream.use { input ->
-                FileOutputStream(outFile).use { output -> input.copyTo(output) }
+                FileOutputStream(tempFile).use { output -> input.copyTo(output) }
+            }
+            if (!tempFile.renameTo(outFile)) {
+                tempFile.copyTo(outFile, overwrite = true)
+                tempFile.delete()
             }
             outFile
         } catch (e: Exception) {
             Log.w(TAG, "APK download failed", e)
+            tempFile.delete()
             null
         } finally {
             connection?.disconnect()

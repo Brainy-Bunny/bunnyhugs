@@ -69,6 +69,20 @@ class ProximityForegroundService : LifecycleService() {
     // transition - see startGattSyncIfNeeded's fix comment for the full explanation).
     private var gattReadyForSession = false
 
+    // MAJOR fix (D): shared "one CLIENT-role sync attempt at a time" guard across all three trigger
+    // paths (the 15-minute periodic ticker, the manualSyncRequests collector, and onPartnerSeen's
+    // transition-triggered call) - see startGattSyncIfNeeded's doc for why this specifically guards the
+    // client role. Without this, a periodic tick could fire connectAsClient() while an earlier
+    // per-action-triggered attempt's photo phase (which can run for many seconds) is still in flight;
+    // connectAsClient() unconditionally tears down and replaces any existing in-flight connection, so an
+    // overlapping call would silently abort a real transfer already in progress rather than let it
+    // finish - and since mergeRemoteSessions/mergeRemoteStubs (Repositories.kt) do a non-atomic
+    // check-then-insert with no DB-level uniqueness constraint on syncId, two genuinely concurrent
+    // exchanges could each independently decide "this syncId isn't present yet" and both insert,
+    // producing duplicate rows (e.g. a photo appearing twice in the gallery).
+    private val syncGuardLock = Any()
+    private var clientSyncAttemptInProgress = false
+
     override fun onCreate() {
         super.onCreate()
         advertiser = AdvertiserManager(this)
@@ -165,6 +179,7 @@ class ProximityForegroundService : LifecycleService() {
                     gattReadyForSession = false
                     gattSync.stopServer()
                     gattSync.disconnectClient()
+                    resetClientSyncGuard()
                 } catch (e: Exception) {
                     Log.e(TAG, "Unpaired-event teardown failed", e)
                 }
@@ -273,6 +288,7 @@ class ProximityForegroundService : LifecycleService() {
                         gattSync.stopServer()
                         gattSync.disconnectClient()
                         gattReadyForSession = false
+                        resetClientSyncGuard()
                     }
                 }
             }
@@ -503,6 +519,7 @@ class ProximityForegroundService : LifecycleService() {
         gattReadyForSession = false
         gattSync.stopServer()
         gattSync.disconnectClient()
+        resetClientSyncGuard()
         updateNotification(now)
     }
 
@@ -584,7 +601,11 @@ class ProximityForegroundService : LifecycleService() {
         val onResult: (Boolean) -> Unit = { success ->
             lifecycleScope.launch {
                 if (success) ServiceLocator.settingsStore.setLastSyncAt(System.currentTimeMillis())
-                if (manual) AppEvents.emitSyncCompleted(success)
+                // MINOR fix (H): always emit (not just for manual=true triggers) - Date Ideas screen's
+                // "Last synced Xm ago" should refresh after ANY sync that actually completed, including
+                // the 15-minute periodic catch-all, not just a manual "Sync now" tap. Harmless when
+                // nothing is collecting (MutableSharedFlow just buffers/drops).
+                AppEvents.emitSyncCompleted(success)
             }
         }
 
@@ -598,7 +619,23 @@ class ProximityForegroundService : LifecycleService() {
             if (manual) AppEvents.emitSyncListening()
             gattSync.startServer(handshakeToken, onResult)
         } else {
-            gattSync.connectAsClient(device, handshakeToken, onResult)
+            // MAJOR fix (D): only ever one CLIENT-role attempt in flight - see clientSyncAttemptInProgress's
+            // doc above. The server role isn't guarded here: GattSyncManager.startServer is already
+            // idempotent (a no-op re-open when already listening, see its own doc) and non-blocking, so
+            // it doesn't represent an exclusive "attempt in flight" the way connectAsClient's
+            // JSON-exchange-plus-photo-phase does.
+            val acquired = synchronized(syncGuardLock) {
+                if (clientSyncAttemptInProgress) false else { clientSyncAttemptInProgress = true; true }
+            }
+            if (!acquired) {
+                Log.d(TAG, "Skipping client sync attempt - another one is already in flight")
+                if (manual) AppEvents.emitSyncCompleted(false)
+                return
+            }
+            gattSync.connectAsClient(device, handshakeToken) { success ->
+                synchronized(syncGuardLock) { clientSyncAttemptInProgress = false }
+                onResult(success)
+            }
         }
     }
 
@@ -656,12 +693,31 @@ class ProximityForegroundService : LifecycleService() {
     private fun updateBatteryOptimizationNotification() {
         val ignoring = BatteryOptimization.isIgnoring(this)
         if (ignoring == lastBatteryOptimizationIgnored) return
-        lastBatteryOptimizationIgnored = ignoring
         if (ignoring) {
+            // cancel() is always effective (idempotent even if nothing was showing), so it's always safe
+            // to latch this state immediately.
             Notifications.cancelBatteryWarning(this)
+            lastBatteryOptimizationIgnored = true
         } else {
-            Notifications.showBatteryWarning(this)
+            // MINOR fix (F): only latch "already nagged for this state" once the notification actually
+            // posted - Notifications.showBatteryWarning silently no-ops if POST_NOTIFICATIONS isn't
+            // granted (same pattern as showPhotoReminder). Latching unconditionally used to mean: deny
+            // notifications once while not-ignoring, latch false here regardless, and then NEVER post
+            // even after later granting POST_NOTIFICATIONS - every later tick's
+            // `ignoring == lastBatteryOptimizationIgnored` check would keep short-circuiting before ever
+            // retrying the notify() call.
+            if (Notifications.showBatteryWarning(this)) {
+                lastBatteryOptimizationIgnored = false
+            }
         }
+    }
+
+    /** Releases the client-role sync-attempt guard (see clientSyncAttemptInProgress's doc) - called from
+     * every path that forcibly tears down the GATT client outside of connectAsClient's own onSyncDone
+     * callback (unpair, Bluetooth toggled off, an apart transition, service destruction), so the guard
+     * can never get stuck permanently true if that external teardown happens to suppress the callback. */
+    private fun resetClientSyncGuard() {
+        synchronized(syncGuardLock) { clientSyncAttemptInProgress = false }
     }
 
     private fun formatDuration(millis: Long): String {
@@ -678,6 +734,7 @@ class ProximityForegroundService : LifecycleService() {
         scanner.stop()
         gattSync.stopServer()
         gattSync.disconnectClient()
+        resetClientSyncGuard()
         bluetoothStateReceiver?.let {
             try { unregisterReceiver(it) } catch (e: Exception) { /* not registered / already gone */ }
         }

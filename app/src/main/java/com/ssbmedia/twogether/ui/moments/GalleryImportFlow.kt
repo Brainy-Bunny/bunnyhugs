@@ -27,6 +27,7 @@ import androidx.compose.ui.unit.dp
 import androidx.exifinterface.media.ExifInterface
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.events.AppEvents
+import com.ssbmedia.twogether.util.ImageDownscaler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -138,17 +139,22 @@ private fun parseExifDateTime(raw: String): LocalDate? = try {
  * why a plain content:// reference isn't good enough. Returns null (rather than throwing into the
  * caller's coroutine) if the source stream can't be opened or the copy fails partway (e.g. storage
  * full); the dialog simply stays open with isSaving reset so the user can retry or cancel. */
-private fun copyPickedImageToMomentsDir(context: Context, uri: Uri): File? = try {
-    val outputDir = File(context.filesDir, "moments").apply { mkdirs() }
-    val ext = extensionFor(context.contentResolver, uri)
-    val outputFile = File(outputDir, "gallery_${System.currentTimeMillis()}.$ext")
-    val copied = context.contentResolver.openInputStream(uri)?.use { input ->
-        outputFile.outputStream().use { output -> input.copyTo(output) }
-        true
-    } ?: false
-    if (copied) outputFile else null
-} catch (e: Exception) {
-    null
+private fun copyPickedImageToMomentsDir(context: Context, uri: Uri): File? {
+    return try {
+        val outputDir = File(context.filesDir, "moments").apply { mkdirs() }
+        val ext = extensionFor(context.contentResolver, uri)
+        val outputFile = File(outputDir, "gallery_${System.currentTimeMillis()}.$ext")
+        val copied = context.contentResolver.openInputStream(uri)?.use { input ->
+            outputFile.outputStream().use { output -> input.copyTo(output) }
+            true
+        } ?: false
+        if (!copied) return null
+        // MAJOR fix: downscale before this Moment is ever queued for BLE sync - see ImageDownscaler's
+        // doc. Caller already runs this inside Dispatchers.IO.
+        ImageDownscaler.downscaleIfNeeded(outputFile)
+    } catch (e: Exception) {
+        null
+    }
 }
 
 private fun extensionFor(resolver: ContentResolver, uri: Uri): String {

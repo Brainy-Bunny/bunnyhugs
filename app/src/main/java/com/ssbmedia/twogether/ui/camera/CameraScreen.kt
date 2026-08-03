@@ -42,7 +42,10 @@ import androidx.core.content.ContextCompat
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.ui.moments.GalleryImportHost
+import com.ssbmedia.twogether.util.ImageDownscaler
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -172,8 +175,15 @@ fun CameraScreen(onSaved: () -> Unit, onCancel: () -> Unit) {
                                 object : ImageCapture.OnImageSavedCallback {
                                     override fun onImageSaved(output: ImageCapture.OutputFileResults) {
                                         scope.launch {
+                                            // MAJOR fix: downscale before this Moment is ever queued for
+                                            // BLE sync - a real camera JPEG (3-5MB) essentially never
+                                            // finishes transferring at real BLE throughput otherwise. See
+                                            // ImageDownscaler's doc for the "downscaled copy only" choice.
+                                            val finalFile = withContext(Dispatchers.IO) {
+                                                ImageDownscaler.downscaleIfNeeded(outputFile)
+                                            }
                                             val openSession = ServiceLocator.sessionRepository.getOpenSession()
-                                            ServiceLocator.momentRepository.add(outputFile.absolutePath, openSession?.id)
+                                            ServiceLocator.momentRepository.add(finalFile.absolutePath, openSession?.id)
                                             isSaving = false
                                             showSaved = true
                                             // A new photo only auto-syncs out via the next apart->together

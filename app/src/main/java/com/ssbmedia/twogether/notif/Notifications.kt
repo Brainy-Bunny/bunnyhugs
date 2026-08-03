@@ -231,10 +231,14 @@ object Notifications {
             .build()
     }
 
-    fun showBatteryWarning(context: Context) {
-        if (!BlePermissions.hasNotificationPermission(context)) return
-        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+    /** Returns true iff the warning was actually posted, so callers don't latch "already nagged for this
+     * state" when nothing was shown (e.g. notification permission denied) - mirrors showPhotoReminder's
+     * pattern. See ProximityForegroundService.updateBatteryOptimizationNotification's doc. */
+    fun showBatteryWarning(context: Context): Boolean {
+        if (!BlePermissions.hasNotificationPermission(context)) return false
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return false
         manager.notify(BATTERY_WARNING_NOTIFICATION_ID, buildBatteryWarningNotification(context))
+        return true
     }
 
     fun cancelBatteryWarning(context: Context) {
