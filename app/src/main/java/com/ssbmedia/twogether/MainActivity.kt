@@ -5,9 +5,13 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -16,6 +20,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.font.FontWeight
 import androidx.core.content.ContextCompat
 import com.ssbmedia.twogether.ble.BlePermissions
 import com.ssbmedia.twogether.data.datastore.AppSettings
@@ -72,7 +79,25 @@ class MainActivity : ComponentActivity() {
                     when {
                         loadedPairing == null || loadedSettings == null -> {
                             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                CircularProgressIndicator()
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(text = "💕", fontSize = 40.sp)
+                                    Text(
+                                        text = "Twogether",
+                                        style = MaterialTheme.typography.headlineSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(top = 4.dp, bottom = 20.dp)
+                                    )
+                                    CircularProgressIndicator()
+                                    // Book-dedication-style personal credit, shown only for the brief
+                                    // moment this loading gate is up while DataStore resolves - subtle,
+                                    // not attention-grabbing, and never gates or restricts anything.
+                                    Text(
+                                        text = "Inspired by My Cutie Kachvii 💚",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(top = 16.dp)
+                                    )
+                                }
                             }
                         }
                         !loadedPairing.isPaired -> PairingScreen(onPaired = { startProximityService() })

@@ -10,7 +10,7 @@ import java.util.UUID
 
 @Database(
     entities = [TogetherSession::class, DateIdea::class, TimeCapsule::class, Moment::class, MomentNote::class, Milestone::class],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -99,6 +99,24 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v3 -> v4, Feature 2 (photo sync): adds moments.photoDownloaded, splitting "do I have the
+         * actual photo bytes locally" out of isRemote's "whose photo is this / did metadata arrive via
+         * sync" (see Moment.photoDownloaded's doc). Backfilled true for every existing row by the
+         * ALTER TABLE default (a photo taken on this device, or already-downloaded before this
+         * migration, genuinely has real bytes sitting at photoUri already) then flipped back to false
+         * for whatever's currently a remote stub (isRemote=1) - those never had real bytes under the old
+         * metadata-only sync, which is exactly what GattSyncManager's new photo-transfer phase now goes
+         * and fetches on the next together-session. Never destructive - no existing Moment row, file, or
+         * any other table is touched, only this one new column.
+         */
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE moments ADD COLUMN photoDownloaded INTEGER NOT NULL DEFAULT 1")
+                db.execSQL("UPDATE moments SET photoDownloaded = 0 WHERE isRemote = 1")
+            }
+        }
+
         fun get(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -106,7 +124,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "twogether.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                     // Safety net only for a FUTURE schema version we didn't write a real migration for -
                     // the 1->2 and 2->3 paths above are always handled for real, so existing users'
                     // sessions/moments/date-ideas/capsules/notes/milestones are never silently wiped by this.

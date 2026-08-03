@@ -1,5 +1,6 @@
 package com.ssbmedia.twogether.ui.stats
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -9,6 +10,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -19,6 +21,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -26,6 +29,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
+import com.ssbmedia.twogether.stats.DateRange
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.stats.Trend
 import com.ssbmedia.twogether.ui.components.SectionHeader
@@ -44,8 +48,24 @@ class StatsViewModel : ViewModel() {
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), com.ssbmedia.twogether.data.datastore.ProximityPersistedState())
 }
 
+/**
+ * Feature 1: every stat card below that's meaningfully drill-down-able now takes an onClick that routes
+ * to a dedicated detail screen (wired from NavGraph). Two cards ("Days together", "Longest single day",
+ * "Together since") route to the existing Calendar screen instead of a new screen - either plain, or
+ * jumped/highlighted via [onOpenCalendarWithArgs] - see [Screen.Calendar]'s doc for why that's a single
+ * shared destination rather than three near-duplicate ones.
+ */
 @Composable
-fun StatsScreen(onBack: () -> Unit, onOpenBadges: () -> Unit) {
+fun StatsScreen(
+    onBack: () -> Unit,
+    onOpenBadges: () -> Unit,
+    onOpenHoursDetail: () -> Unit,
+    onOpenCalendar: () -> Unit,
+    onOpenMonthlyDetail: (metric: String) -> Unit,
+    onOpenFavoriteDayDetail: () -> Unit,
+    onOpenGapsDetail: () -> Unit,
+    onOpenCalendarWithArgs: (jumpToEpochDay: Long?, highlightStartEpochDay: Long?, highlightEndEpochDay: Long?) -> Unit
+) {
     val vm: StatsViewModel = viewModel(factory = SimpleViewModelFactory { StatsViewModel() })
     val sessions by vm.sessions.collectAsState()
     val proximityState by vm.proximityState.collectAsState()
@@ -53,6 +73,15 @@ fun StatsScreen(onBack: () -> Unit, onOpenBadges: () -> Unit) {
     // timeout - see StatsCalculator.effectiveOpenSessionCutoff's doc.
     val stats = remember(sessions, proximityState.lastSeenAt) {
         StatsCalculator.compute(sessions, lastSeenAt = proximityState.lastSeenAt)
+    }
+    // Feature 1: the actual calendar-date span of the longest daily/weekly streak, so "Longest streak"
+    // cards can jump Calendar there and highlight it - see StatsCalculator's doc for why this is a
+    // separate call from stats.longestDailyStreak/longestWeeklyStreak (which only expose the length).
+    val longestDailyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt) {
+        StatsCalculator.longestDailyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt)
+    }
+    val longestWeeklyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt) {
+        StatsCalculator.longestWeeklyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt)
     }
 
     Scaffold(
@@ -75,14 +104,16 @@ fun StatsScreen(onBack: () -> Unit, onOpenBadges: () -> Unit) {
                         label = "Hours together",
                         value = "${"%.1f".format(stats.totalHoursAllTime)}h",
                         modifier = Modifier.weight(1f),
-                        containerColor = MaterialTheme.colorScheme.primaryContainer
+                        containerColor = MaterialTheme.colorScheme.primaryContainer,
+                        onClick = onOpenHoursDetail
                     )
                     StatCard(
                         emoji = "🗓️",
                         label = "Days together",
                         value = "${stats.totalDaysTogether}",
                         modifier = Modifier.weight(1f),
-                        containerColor = MaterialTheme.colorScheme.primaryContainer
+                        containerColor = MaterialTheme.colorScheme.primaryContainer,
+                        onClick = onOpenCalendar
                     )
                 }
             }
@@ -98,14 +129,30 @@ fun StatsScreen(onBack: () -> Unit, onOpenBadges: () -> Unit) {
                 SectionHeader("Streaks")
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
                     StatCard(emoji = "🔥", label = "Daily streak (current)", value = "${stats.currentDailyStreak}d", modifier = Modifier.weight(1f))
-                    StatCard(emoji = "🏆", label = "Daily streak (longest)", value = "${stats.longestDailyStreak}d", modifier = Modifier.weight(1f))
+                    StatCard(
+                        emoji = "🏆",
+                        label = "Daily streak (longest)",
+                        value = "${stats.longestDailyStreak}d",
+                        modifier = Modifier.weight(1f),
+                        onClick = longestDailyStreakRange?.let { range ->
+                            { onOpenCalendarWithArgs(null, range.start.toEpochDay(), range.end.toEpochDay()) }
+                        }
+                    )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
                     StatCard(emoji = "🌟", label = "Weekly streak (current)", value = "${stats.currentWeeklyStreak}w", modifier = Modifier.weight(1f))
-                    StatCard(emoji = "✨", label = "Weekly streak (longest)", value = "${stats.longestWeeklyStreak}w", modifier = Modifier.weight(1f))
+                    StatCard(
+                        emoji = "✨",
+                        label = "Weekly streak (longest)",
+                        value = "${stats.longestWeeklyStreak}w",
+                        modifier = Modifier.weight(1f),
+                        onClick = longestWeeklyStreakRange?.let { range ->
+                            { onOpenCalendarWithArgs(null, range.start.toEpochDay(), range.end.toEpochDay()) }
+                        }
+                    )
                 }
                 Text(
-                    text = "Daily streak = consecutive days together. Weekly streak is separate — consecutive weeks with any time together.",
+                    text = "Daily streak = consecutive days together. Weekly streak is separate — consecutive weeks with any time together. Tap a \"longest\" card to see it on the calendar.",
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(top = 8.dp)
                 )
@@ -121,7 +168,8 @@ fun StatsScreen(onBack: () -> Unit, onOpenBadges: () -> Unit) {
                         emoji = "❤️",
                         label = "Favorite day",
                         value = stats.favoriteDayOfWeek?.name?.lowercase()?.replaceFirstChar { it.uppercase() } ?: "—",
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier.weight(1f),
+                        onClick = onOpenFavoriteDayDetail
                     )
                 }
             }
@@ -134,7 +182,10 @@ fun StatsScreen(onBack: () -> Unit, onOpenBadges: () -> Unit) {
                         emoji = "💞",
                         label = "Together since",
                         value = stats.togetherSince?.format(DateTimeFormatter.ofPattern("MMM d, yyyy")) ?: "—",
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier.weight(1f),
+                        onClick = stats.togetherSince?.let { date ->
+                            { onOpenCalendarWithArgs(date.toEpochDay(), null, null) }
+                        }
                     )
                     StatCard(
                         emoji = trendEmoji(stats.monthTrend),
@@ -148,13 +199,15 @@ fun StatsScreen(onBack: () -> Unit, onOpenBadges: () -> Unit) {
                         emoji = "📈",
                         label = "Most met month",
                         value = stats.mostMetMonth?.let { "${monthLabel(it.yearMonth)} (${it.value.toInt()}d)" } ?: "—",
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier.weight(1f),
+                        onClick = { onOpenMonthlyDetail("days") }
                     )
                     StatCard(
                         emoji = "⏰",
                         label = "Most hours month",
                         value = stats.mostHoursMonth?.let { "${monthLabel(it.yearMonth)} (${"%.1f".format(it.value)}h)" } ?: "—",
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier.weight(1f),
+                        onClick = { onOpenMonthlyDetail("hours") }
                     )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
@@ -162,13 +215,17 @@ fun StatsScreen(onBack: () -> Unit, onOpenBadges: () -> Unit) {
                         emoji = "🌞",
                         label = "Longest single day",
                         value = stats.longestSingleDay?.let { "${"%.1f".format(it.hours)}h" } ?: "—",
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier.weight(1f),
+                        onClick = stats.longestSingleDay?.let { day ->
+                            { onOpenCalendarWithArgs(day.date.toEpochDay(), null, null) }
+                        }
                     )
                     StatCard(
                         emoji = "🔁",
                         label = "Avg. days between meetups",
                         value = stats.avgDaysBetweenMeetups?.let { "%.1f".format(it) } ?: "—",
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier.weight(1f),
+                        onClick = onOpenGapsDetail
                     )
                 }
                 stats.longestSingleDay?.let {
@@ -182,11 +239,25 @@ fun StatsScreen(onBack: () -> Unit, onOpenBadges: () -> Unit) {
                     val fmt = DateTimeFormatter.ofPattern("MMM d, yyyy")
                     val start = java.time.Instant.ofEpochMilli(gap.startMillis).atZone(java.time.ZoneId.systemDefault()).toLocalDate()
                     val end = java.time.Instant.ofEpochMilli(gap.endMillis).atZone(java.time.ZoneId.systemDefault()).toLocalDate()
-                    Text(
-                        text = "Longest apart: ${"%.1f".format(gap.days)} days (${start.format(fmt)} – ${end.format(fmt)}).",
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.padding(top = 4.dp)
-                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 4.dp)
+                            .clickable(onClick = onOpenGapsDetail),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Longest apart: ${"%.1f".format(gap.days)} days (${start.format(fmt)} – ${end.format(fmt)}).",
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Icon(
+                            imageVector = Icons.Filled.ChevronRight,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
+                            modifier = Modifier.padding(start = 4.dp)
+                        )
+                    }
                 }
             }
             item {

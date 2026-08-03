@@ -8,6 +8,7 @@ import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.YearMonth
 import java.time.ZoneId
+import java.time.temporal.ChronoUnit
 import java.time.temporal.WeekFields
 
 /** A calendar month plus a metric value for it - used by [TogetherStats.mostMetMonth] (value = distinct
@@ -20,9 +21,22 @@ data class DayStat(val date: LocalDate, val hours: Double)
 /** Simple up/down/flat trend signal - see [TogetherStats.monthTrend]'s doc for exactly what's compared. */
 enum class Trend { UP, DOWN, FLAT }
 
-/** A gap between two consecutive "meetups" (see [StatsCalculator] clustering doc), with the actual
- * millis range it spans so the UI can render e.g. "12 days apart, March 3 – March 15, 2026". */
+/** A gap between two consecutive "meetups" - i.e. distinct together-days, the same qualifying-day
+ * concept [TogetherStats.totalDaysTogether]/the streak stats use (see [StatsCalculator.dayGapsFromQualifyingDays]) -
+ * with the actual millis range it spans (midnight of each day, in the caller's zone) so the UI can
+ * render e.g. "12 days apart, March 3 – March 15, 2026". */
 data class GapInfo(val days: Double, val startMillis: Long, val endMillis: Long)
+
+/** An inclusive calendar-date span - used by [StatsCalculator.longestDailyStreakRange] /
+ * [StatsCalculator.longestWeeklyStreakRange] so the Calendar screen can highlight exactly which days
+ * made up a given streak, distinct from the plain streak LENGTH already in [TogetherStats]. */
+data class DateRange(val start: LocalDate, val end: LocalDate)
+
+/** One calendar month's activity - used by the Stats screen's monthly drill-down chart (Feature 1) so
+ * it can render a continuous month-by-month timeline (including zero-activity months in between),
+ * unlike [TogetherStats.mostMetMonth]/[TogetherStats.mostHoursMonth] which only expose the single best
+ * month. */
+data class MonthlyBreakdown(val yearMonth: YearMonth, val daysMet: Int, val hours: Double)
 
 data class TogetherStats(
     val totalHoursAllTime: Double,
@@ -55,23 +69,18 @@ data class TogetherStats(
      * unfairly always trend down until the month is almost over. UP/DOWN uses a 5% deadband either side
      * so tiny noise doesn't flip-flop the label. */
     val monthTrend: Trend,
-    /** Average days between the end of one "meetup" and the start of the next (null if fewer than 2
-     * meetups exist yet). A "meetup" clusters sessions/merged-intervals separated by less than
-     * [MEETUP_GAP_MILLIS] into one, so a couple who went apart for an hour and came back the same day
-     * still counts as a single meetup, not two. */
+    /** Average calendar-day gap between consecutive distinct together-days (null if fewer than 2
+     * together-days exist yet). A "meetup" is one distinct calendar day with ANY together-time - the
+     * exact same qualifying-day set [totalDaysTogether]/the streak stats use - so meeting twice in one
+     * day (e.g. a morning session and an evening session, however far apart) always counts as a single
+     * meetup/day, never two. */
     val avgDaysBetweenMeetups: Double?,
-    /** The single longest gap between two consecutive meetups, with the actual date range it spans. */
+    /** The single longest gap, in calendar days, between two consecutive together-days, with the actual
+     * date range it spans. */
     val longestApart: GapInfo?
 )
 
 private const val REUNION_GAP_MILLIS = 30 * 60 * 1000L
-
-/** Gap threshold used to cluster individual sessions/merged intervals into a single "meetup" for
- * [TogetherStats.avgDaysBetweenMeetups] / [TogetherStats.longestApart] - a couple apart for less than
- * this (e.g. a coffee run, a short errand) during an otherwise-continuous day together still counts as
- * one meetup, not two separate ones. Deliberately larger than REUNION_GAP_MILLIS (which flags ANY gap
- * worth celebrating as a reunion) since "distinct meetup" is a coarser, daily-life-scale concept. */
-private const val MEETUP_GAP_MILLIS = 4 * 60 * 60 * 1000L
 
 /** Arbitrary fixed date used only as a field-template base in computeWeeklyStreaks' previousWeekKey -
  * see its doc for why this must NOT be LocalDate.now(). Any date works; this one is a plain, safely
@@ -198,15 +207,9 @@ object StatsCalculator {
 
         // ---- Feature E ----
 
-        val hoursByMonth = HashMap<YearMonth, Double>()
-        val daysByMonth = HashMap<YearMonth, Int>()
-        minutesPerDay.forEach { (date, minutes) ->
-            val ym = YearMonth.from(date)
-            hoursByMonth[ym] = (hoursByMonth[ym] ?: 0.0) + minutes / 60.0
-            daysByMonth[ym] = (daysByMonth[ym] ?: 0) + 1
-        }
-        val mostMetMonth = daysByMonth.maxByOrNull { it.value }?.let { MonthStat(it.key, it.value.toDouble()) }
-        val mostHoursMonth = hoursByMonth.maxByOrNull { it.value }?.let { MonthStat(it.key, it.value) }
+        val monthlyStats = monthlyBreakdownFromDailyMap(minutesPerDay)
+        val mostMetMonth = monthlyStats.maxByOrNull { it.daysMet }?.let { MonthStat(it.yearMonth, it.daysMet.toDouble()) }
+        val mostHoursMonth = monthlyStats.maxByOrNull { it.hours }?.let { MonthStat(it.yearMonth, it.hours) }
 
         val longestSingleDay = minutesPerDay.maxByOrNull { it.value }?.let { DayStat(it.key, it.value / 60.0) }
 
@@ -228,15 +231,9 @@ object StatsCalculator {
             else -> Trend.FLAT
         }
 
-        val meetups = clusterMeetups(merged)
-        val avgDaysBetweenMeetups = if (meetups.size >= 2) {
-            (1 until meetups.size).map { (meetups[it].start - meetups[it - 1].end) / 86_400_000.0 }.average()
-        } else null
-        val longestApart = if (meetups.size >= 2) {
-            (1 until meetups.size)
-                .map { GapInfo((meetups[it].start - meetups[it - 1].end) / 86_400_000.0, meetups[it - 1].end, meetups[it].start) }
-                .maxByOrNull { it.days }
-        } else null
+        val gaps = dayGapsFromQualifyingDays(qualifyingDays.toList(), zone)
+        val avgDaysBetweenMeetups = if (gaps.isNotEmpty()) gaps.map { it.days }.average() else null
+        val longestApart = gaps.maxByOrNull { it.days }
 
         return TogetherStats(
             totalHoursAllTime = totalHoursAllTime,
@@ -289,22 +286,6 @@ object StatsCalculator {
             }
         }
         return merged
-    }
-
-    /** Feature E: greedily groups consecutive merged intervals separated by less than
-     * [MEETUP_GAP_MILLIS] into one "meetup" - see [TogetherStats.avgDaysBetweenMeetups]'s doc. */
-    private fun clusterMeetups(mergedSorted: List<Interval>): List<Interval> {
-        if (mergedSorted.isEmpty()) return emptyList()
-        val out = mutableListOf(mergedSorted.first())
-        for (interval in mergedSorted.drop(1)) {
-            val last = out.last()
-            if (interval.start - last.end < MEETUP_GAP_MILLIS) {
-                out[out.lastIndex] = last.copy(end = maxOf(last.end, interval.end))
-            } else {
-                out.add(interval)
-            }
-        }
-        return out
     }
 
     private fun clippedIntervalMillis(interval: Interval, rangeStart: Long, rangeEnd: Long): Long {
@@ -372,22 +353,31 @@ object StatsCalculator {
         return date.get(weekFields.weekBasedYear()) to date.get(weekFields.weekOfWeekBasedYear())
     }
 
+    // Step back 7 days from the Monday of that ISO week. Anchored on a FIXED reference date (not
+    // LocalDate.now()/today) so this is a pure function of `key` alone - using the real wall clock as a
+    // throwaway "template" date here was harmless in practice (the weekBasedYear/weekOfWeekBasedYear/
+    // dayOfWeek fields set below fully determine the result) but needlessly tied this to the system
+    // default zone, which could differ from the `zone` this whole StatsCalculator.compute() call was
+    // asked to use. Hoisted to a top-level function (rather than local to computeWeeklyStreaks) so
+    // [longestWeeklyStreakRange] can walk the same week-key arithmetic when locating a streak's actual
+    // calendar dates.
+    private fun previousWeekKey(key: Pair<Int, Int>): Pair<Int, Int> {
+        val approxDate = FIXED_WEEK_ANCHOR.with(WeekFields.ISO.weekBasedYear(), key.first.toLong())
+            .with(WeekFields.ISO.weekOfWeekBasedYear(), key.second.toLong())
+            .with(WeekFields.ISO.dayOfWeek(), 1L)
+        val prev = approxDate.minusWeeks(1)
+        return WeekFields.ISO.let { wf -> prev.get(wf.weekBasedYear()) to prev.get(wf.weekOfWeekBasedYear()) }
+    }
+
+    /** The Monday of the given ISO week key, as a real calendar date - see [previousWeekKey]'s doc for
+     * why [FIXED_WEEK_ANCHOR] is a safe, zone-independent template date to derive it from. */
+    private fun weekKeyToMonday(key: Pair<Int, Int>): LocalDate =
+        FIXED_WEEK_ANCHOR.with(WeekFields.ISO.weekBasedYear(), key.first.toLong())
+            .with(WeekFields.ISO.weekOfWeekBasedYear(), key.second.toLong())
+            .with(WeekFields.ISO.dayOfWeek(), 1L)
+
     private fun computeWeeklyStreaks(qualifyingWeeks: Set<Pair<Int, Int>>, currentWeekKey: Pair<Int, Int>): Pair<Int, Int> {
         if (qualifyingWeeks.isEmpty()) return 0 to 0
-
-        fun previousWeekKey(key: Pair<Int, Int>): Pair<Int, Int> {
-            // Step back 7 days from the Monday of that ISO week. Anchored on a FIXED reference date
-            // (not LocalDate.now()/today) so this is a pure function of `key` alone - using the real
-            // wall clock as a throwaway "template" date here was harmless in practice (the weekBasedYear/
-            // weekOfWeekBasedYear/dayOfWeek fields set below fully determine the result) but needlessly
-            // tied this to the system default zone, which could differ from the `zone` this whole
-            // StatsCalculator.compute() call was asked to use.
-            val approxDate = FIXED_WEEK_ANCHOR.with(WeekFields.ISO.weekBasedYear(), key.first.toLong())
-                .with(WeekFields.ISO.weekOfWeekBasedYear(), key.second.toLong())
-                .with(WeekFields.ISO.dayOfWeek(), 1L)
-            val prev = approxDate.minusWeeks(1)
-            return WeekFields.ISO.let { wf -> prev.get(wf.weekBasedYear()) to prev.get(wf.weekOfWeekBasedYear()) }
-        }
 
         var anchor = currentWeekKey
         if (anchor !in qualifyingWeeks) anchor = previousWeekKey(anchor)
@@ -417,5 +407,126 @@ object StatsCalculator {
             if (gap >= REUNION_GAP_MILLIS) count++
         }
         return count
+    }
+
+    /** Turns a sorted list of distinct together-days (the same qualifying-day concept used for
+     * [totalDaysTogether]/streaks - see [buildDailyMinuteMap]) into the gap list between each
+     * consecutive pair, as whole calendar days (via [ChronoUnit.DAYS], never a sub-day fraction, since a
+     * "meetup" is now purely a calendar day and not a session-gap cluster). [startMillis]/[endMillis]
+     * are each day's local midnight so the UI can render the exact date range. Shared by [compute]
+     * (which already has qualifyingDays in hand) and the public [computeMeetupGaps] below - both must
+     * resolve to the exact same gap list, never two independently re-derived ones. */
+    private fun dayGapsFromQualifyingDays(sortedDays: List<LocalDate>, zone: ZoneId): List<GapInfo> {
+        if (sortedDays.size < 2) return emptyList()
+        return (1 until sortedDays.size).map {
+            val prevDay = sortedDays[it - 1]
+            val nextDay = sortedDays[it]
+            GapInfo(
+                ChronoUnit.DAYS.between(prevDay, nextDay).toDouble(),
+                prevDay.atStartOfDay(zone).toInstant().toEpochMilli(),
+                nextDay.atStartOfDay(zone).toInstant().toEpochMilli()
+            )
+        }
+    }
+
+    /** Every gap between consecutive distinct together-days (see [dayGapsFromQualifyingDays]'s doc), not
+     * just the single longest one [TogetherStats.longestApart] already exposes - powers the Stats
+     * screen's "Longest apart" / "Avg. days between meetups" drill-down timeline. */
+    fun computeMeetupGaps(
+        sessions: List<TogetherSession>,
+        now: Long = System.currentTimeMillis(),
+        zone: ZoneId = ZoneId.systemDefault(),
+        lastSeenAt: Long = 0L,
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+    ): List<GapInfo> = dayGapsFromQualifyingDays(
+        buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis).keys.sorted(),
+        zone
+    )
+
+    /** Shared by [compute]'s mostMetMonth/mostHoursMonth and the public [computeMonthlyBreakdown] below -
+     * just the per-month grouping, no gap-filling (that's [computeMonthlyBreakdown]'s job), so both stay
+     * derived from the exact same per-day map. */
+    private fun monthlyBreakdownFromDailyMap(minutesPerDay: Map<LocalDate, Long>): List<MonthlyBreakdown> {
+        val hoursByMonth = HashMap<YearMonth, Double>()
+        val daysByMonth = HashMap<YearMonth, Int>()
+        minutesPerDay.forEach { (date, minutes) ->
+            val ym = YearMonth.from(date)
+            hoursByMonth[ym] = (hoursByMonth[ym] ?: 0.0) + minutes / 60.0
+            daysByMonth[ym] = (daysByMonth[ym] ?: 0) + 1
+        }
+        return hoursByMonth.keys.map { MonthlyBreakdown(it, daysByMonth[it] ?: 0, hoursByMonth[it] ?: 0.0) }
+    }
+
+    /** Every calendar month from the couple's very first together-day through the current month
+     * (inclusive), with zero-activity months filled in so the Stats screen's monthly drill-down chart can
+     * render a continuous timeline rather than only the single best month. Sorted oldest-first. */
+    fun computeMonthlyBreakdown(
+        sessions: List<TogetherSession>,
+        now: Long = System.currentTimeMillis(),
+        zone: ZoneId = ZoneId.systemDefault(),
+        lastSeenAt: Long = 0L,
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+    ): List<MonthlyBreakdown> {
+        val minutesPerDay = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis)
+        if (minutesPerDay.isEmpty()) return emptyList()
+        val byMonth = monthlyBreakdownFromDailyMap(minutesPerDay).associateBy { it.yearMonth }
+        val firstMonth = minutesPerDay.keys.minOf { YearMonth.from(it) }
+        val lastMonth = YearMonth.from(LocalDateTime.ofInstant(Instant.ofEpochMilli(now), zone).toLocalDate())
+        val out = mutableListOf<MonthlyBreakdown>()
+        var cursor = firstMonth
+        while (!cursor.isAfter(lastMonth)) {
+            out.add(byMonth[cursor] ?: MonthlyBreakdown(cursor, 0, 0.0))
+            cursor = cursor.plusMonths(1)
+        }
+        return out
+    }
+
+    /** The actual calendar-date span of [TogetherStats.longestDailyStreak] (not just its length), so the
+     * Calendar screen can jump to and highlight exactly those days. Ties (multiple runs sharing the same
+     * max length) resolve to the MOST RECENT run. */
+    fun longestDailyStreakRange(
+        sessions: List<TogetherSession>,
+        now: Long = System.currentTimeMillis(),
+        zone: ZoneId = ZoneId.systemDefault(),
+        lastSeenAt: Long = 0L,
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+    ): DateRange? {
+        val qualifyingDays = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis).keys.sorted()
+        if (qualifyingDays.isEmpty()) return null
+        var bestStart = qualifyingDays[0]
+        var bestEnd = qualifyingDays[0]
+        var bestLen = 1
+        var curStart = qualifyingDays[0]
+        var curLen = 1
+        for (i in 1 until qualifyingDays.size) {
+            if (qualifyingDays[i] == qualifyingDays[i - 1].plusDays(1)) curLen++ else { curStart = qualifyingDays[i]; curLen = 1 }
+            if (curLen >= bestLen) { bestLen = curLen; bestStart = curStart; bestEnd = qualifyingDays[i] }
+        }
+        return DateRange(bestStart, bestEnd)
+    }
+
+    /** Same idea as [longestDailyStreakRange] but for [TogetherStats.longestWeeklyStreak] - resolves the
+     * winning run of consecutive ISO weeks back to real calendar dates (Monday of its first week through
+     * Sunday of its last). Ties resolve to the MOST RECENT run. */
+    fun longestWeeklyStreakRange(
+        sessions: List<TogetherSession>,
+        now: Long = System.currentTimeMillis(),
+        zone: ZoneId = ZoneId.systemDefault(),
+        lastSeenAt: Long = 0L,
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+    ): DateRange? {
+        val qualifyingDays = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis).keys
+        if (qualifyingDays.isEmpty()) return null
+        val sortedWeeks = qualifyingDays.map { weekKeyOf(it) }.toSortedSet(compareBy({ it.first }, { it.second })).toList()
+        var bestStart = sortedWeeks[0]
+        var bestEnd = sortedWeeks[0]
+        var bestLen = 1
+        var curStart = sortedWeeks[0]
+        var curLen = 1
+        for (i in 1 until sortedWeeks.size) {
+            if (previousWeekKey(sortedWeeks[i]) == sortedWeeks[i - 1]) curLen++ else { curStart = sortedWeeks[i]; curLen = 1 }
+            if (curLen >= bestLen) { bestLen = curLen; bestStart = curStart; bestEnd = sortedWeeks[i] }
+        }
+        return DateRange(weekKeyToMonday(bestStart), weekKeyToMonday(bestEnd).plusDays(6))
     }
 }

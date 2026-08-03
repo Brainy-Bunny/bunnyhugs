@@ -117,9 +117,18 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
 class MomentRepository(private val dao: MomentDao) {
     fun observeAll(): Flow<List<Moment>> = dao.observeAll()
     suspend fun getAll(): List<Moment> = dao.getAll()
+    suspend fun getBySyncId(syncId: String): Moment? = dao.getBySyncId(syncId)
 
     suspend fun add(photoUri: String, sessionId: Long?): Long =
         dao.insert(Moment(photoUri = photoUri, takenAt = System.currentTimeMillis(), sessionId = sessionId))
+
+    /** Feature 2: called once GattSyncManager has fully received a photo's bytes, written them to a temp
+     * file, and successfully renamed that into place at the Moment's real photoUri - see
+     * GattSyncManager.savePhotoBytes. Room's own Flow (observeAll) picks this up automatically, so
+     * MomentsScreen re-renders the real image with no further plumbing needed. */
+    suspend fun markPhotoDownloaded(syncId: String) {
+        dao.updatePhotoDownloaded(syncId, true)
+    }
 
     /**
      * Feature D: union-merges the partner's moment METADATA (never photo bytes - see Moment.isRemote's

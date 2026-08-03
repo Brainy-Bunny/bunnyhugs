@@ -23,6 +23,7 @@ import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -51,6 +52,7 @@ import coil.compose.AsyncImage
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.data.db.Moment
 import com.ssbmedia.twogether.data.db.MomentNote
+import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.ui.components.EmptyState
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
 import kotlinx.coroutines.flow.SharingStarted
@@ -71,6 +73,9 @@ class MomentsViewModel : ViewModel() {
 fun MomentsScreen(onBack: () -> Unit) {
     val vm: MomentsViewModel = viewModel(factory = SimpleViewModelFactory { MomentsViewModel() })
     val moments by vm.moments.collectAsState()
+    // Feature 2: syncIds currently being requested/received over GATT - drives the "Receiving photo…"
+    // indicator below instead of the old static remote-stub placeholder while a transfer is in flight.
+    val transferring by AppEvents.momentsTransferring.collectAsState()
     var selected by remember { mutableStateOf<Moment?>(null) }
 
     val zone = remember { ZoneId.systemDefault() }
@@ -112,7 +117,11 @@ fun MomentsScreen(onBack: () -> Unit) {
                             )
                             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 dayMoments.forEach { moment ->
-                                    MomentThumbnail(moment = moment, onClick = { selected = moment })
+                                    MomentThumbnail(
+                                        moment = moment,
+                                        isTransferring = moment.syncId in transferring,
+                                        onClick = { selected = moment }
+                                    )
                                 }
                             }
                         }
@@ -122,17 +131,17 @@ fun MomentsScreen(onBack: () -> Unit) {
         }
 
         selected?.let { moment ->
-            MomentFullScreen(moment = moment, onDismiss = { selected = null })
+            MomentFullScreen(moment = moment, isTransferring = moment.syncId in transferring, onDismiss = { selected = null })
         }
     }
 }
 
 @Composable
-private fun MomentThumbnail(moment: Moment, onClick: () -> Unit) {
-    // Feature D scope note: a remote-stub Moment (isRemote=true, synced metadata only - see
-    // Moment.isRemote's doc) never has a real local file at photoUri, so it gets a clear placeholder
-    // tile here rather than silently rendering a broken image / nothing via Coil's own error handling.
-    val hasLocalPhoto = remember(moment.photoUri, moment.isRemote) { !moment.isRemote && File(moment.photoUri).isFile }
+private fun MomentThumbnail(moment: Moment, isTransferring: Boolean, onClick: () -> Unit) {
+    // Feature 2: renders off photoDownloaded now (not isRemote) - a remote-stub moment whose photo
+    // transfer has since completed correctly shows the real image here, not the placeholder forever. The
+    // File(...).isFile check stays as a defensive belt-and-suspenders against the flag and disk disagreeing.
+    val hasLocalPhoto = remember(moment.photoUri, moment.photoDownloaded) { moment.photoDownloaded && File(moment.photoUri).isFile }
     if (hasLocalPhoto) {
         AsyncImage(
             model = moment.photoUri,
@@ -152,23 +161,27 @@ private fun MomentThumbnail(moment: Moment, onClick: () -> Unit) {
                 .clickable(onClick = onClick),
             contentAlignment = Alignment.Center
         ) {
-            Icon(
-                imageVector = Icons.Filled.PhotoCamera,
-                contentDescription = "Photo on partner's phone",
-                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
-            )
+            if (isTransferring) {
+                CircularProgressIndicator(modifier = Modifier.size(28.dp), strokeWidth = 2.dp)
+            } else {
+                Icon(
+                    imageVector = Icons.Filled.PhotoCamera,
+                    contentDescription = "Photo on partner's phone",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                )
+            }
         }
     }
 }
 
 @Composable
-private fun MomentFullScreen(moment: Moment, onDismiss: () -> Unit) {
+private fun MomentFullScreen(moment: Moment, isTransferring: Boolean, onDismiss: () -> Unit) {
     val zone = remember { ZoneId.systemDefault() }
     val dateLabel = remember(moment.takenAt) {
         Instant.ofEpochMilli(moment.takenAt).atZone(zone).toLocalDateTime()
             .format(DateTimeFormatter.ofLocalizedDateTime(FormatStyle.MEDIUM, FormatStyle.SHORT))
     }
-    val hasLocalPhoto = remember(moment.photoUri, moment.isRemote) { !moment.isRemote && File(moment.photoUri).isFile }
+    val hasLocalPhoto = remember(moment.photoUri, moment.photoDownloaded) { moment.photoDownloaded && File(moment.photoUri).isFile }
 
     Box(
         modifier = Modifier
@@ -197,8 +210,13 @@ private fun MomentFullScreen(moment: Moment, onDismiss: () -> Unit) {
                     contentAlignment = Alignment.Center
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(Icons.Filled.PhotoCamera, contentDescription = null, tint = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.7f))
-                        Text("This photo is on your partner's phone", color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.7f), modifier = Modifier.padding(top = 8.dp))
+                        if (isTransferring) {
+                            CircularProgressIndicator(color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.85f))
+                            Text("Receiving photo…", color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.7f), modifier = Modifier.padding(top = 12.dp))
+                        } else {
+                            Icon(Icons.Filled.PhotoCamera, contentDescription = null, tint = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.7f))
+                            Text("This photo is on your partner's phone", color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.7f), modifier = Modifier.padding(top = 8.dp))
+                        }
                     }
                 }
             }

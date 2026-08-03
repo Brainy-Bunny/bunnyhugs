@@ -20,6 +20,14 @@
          levels only (26-28); inert/unused on API 29+, where MediaStore.Downloads needs no permission. -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
 
+    <!-- Battery optimization prompt: normal permission (no runtime grant dialog) that lets this app
+         launch Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, the standard policy-compliant way
+         to ask the user to exempt Twogether from Doze/App Standby so the always-on proximity-tracking
+         foreground service isn't silently killed in the background on aggressive OEMs (Xiaomi, Samsung,
+         OnePlus, etc). The actual exemption itself is still a user-facing system dialog, not silently
+         granted by this manifest declaration. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <!-- Auto-update feature ONLY: this app is otherwise fully offline by design (no accounts, no
          servers - see the "About" text in Settings). This single deliberate exception lets
          UpdateChecker do one read-only GET against the public GitHub Releases API and, if a newer

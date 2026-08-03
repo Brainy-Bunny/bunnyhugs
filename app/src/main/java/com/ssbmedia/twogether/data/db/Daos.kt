@@ -90,6 +90,12 @@ interface MomentDao {
     @Query("SELECT * FROM moments WHERE syncId = :syncId LIMIT 1")
     suspend fun getBySyncId(syncId: String): Moment?
 
+    /** Feature 2: flips a Moment's photoDownloaded flag once GattSyncManager's photo-transfer phase has
+     * fully written and renamed the real file into place at [Moment.photoUri] - see
+     * MomentRepository.markPhotoDownloaded's doc. */
+    @Query("UPDATE moments SET photoDownloaded = :downloaded WHERE syncId = :syncId")
+    suspend fun updatePhotoDownloaded(syncId: String, downloaded: Boolean)
+
     /** Wipes every row - used only by Feature 4's backup restore, which always fully repopulates this
      * table immediately afterward inside the same DB transaction. */
     @Query("DELETE FROM moments")

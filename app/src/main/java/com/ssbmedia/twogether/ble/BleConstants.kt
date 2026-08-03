@@ -27,6 +27,11 @@ object BleConstants {
     val SYNC_CHARACTERISTIC_UUID: UUID = UUID.fromString("6f5a0003-9c1e-4f2a-8a3d-3b1e6d4f0003")
     val CLIENT_CONFIG_DESCRIPTOR_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
+    /** Feature 2: a second characteristic on the SAME sync service/connection, dedicated to photo bytes
+     * so the small metadata JSON exchange (SYNC_CHARACTERISTIC_UUID) never has to share reassembly state
+     * with the much larger, much slower photo transfer - see GattSyncManager's photo-phase doc. */
+    val PHOTO_CHARACTERISTIC_UUID: UUID = UUID.fromString("6f5a0004-9c1e-4f2a-8a3d-3b1e6d4f0004")
+
     /** How many leading hex chars of the strengthened pair-code hash we broadcast in service data to identify our partner. */
     const val SECRET_PREFIX_BYTES = 4
 
@@ -47,6 +52,19 @@ object BleConstants {
      * further clamped down to whatever ATT MTU was really negotiated on that connection (see
      * GattSyncManager.effectiveChunkPayload); never sent larger than what fits. */
     const val MAX_CHUNK_PAYLOAD = 180
+
+    /** Feature 2: a higher chunk-payload ceiling used ONLY for the photo characteristic. JSON metadata
+     * chunks stay capped at MAX_CHUNK_PAYLOAD above (unchanged, proven-safe sizing); photo transfers are
+     * the whole reason to request a bigger MTU at all (see GattSyncManager's REQUESTED_MTU) - without
+     * raising this ceiling too, a larger negotiated MTU would go to waste and every photo would still
+     * crawl through at 180-byte chunks. */
+    const val MAX_CHUNK_PAYLOAD_PHOTO = 500
+
+    /** Photo-characteristic wire protocol: each fully-reassembled message (chunked exactly like the JSON
+     * envelope, via the same MORE/LAST flag byte) starts with one of these type bytes. */
+    const val PHOTO_FRAME_TYPE_REQUEST: Byte = 1
+    const val PHOTO_FRAME_TYPE_DATA: Byte = 2
+    const val PHOTO_FRAME_TYPE_DONE: Byte = 3
 
     /**
      * Slices [numBytes] bytes out of a hex string starting at hex-character [hexOffset] (2 hex chars per

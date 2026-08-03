@@ -1,7 +1,10 @@
 package com.ssbmedia.twogether.events
 
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /** Lightweight in-process event bus so the UI and the background service can nudge each other. */
 object AppEvents {
@@ -52,5 +55,18 @@ object AppEvents {
 
     fun emitUnpaired() {
         _unpaired.tryEmit(Unit)
+    }
+
+    /** service -> UI: syncIds of Moments this device is CURRENTLY in the middle of requesting/receiving
+     * photo bytes for over GATT (Feature 2), so MomentsScreen can show a "Receiving photo…" progress
+     * indicator instead of the old static "photo is on your partner's phone" placeholder while a
+     * transfer is genuinely in flight, and fall back to that same placeholder for anything not yet
+     * requested this session. Always replaced wholesale (not additive) - see GattSyncManager's photo
+     * phase for where this is set/cleared. */
+    private val _momentsTransferring = MutableStateFlow<Set<String>>(emptySet())
+    val momentsTransferring: StateFlow<Set<String>> = _momentsTransferring.asStateFlow()
+
+    fun setMomentsTransferring(syncIds: Set<String>) {
+        _momentsTransferring.value = syncIds
     }
 }

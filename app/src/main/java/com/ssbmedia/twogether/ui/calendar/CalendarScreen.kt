@@ -1,6 +1,7 @@
 package com.ssbmedia.twogether.ui.calendar
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -84,16 +85,43 @@ class CalendarViewModel : ViewModel() {
     }
 }
 
+/**
+ * @param jumpToEpochDay Feature 1: when set (from a Stats card like "Longest single day" / "Together
+ * since"), the calendar opens on that date's month with that day's detail dialog already showing,
+ * instead of the current month - so tapping the card visibly lands you on the right day, not just the
+ * right screen.
+ * @param highlightStartEpochDay @param highlightEndEpochDay Feature 1: when both are set (from
+ * "Longest streak" cards), every day in this inclusive range is painted with a distinct highlight -
+ * see [DayCell]'s `isStreakHighlight` - separate from the normal together-day dot marking, so it's
+ * visually clear this is "the streak being shown" rather than just another together day.
+ */
 @Composable
-fun CalendarScreen(onBack: () -> Unit) {
+fun CalendarScreen(
+    onBack: () -> Unit,
+    jumpToEpochDay: Long? = null,
+    highlightStartEpochDay: Long? = null,
+    highlightEndEpochDay: Long? = null
+) {
     val vm: CalendarViewModel = viewModel(factory = SimpleViewModelFactory { CalendarViewModel() })
     val sessions by vm.sessions.collectAsState()
     val moments by vm.moments.collectAsState()
     val proximityState by vm.proximityState.collectAsState()
     val zone = remember { ZoneId.systemDefault() }
 
-    var yearMonth by remember { mutableStateOf(YearMonth.now(zone)) }
-    var selectedDay by remember { mutableStateOf<LocalDate?>(null) }
+    val jumpToDate = remember(jumpToEpochDay) { jumpToEpochDay?.let { LocalDate.ofEpochDay(it) } }
+    // A plain Pair rather than a java.time ClosedRange - LocalDate implements Comparable<ChronoLocalDate>
+    // rather than Comparable<LocalDate>, which the stdlib's generic `a..b` rangeTo operator can't use
+    // directly. Membership below is checked by hand instead.
+    val highlightRange = remember(highlightStartEpochDay, highlightEndEpochDay) {
+        if (highlightStartEpochDay != null && highlightEndEpochDay != null) {
+            LocalDate.ofEpochDay(highlightStartEpochDay) to LocalDate.ofEpochDay(highlightEndEpochDay)
+        } else null
+    }
+    // The highlight range takes priority over a plain jump-to-date when both would apply (they never
+    // do in practice from how Stats wires these, but this keeps the initial month deterministic either
+    // way): jump to whichever one was actually requested.
+    var yearMonth by remember { mutableStateOf(YearMonth.from(highlightRange?.first ?: jumpToDate ?: LocalDate.now(zone))) }
+    var selectedDay by remember { mutableStateOf(jumpToDate) }
     var showAddDialog by remember { mutableStateOf(false) }
 
     // lastSeenAt clamps an open session's live duration so a stale/orphaned open session can't inflate
@@ -197,13 +225,38 @@ fun CalendarScreen(onBack: () -> Unit) {
                     val hasTogetherTime = day in minutesPerDay
                     val hasPhoto = day in daysWithPhotos
                     val hasManualEntry = day in daysWithManualEntry
+                    val isStreakHighlight = highlightRange != null &&
+                        !day.isBefore(highlightRange.first) && !day.isAfter(highlightRange.second)
                     DayCell(
                         day = day,
                         hasTogetherTime = hasTogetherTime,
                         hasPhoto = hasPhoto,
                         hasManualEntry = hasManualEntry,
                         isToday = day == LocalDate.now(zone),
+                        isStreakHighlight = isStreakHighlight,
                         onClick = { selectedDay = day }
+                    )
+                }
+            }
+
+            // Feature 1: only shown when Stats deep-linked here to show off a specific streak - explains
+            // what the distinct highlight color means, right where it's visible.
+            if (highlightRange != null) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(10.dp)
+                            .clip(MaterialTheme.shapes.extraSmall)
+                            .background(MaterialTheme.colorScheme.tertiary)
+                    )
+                    Text(
+                        "Your streak",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(start = 6.dp)
                     )
                 }
             }
@@ -254,13 +307,29 @@ fun CalendarScreen(onBack: () -> Unit) {
 }
 
 @Composable
-private fun DayCell(day: LocalDate, hasTogetherTime: Boolean, hasPhoto: Boolean, hasManualEntry: Boolean, isToday: Boolean, onClick: () -> Unit) {
+private fun DayCell(
+    day: LocalDate,
+    hasTogetherTime: Boolean,
+    hasPhoto: Boolean,
+    hasManualEntry: Boolean,
+    isToday: Boolean,
+    onClick: () -> Unit,
+    isStreakHighlight: Boolean = false
+) {
+    // isStreakHighlight (Feature 1: "this is the streak Stats sent you to look at") is deliberately a
+    // DIFFERENT visual channel than isToday's fill - a tertiary border, so a highlighted streak day that
+    // also happens to be today still clearly shows both signals rather than one hiding the other.
     Box(
         modifier = Modifier
             .aspectRatio(1f)
             .padding(2.dp)
             .clip(MaterialTheme.shapes.medium)
             .background(if (isToday) MaterialTheme.colorScheme.primaryContainer else androidx.compose.ui.graphics.Color.Transparent)
+            .then(
+                if (isStreakHighlight) {
+                    Modifier.border(2.dp, MaterialTheme.colorScheme.tertiary, MaterialTheme.shapes.medium)
+                } else Modifier
+            )
             .clickable(onClick = onClick)
     ) {
         Column(modifier = Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {

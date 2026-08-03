@@ -205,11 +205,13 @@ class StatsCalculatorAuditTest {
     // ---------------------------------------------------------------------------------------
     @Test
     fun `longest apart and average days between meetups against hand-calculated gaps`() {
-        val meetup1Start = ts(2026, 1, 1, 10, 0)
+        // "Meetup" = distinct calendar day now, so gaps are whole calendar-day differences between
+        // together-days, not sub-day millis fractions between session edges.
+        val meetup1Start = ts(2026, 1, 1, 10, 0)   // day Jan 1
         val meetup1End = ts(2026, 1, 1, 11, 0)
-        val meetup2Start = ts(2026, 1, 3, 10, 0)   // gap1 = 47h = 1.9583333d
+        val meetup2Start = ts(2026, 1, 3, 10, 0)   // day Jan 3 -> gap1 = Jan1 to Jan3 = 2 days
         val meetup2End = ts(2026, 1, 3, 11, 0)
-        val meetup3Start = ts(2026, 1, 12, 10, 0)  // gap2 = 215h = 8.9583333d
+        val meetup3Start = ts(2026, 1, 12, 10, 0)  // day Jan 12 -> gap2 = Jan3 to Jan12 = 9 days
         val meetup3End = ts(2026, 1, 12, 11, 0)
 
         val sessions = listOf(
@@ -219,34 +221,36 @@ class StatsCalculatorAuditTest {
         )
         val stats = StatsCalculator.compute(sessions, now = ts(2026, 1, 13, 0, 0), zone = zone)
 
-        val gap1Days = 47.0 / 24.0
-        val gap2Days = 215.0 / 24.0
+        val gap1Days = 2.0
+        val gap2Days = 9.0
         val expectedAvg = (gap1Days + gap2Days) / 2.0
 
         assertNotNull(stats.longestApart)
-        assertEquals(gap2Days, stats.longestApart!!.days, 1e-4)
-        assertEquals(meetup2End, stats.longestApart!!.startMillis)
-        assertEquals(meetup3Start, stats.longestApart!!.endMillis)
+        assertEquals(gap2Days, stats.longestApart!!.days, 1e-9)
+        assertEquals(LocalDate.of(2026, 1, 3).atStartOfDay(zone).toInstant().toEpochMilli(), stats.longestApart!!.startMillis)
+        assertEquals(LocalDate.of(2026, 1, 12).atStartOfDay(zone).toInstant().toEpochMilli(), stats.longestApart!!.endMillis)
 
         assertNotNull(stats.avgDaysBetweenMeetups)
-        assertEquals(expectedAvg, stats.avgDaysBetweenMeetups!!, 1e-4)
+        assertEquals(expectedAvg, stats.avgDaysBetweenMeetups!!, 1e-9)
     }
 
     @Test
-    fun `meetup clustering merges sessions less than the meetup gap apart into one meetup`() {
-        // Two sessions 2h apart on the same day (< 4h MEETUP_GAP) must cluster into ONE meetup, so a
-        // short coffee-run apart doesn't get miscounted as its own "reunion gap" entry.
-        val a1 = session(ts(2026, 1, 1, 8, 0), ts(2026, 1, 1, 10, 0))
-        val a2 = session(ts(2026, 1, 1, 12, 0), ts(2026, 1, 1, 14, 0)) // gap = 2h < 4h -> same meetup
-        val b1 = session(ts(2026, 1, 10, 8, 0), ts(2026, 1, 10, 10, 0)) // far away -> second meetup
+    fun `same-day sessions always count as one meetup regardless of the gap between them`() {
+        // REGRESSION for the old 4h session-clustering logic (removed): a morning session and an evening
+        // session on the SAME calendar day, separated by 8h (well over the old 4h threshold), must still
+        // count as ONE meetup/one together-day now that "meetup" = distinct calendar day.
+        val a1 = session(ts(2026, 1, 1, 9, 0), ts(2026, 1, 1, 11, 0))
+        val a2 = session(ts(2026, 1, 1, 18, 0), ts(2026, 1, 1, 20, 0)) // 8h gap, same calendar day
+        val b1 = session(ts(2026, 1, 10, 8, 0), ts(2026, 1, 10, 10, 0)) // a different day -> second meetup
         val stats = StatsCalculator.compute(listOf(a1, a2, b1), now = ts(2026, 1, 11, 0, 0), zone = zone)
 
-        // Only 2 meetups exist (a1+a2 merged, b1 alone) -> exactly one gap.
+        // Only 2 distinct together-days exist (Jan 1, Jan 10) -> exactly one gap of 9 calendar days.
         assertNotNull(stats.longestApart)
-        // gap = b1.start - a2.end = Jan10 08:00 - Jan1 14:00 = 8d18h = 210h = 8.75d
-        assertEquals(8.75, stats.longestApart!!.days, 1e-4)
-        assertEquals(a2.endedAt, stats.longestApart!!.startMillis)
-        assertEquals(b1.startedAt, stats.longestApart!!.endMillis)
+        assertEquals(9.0, stats.longestApart!!.days, 1e-9)
+        assertEquals(LocalDate.of(2026, 1, 1).atStartOfDay(zone).toInstant().toEpochMilli(), stats.longestApart!!.startMillis)
+        assertEquals(LocalDate.of(2026, 1, 10).atStartOfDay(zone).toInstant().toEpochMilli(), stats.longestApart!!.endMillis)
+        assertNotNull(stats.avgDaysBetweenMeetups)
+        assertEquals(9.0, stats.avgDaysBetweenMeetups!!, 1e-9)
     }
 
     @Test

@@ -5,13 +5,16 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -38,25 +41,51 @@ fun SectionHeader(title: String, modifier: Modifier = Modifier) {
     )
 }
 
+/**
+ * [onClick] is optional so every existing call site (which just displays a number) keeps working
+ * unchanged - passing it opts a card into the Stats screen's drill-down navigation (Feature 1), and
+ * automatically shows a small chevron as tap affordance (mirroring [QuickLinkChip]'s onClick-driven
+ * Card ripple elsewhere in the app) so a tappable stat never looks identical to a purely-informational
+ * one.
+ */
 @Composable
 fun StatCard(
     emoji: String,
     label: String,
     value: String,
     modifier: Modifier = Modifier,
-    containerColor: Color = MaterialTheme.colorScheme.secondaryContainer
+    containerColor: Color = MaterialTheme.colorScheme.secondaryContainer,
+    onClick: (() -> Unit)? = null
 ) {
+    // Deliberately NOT using Card's own onClick/enabled overload here - Material3 applies a dimmed
+    // disabled-content alpha to that overload whenever enabled=false, which would visually fade every
+    // plain, non-clickable StatCard (still the majority of call sites) for no reason. A plain
+    // Modifier.clickable added only when [onClick] is non-null gives the same ripple/tap affordance
+    // without touching any card's appearance when it isn't tappable.
+    val clickModifier = if (onClick != null) {
+        modifier.clickable(onClick = onClick)
+    } else modifier
     Card(
-        modifier = modifier,
+        modifier = clickModifier,
         shape = MaterialTheme.shapes.large,
         colors = CardDefaults.cardColors(containerColor = containerColor),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(text = emoji, style = MaterialTheme.typography.headlineMedium)
-            androidx.compose.foundation.layout.Spacer(modifier = Modifier.padding(top = 4.dp))
-            Text(text = value, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            Text(text = label, style = MaterialTheme.typography.bodySmall)
+        Box {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(text = emoji, style = MaterialTheme.typography.headlineMedium)
+                androidx.compose.foundation.layout.Spacer(modifier = Modifier.padding(top = 4.dp))
+                Text(text = value, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text(text = label, style = MaterialTheme.typography.bodySmall)
+            }
+            if (onClick != null) {
+                Icon(
+                    imageVector = Icons.Filled.ChevronRight,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
+                    modifier = Modifier.align(Alignment.TopEnd).padding(6.dp).size(16.dp)
+                )
+            }
         }
     }
 }

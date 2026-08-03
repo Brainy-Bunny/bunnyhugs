@@ -315,6 +315,14 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
             SettingsSection(title = "About") {
                 SettingsRow(label = "Version", subtitle = BuildConfig.VERSION_NAME) {}
                 SettingsRow(label = "Twogether", subtitle = "Made for the two of you 💕 — fully offline, no accounts, no servers.") {}
+                // Quiet, permanent book-dedication-style personal credit - not tied to any account or
+                // couple, purely a personal note from the app's maker. Never gates or restricts anything.
+                Text(
+                    text = "Inspired by My Cutie Kachvii 💚",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 10.dp)
+                )
             }
         }
     }

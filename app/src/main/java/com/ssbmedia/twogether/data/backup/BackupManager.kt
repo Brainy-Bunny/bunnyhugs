@@ -72,11 +72,16 @@ import java.util.zip.ZipOutputStream
  */
 object BackupManager {
     private const val MANIFEST_ENTRY = "manifest.json"
-    /** v1 -> v2 (this feature batch): added sessions[].syncId, moments[].syncId/isRemote,
-     * momentNotes[], milestones[], settings.localDeviceId. restoreBackup() accepts EITHER version -
-     * a v1 backup simply has empty/defaulted values for everything new (see the parse* functions'
-     * optString/optBoolean fallbacks below), so old backups remain fully restorable. */
-    private const val BACKUP_FORMAT_VERSION = 2
+    /** v1 -> v2: added sessions[].syncId, moments[].syncId/isRemote, momentNotes[], milestones[],
+     * settings.localDeviceId.
+     * v2 -> v3 (Feature 2, photo sync): added moments[].photoDownloaded, splitting "do I actually hold
+     * the photo bytes" out of isRemote (see Moment.photoDownloaded's doc). restoreBackup() accepts ANY
+     * of v1/v2/v3 - an older backup simply has no photoDownloaded key, and parseMoments below defaults
+     * it the exact same way AppDatabase.MIGRATION_3_4 backfills existing rows on a live upgrade
+     * (`!isRemote` - a non-remote row in an old backup necessarily has its own real photo bytes since
+     * v1/v2 never had remote-stub rows without them; a remote-stub row correctly starts false, letting
+     * the very next together-session's photo-transfer phase go fetch it for real). */
+    private const val BACKUP_FORMAT_VERSION = 3
     const val BACKUP_FOLDER_NAME = "Twogether Backups"
     private val RELATIVE_DIR = Environment.DIRECTORY_DOWNLOADS + "/" + BACKUP_FOLDER_NAME
 
@@ -271,6 +276,7 @@ object BackupManager {
                     put("photoZipEntry", if (File(m.photoUri).isFile) photoZipEntryName(m) else JSONObject.NULL)
                     put("syncId", m.syncId)
                     put("isRemote", m.isRemote)
+                    put("photoDownloaded", m.photoDownloaded)
                 })
             }
         })
@@ -514,13 +520,17 @@ object BackupManager {
     private fun parseMoments(arr: JSONArray): List<MomentWithZipHint> = (0 until arr.length()).map { i ->
         val o = arr.getJSONObject(i)
         val syncId = o.optStringOrNull("syncId")?.takeIf { it.isNotBlank() } ?: java.util.UUID.randomUUID().toString()
+        val isRemote = o.optBoolean("isRemote", false)
         val moment = Moment(
             id = o.getLong("id"),
             photoUri = o.getString("photoUri"),
             takenAt = o.getLong("takenAt"),
             sessionId = if (o.isNull("sessionId")) null else o.getLong("sessionId"),
             syncId = syncId,
-            isRemote = o.optBoolean("isRemote", false)
+            isRemote = isRemote,
+            // Feature 2: a v1/v2 backup (made before photoDownloaded existed) defaults exactly like
+            // AppDatabase.MIGRATION_3_4's live-upgrade backfill - see BACKUP_FORMAT_VERSION's doc above.
+            photoDownloaded = o.optBoolean("photoDownloaded", !isRemote)
         )
         MomentWithZipHint(moment, o.optStringOrNull("photoZipEntry"))
     }

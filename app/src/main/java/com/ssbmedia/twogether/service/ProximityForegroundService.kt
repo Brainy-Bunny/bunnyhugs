@@ -28,6 +28,7 @@ import com.ssbmedia.twogether.data.datastore.ProximityPersistedState
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.notif.Notifications
 import com.ssbmedia.twogether.stats.StatsCalculator
+import com.ssbmedia.twogether.util.BatteryOptimization
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -53,6 +54,12 @@ class ProximityForegroundService : LifecycleService() {
     private var lastSeenDevice: BluetoothDevice? = null
     private var lastSeenTieBreak: Byte = 0
     private var bluetoothStateReceiver: BroadcastReceiver? = null
+
+    // Tracks the last known battery-optimization-exemption state so updateBatteryOptimizationNotification
+    // only actually calls notify()/cancel() when it flips, rather than on every 5s tick - matching
+    // lastNotificationText's pattern for the status notification just above. Starts null (unknown) so the
+    // very first tick after process start always evaluates and settles this for real.
+    private var lastBatteryOptimizationIgnored: Boolean? = null
 
     // Tracks whether GATT sync (server-open or a client attempt) has been set up for the *current*
     // together-session, so it only gets (re-)armed once per session instead of on every single beacon
@@ -330,6 +337,7 @@ class ProximityForegroundService : LifecycleService() {
         }
 
         updateNotification(now)
+        updateBatteryOptimizationNotification()
 
         // Guard against clobbering an in-flight unpair(): SettingsScreen.unpair() writes
         // isTogether=false directly to the store as part of tearing down the pairing, on a
@@ -611,6 +619,28 @@ class ProximityForegroundService : LifecycleService() {
             if (BlePermissions.hasNotificationPermission(this@ProximityForegroundService)) {
                 notify(Notifications.STATUS_NOTIFICATION_ID, notification)
             }
+        }
+    }
+
+    /**
+     * Feature 1: shows/cancels the persistent battery-optimization nag notification as this app's
+     * Doze/App Standby exemption state changes. Piggybacks on this service's existing 5s ticker (rather
+     * than wiring a separate ON_RESUME hook) since the ticker already runs continuously regardless of
+     * which screen - or no screen - is open, so this stays accurate even if the user never reopens the
+     * app after dismissing the onboarding dialog. Only calls notify()/cancel() when the state actually
+     * flips (see lastBatteryOptimizationIgnored), so this is not spamming the notification manager every
+     * 5 seconds - and critically, the notification actually disappears (cancel(), not just an updated
+     * text) the moment the user grants the exemption, whether that happened via the onboarding dialog,
+     * tapping this very notification, or manually in system Settings.
+     */
+    private fun updateBatteryOptimizationNotification() {
+        val ignoring = BatteryOptimization.isIgnoring(this)
+        if (ignoring == lastBatteryOptimizationIgnored) return
+        lastBatteryOptimizationIgnored = ignoring
+        if (ignoring) {
+            Notifications.cancelBatteryWarning(this)
+        } else {
+            Notifications.showBatteryWarning(this)
         }
     }
 

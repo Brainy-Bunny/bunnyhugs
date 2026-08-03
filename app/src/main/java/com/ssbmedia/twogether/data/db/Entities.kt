@@ -60,7 +60,21 @@ data class Moment(
      * UI must check local file existence before trying to render it as an image and show a clear
      * "photo is on {partner}'s phone" placeholder instead of a broken image.
      */
-    val isRemote: Boolean = false
+    val isRemote: Boolean = false,
+    /**
+     * Feature 2 (photo sync): split from [isRemote] on purpose - [isRemote] answers "whose photo is
+     * this / did the metadata arrive via sync", [photoDownloaded] answers the separate question "does
+     * THIS device actually hold the real photo bytes on disk right now". A moment taken locally is
+     * trivially true from the moment it's inserted (see MomentRepository.add - isRemote=false there, so
+     * the default `!isRemote` below resolves to true). A remote-stub row created by mergeRemoteStubs is
+     * always isRemote=true, so this defaults to false - exactly the "no pixels yet" state the old
+     * isRemote-only model conflated - and GattSyncManager's photo-transfer phase flips it to true once
+     * the actual bytes have been written to [photoUri] and fsync'd into place (see
+     * MomentRepository.markPhotoDownloaded). The UI (MomentsScreen) renders off THIS flag now, not
+     * isRemote, so a remote-stub moment correctly starts showing the real image the moment its transfer
+     * completes without needing isRemote itself to ever change.
+     */
+    val photoDownloaded: Boolean = !isRemote
 )
 
 /**

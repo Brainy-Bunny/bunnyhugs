@@ -13,6 +13,7 @@ import com.ssbmedia.twogether.R
 import com.ssbmedia.twogether.ble.BlePermissions
 import com.ssbmedia.twogether.ui.snooze.SnoozeActivity
 import com.ssbmedia.twogether.ui.update.UpdateInstallActivity
+import com.ssbmedia.twogether.util.BatteryOptimization
 import java.io.File
 
 object Notifications {
@@ -20,6 +21,10 @@ object Notifications {
     const val CHANNEL_REMINDERS = "reminders"
     const val CHANNEL_MILESTONES = "milestones"
     const val CHANNEL_UPDATES = "updates"
+    /** Separate (and deliberately LOW-importance, silent) channel from CHANNEL_STATUS, so the battery
+     * nag is clearly distinguishable from the normal always-on "together/apart" status notification
+     * rather than folded into its text - see buildBatteryWarningNotification's doc. */
+    const val CHANNEL_BATTERY_WARNING = "battery_warning"
 
     const val STATUS_NOTIFICATION_ID = 1001
     const val REMINDER_NOTIFICATION_ID = 1002
@@ -27,6 +32,7 @@ object Notifications {
      * different milestones never clobber each other's notification (see MilestoneAlarmScheduler). */
     const val MILESTONE_NOTIFICATION_ID_BASE = 2000
     const val UPDATE_NOTIFICATION_ID = 3000
+    const val BATTERY_WARNING_NOTIFICATION_ID = 4000
 
     const val EXTRA_OPEN_CAMERA = "open_camera"
     /** Feature F: carries which milestone to open the "throughout the years" retrospective for, when the
@@ -58,10 +64,17 @@ object Notifications {
         ).apply {
             description = "Lets you know when a newer version of Twogether is ready to install"
         }
+        val batteryChannel = NotificationChannel(
+            CHANNEL_BATTERY_WARNING, "Battery optimization warning", NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "Warns you if Android's battery optimization might interrupt background tracking"
+            setShowBadge(false)
+        }
         manager.createNotificationChannel(statusChannel)
         manager.createNotificationChannel(reminderChannel)
         manager.createNotificationChannel(milestoneChannel)
         manager.createNotificationChannel(updatesChannel)
+        manager.createNotificationChannel(batteryChannel)
     }
 
     fun buildStatusNotification(context: Context, contentText: String): Notification {
@@ -188,5 +201,44 @@ object Notifications {
 
         manager.notify(UPDATE_NOTIFICATION_ID, notification)
         return true
+    }
+
+    /**
+     * Battery optimization nag: shown for as long as the app is NOT exempted from Doze/App Standby (see
+     * BatteryOptimization.isIgnoring), so the couple understands *why* background tracking might be
+     * unreliable rather than just silently missing detections. Deliberately setOngoing(true) (persists
+     * through a swipe, matching the always-on status notification's own pattern) but - unlike the status
+     * notification - this one is expected to actually go away entirely (cancel(), not just update its
+     * text) the moment the exemption is granted; see ProximityForegroundService's per-tick check.
+     * Tapping it goes straight to the same system settings screen the onboarding dialog's "Allow" button
+     * uses, so there's exactly one way to resolve this app-wide.
+     */
+    fun buildBatteryWarningNotification(context: Context): Notification {
+        val settingsIntent = BatteryOptimization.requestIgnoreIntent(context)
+        val pendingIntent = PendingIntent.getActivity(
+            context, 0, settingsIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(context, CHANNEL_BATTERY_WARNING)
+            .setSmallIcon(R.drawable.ic_notification_heart)
+            .setContentTitle("Background tracking may be unreliable")
+            .setContentText("Tap to let Twogether skip battery optimization")
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setContentIntent(pendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+    }
+
+    fun showBatteryWarning(context: Context) {
+        if (!BlePermissions.hasNotificationPermission(context)) return
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        manager.notify(BATTERY_WARNING_NOTIFICATION_ID, buildBatteryWarningNotification(context))
+    }
+
+    fun cancelBatteryWarning(context: Context) {
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        manager.cancel(BATTERY_WARNING_NOTIFICATION_ID)
     }
 }
