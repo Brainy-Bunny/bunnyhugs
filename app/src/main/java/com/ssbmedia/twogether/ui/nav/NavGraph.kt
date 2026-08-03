@@ -154,7 +154,12 @@ fun TwogetherNavHost(cameraTrigger: Int, onUnpaired: () -> Unit, openMilestoneId
                 )
             }
             composable(Screen.DateIdeas.route) { DateIdeasScreen(onBack = { navController.popBackStack() }) }
-            composable(Screen.Moments.route) { MomentsScreen(onBack = { navController.popBackStack() }) }
+            composable(Screen.Moments.route) {
+                MomentsScreen(
+                    onBack = { navController.popBackStack() },
+                    onNavigateCamera = { navController.navigate(Screen.Camera.route) }
+                )
+            }
             composable(Screen.Stats.route) {
                 StatsScreen(
                     onBack = { navController.popBackStack() },

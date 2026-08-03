@@ -24,6 +24,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -70,7 +71,7 @@ class MomentsViewModel : ViewModel() {
 }
 
 @Composable
-fun MomentsScreen(onBack: () -> Unit) {
+fun MomentsScreen(onBack: () -> Unit, onNavigateCamera: () -> Unit) {
     val vm: MomentsViewModel = viewModel(factory = SimpleViewModelFactory { MomentsViewModel() })
     val moments by vm.moments.collectAsState()
     // Feature 2: syncIds currently being requested/received over GATT - drives the "Receiving photo…"
@@ -91,6 +92,11 @@ fun MomentsScreen(onBack: () -> Unit) {
                     IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "Back") }
                 }
             )
+        },
+        floatingActionButton = {
+            FloatingActionButton(onClick = onNavigateCamera) {
+                Icon(Icons.Filled.PhotoCamera, contentDescription = "Take a photo")
+            }
         }
     ) { padding ->
         if (moments.isEmpty()) {
