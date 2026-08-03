@@ -203,7 +203,14 @@ data class AppSettings(
     /** Auto-update: wall-clock time of the last *attempted* update check (success or failure),
      * whichever of app-start or UpdateWorker ran it - throttles app-start's own check so reopening
      * the app repeatedly can't re-hit the network every time; see UpdateChecker.MIN_CHECK_INTERVAL_MS. */
-    val lastUpdateCheckAt: Long = 0L
+    val lastUpdateCheckAt: Long = 0L,
+    /** Drag-and-drop reordering of Home's "Quick links" grid - deliberately per-device, NOT synced
+     * between partners (each person may want their own layout), so this lives in local settingsDs
+     * rather than anywhere that gets shared/paired. Comma-joined list of the stable quick-link ids
+     * (see QuickLinkIds in HomeScreen.kt) in the user's preferred order. Null means "never reordered" -
+     * HomeScreen falls back to its DEFAULT_QUICK_LINK_ORDER in that case, so a fresh install (or an
+     * install that predates this feature) keeps showing the original hardcoded order unchanged. */
+    val quickLinksOrder: String? = null
 )
 
 class SettingsStore(private val context: Context) {
@@ -219,6 +226,7 @@ class SettingsStore(private val context: Context) {
         val LOCAL_DEVICE_ID = stringPreferencesKey("local_device_id")
         val AUTO_UPDATE_ENABLED = booleanPreferencesKey("auto_update_check_enabled")
         val LAST_UPDATE_CHECK_AT = longPreferencesKey("last_update_check_at")
+        val QUICK_LINKS_ORDER = stringPreferencesKey("quick_links_order")
     }
 
     val settings: Flow<AppSettings> = context.settingsDs.data.map { p ->
@@ -233,7 +241,8 @@ class SettingsStore(private val context: Context) {
             lastBackupOk = p[Keys.LAST_BACKUP_OK] ?: false,
             localDeviceId = p[Keys.LOCAL_DEVICE_ID],
             autoUpdateCheckEnabled = p[Keys.AUTO_UPDATE_ENABLED] ?: true,
-            lastUpdateCheckAt = p[Keys.LAST_UPDATE_CHECK_AT] ?: 0L
+            lastUpdateCheckAt = p[Keys.LAST_UPDATE_CHECK_AT] ?: 0L,
+            quickLinksOrder = p[Keys.QUICK_LINKS_ORDER]
         )
     }
 
@@ -313,6 +322,15 @@ class SettingsStore(private val context: Context) {
 
     suspend fun setLastUpdateCheckAt(time: Long) {
         context.settingsDs.edit { it[Keys.LAST_UPDATE_CHECK_AT] = time }
+    }
+
+    /** Persists the user's drag-and-drop reordering of Home's "Quick links" grid. [orderedIds] is
+     * stored comma-joined verbatim - deliberately not validated/deduped here, since HomeScreen's own
+     * reconciliation (filtering to currently-known ids + appending any missing ones) is what stays
+     * resilient to a future quick link being added or removed; this store just persists whatever it's
+     * handed. */
+    suspend fun setQuickLinksOrder(orderedIds: List<String>) {
+        context.settingsDs.edit { it[Keys.QUICK_LINKS_ORDER] = orderedIds.joinToString(",") }
     }
 
     /** Records the outcome of the most recent backup attempt (manual "Back up now" or the weekly

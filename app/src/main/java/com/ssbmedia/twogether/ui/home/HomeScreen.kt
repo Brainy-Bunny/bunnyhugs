@@ -4,6 +4,7 @@ import android.content.Intent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,22 +31,32 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.animation.core.animateOffsetAsState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.unit.toSize
+import androidx.compose.ui.zIndex
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -71,11 +82,59 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+
+/** Stable ids for each Home "Quick links" chip - persisted as the drag-and-drop reorder preference
+ * (SettingsStore.setQuickLinksOrder) instead of the display label, which could change wording later
+ * without silently losing everyone's saved custom order. */
+private object QuickLinkIds {
+    const val CALENDAR = "calendar"
+    const val DATE_IDEAS = "dateIdeas"
+    const val MOMENTS = "moments"
+    const val STATS = "stats"
+    const val TIME_CAPSULES = "timeCapsules"
+    const val BADGES = "badges"
+    const val MILESTONES = "milestones"
+    const val CAMERA = "camera"
+}
+
+/** The original hardcoded order, also used as the fallback when no reorder preference is stored yet
+ * (fresh install / never dragged) and as the tail-end insertion order for any id a stored preference
+ * doesn't mention (e.g. a future quick link added after someone already customized their layout). */
+private val DEFAULT_QUICK_LINK_ORDER = listOf(
+    QuickLinkIds.CALENDAR, QuickLinkIds.DATE_IDEAS, QuickLinkIds.MOMENTS, QuickLinkIds.STATS,
+    QuickLinkIds.TIME_CAPSULES, QuickLinkIds.BADGES, QuickLinkIds.MILESTONES, QuickLinkIds.CAMERA
+)
+
+private data class QuickLinkDef(val id: String, val emoji: String, val label: String, val onClick: () -> Unit)
+
+/** Reconciles a raw stored comma-joined id list against [DEFAULT_QUICK_LINK_ORDER]: drops any unknown/
+ * stale id (e.g. a quick link that got removed) and appends any known id missing from the stored value
+ * (e.g. a quick link added after this person already customized their order) at the end, in its default
+ * relative position - so this always returns exactly the current 8 ids, exactly once each, regardless
+ * of what's actually in DataStore. */
+private fun reconcileQuickLinkOrder(stored: String?): List<String> {
+    val known = DEFAULT_QUICK_LINK_ORDER.toSet()
+    val storedIds = stored?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() } ?: emptyList()
+    val reconciled = LinkedHashSet<String>()
+    storedIds.forEach { if (it in known) reconciled.add(it) }
+    DEFAULT_QUICK_LINK_ORDER.forEach { reconciled.add(it) }
+    return reconciled.toList()
+}
 
 class HomeViewModel : ViewModel() {
     val pairingInfo = ServiceLocator.pairingStore.info
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), PairingInfo())
+
+    val quickLinksOrder: StateFlow<List<String>> = ServiceLocator.settingsStore.settings
+        .map { reconcileQuickLinkOrder(it.quickLinksOrder) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), DEFAULT_QUICK_LINK_ORDER)
+
+    fun setQuickLinksOrder(order: List<String>) {
+        viewModelScope.launch { ServiceLocator.settingsStore.setQuickLinksOrder(order) }
+    }
 
     val sessions: StateFlow<List<TogetherSession>> = ServiceLocator.sessionRepository.observeAll()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -122,6 +181,7 @@ fun HomeScreen(
     val proximityState by vm.proximityState.collectAsState()
     val moments by vm.moments.collectAsState()
     val randomMoment by vm.randomMoment.collectAsState()
+    val quickLinksOrder by vm.quickLinksOrder.collectAsState()
 
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -318,33 +378,214 @@ fun HomeScreen(
                 // chip takes an equal half-width share of its row (via weight(1f)) rather than
                 // auto-sizing to its own label, so short ("Stats") and long ("Time Capsules") labels
                 // still line up into a tidy, evenly-sized grid instead of a ragged one.
-                val quickLinks = listOf(
-                    Triple("📅", "Calendar", onNavigateCalendar),
-                    Triple("💌", "Date Ideas", onNavigateDateIdeas),
-                    Triple("📸", "Moments", onNavigateMoments),
-                    Triple("📊", "Stats", onNavigateStats),
-                    Triple("⏳", "Time Capsules", onNavigateCapsules),
-                    Triple("🏅", "Badges", onNavigateBadges),
-                    Triple("🎉", "Milestones", onNavigateMilestones),
-                    Triple("📷", "Take a photo", onNavigateCamera)
-                )
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    quickLinks.chunked(2).forEach { pair ->
-                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            pair.forEach { (emoji, label, action) ->
-                                QuickLinkChip(emoji = emoji, label = label, onClick = action, modifier = Modifier.weight(1f))
-                            }
-                            if (pair.size == 1) {
-                                Spacer(modifier = Modifier.weight(1f))
-                            }
-                        }
-                    }
+                //
+                // Each chip's emoji/label/onClick is looked up by its stable QuickLinkIds id (not by
+                // position) - the id -> action mapping below never changes, only the *order* the ids are
+                // rendered in does (per-device drag-and-drop reorder, see quickLinksOrder/
+                // ReorderableQuickLinksGrid) - so a chip dragged to a new slot always keeps navigating to
+                // wherever its own label/icon says it goes, never a stale position-based destination.
+                val quickLinkDefs = remember(
+                    onNavigateCalendar, onNavigateDateIdeas, onNavigateMoments, onNavigateStats,
+                    onNavigateCapsules, onNavigateBadges, onNavigateMilestones, onNavigateCamera
+                ) {
+                    listOf(
+                        QuickLinkDef(QuickLinkIds.CALENDAR, "📅", "Calendar", onNavigateCalendar),
+                        QuickLinkDef(QuickLinkIds.DATE_IDEAS, "💌", "Date Ideas", onNavigateDateIdeas),
+                        QuickLinkDef(QuickLinkIds.MOMENTS, "📸", "Moments", onNavigateMoments),
+                        QuickLinkDef(QuickLinkIds.STATS, "📊", "Stats", onNavigateStats),
+                        QuickLinkDef(QuickLinkIds.TIME_CAPSULES, "⏳", "Time Capsules", onNavigateCapsules),
+                        QuickLinkDef(QuickLinkIds.BADGES, "🏅", "Badges", onNavigateBadges),
+                        QuickLinkDef(QuickLinkIds.MILESTONES, "🎉", "Milestones", onNavigateMilestones),
+                        QuickLinkDef(QuickLinkIds.CAMERA, "📷", "Take a photo", onNavigateCamera)
+                    ).associateBy { it.id }
                 }
+                ReorderableQuickLinksGrid(
+                    order = quickLinksOrder,
+                    definitions = quickLinkDefs,
+                    onReorder = { vm.setQuickLinksOrder(it) }
+                )
             }
         }
 
         if (showReunion) {
             ReunionOverlay(onDismiss = { showReunion = false })
+        }
+    }
+}
+
+/**
+ * Renders [order] as the existing even 2-column Quick Links grid, with drag-and-drop reordering: a
+ * long-press on a chip picks it up (scale-up + shadow lift, follows the finger 1:1), other chips
+ * smoothly slide out of the way as the dragged one crosses into their slot, and releasing commits the
+ * new order via [onReorder] (persisted immediately by the caller). A plain (non-long-press) tap is left
+ * completely alone - [detectDragGesturesAfterLongPress] never consumes a short tap's down/up events, so
+ * [QuickLinkChip]'s own `Card(onClick = ...)` still sees and handles it normally.
+ *
+ * Deliberately NOT a `LazyVerticalGrid`: nesting a lazy grid inside this screen's outer `LazyColumn`
+ * item would need an explicit height + `userScrollEnabled = false` for only 8 fixed items, adding
+ * complexity for no benefit here. Instead this keeps the original Column-of-Rows structure (matching
+ * the recent even-grid fix) and implements swap/animate directly against the flat [order] list, using
+ * each chip's own measured position (via `onGloballyPositioned`) rather than hand-computed grid math -
+ * that keeps it correct regardless of font scaling / accessibility text size affecting chip height.
+ *
+ * The structural row/column order is frozen the instant a drag starts ([dragStartOrder]) and never
+ * changes again until the drag ends - only each chip's *visual* translation (graphicsLayer) moves during
+ * the drag. This avoids the classic "item jumps" bug where reflowing the actual layout mid-drag fights
+ * with the manually-tracked finger offset.
+ */
+@Composable
+private fun ReorderableQuickLinksGrid(
+    order: List<String>,
+    definitions: Map<String, QuickLinkDef>,
+    onReorder: (List<String>) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var draggingId by remember { mutableStateOf<String?>(null) }
+
+    // What's actually rendered while idle. Reconciled from [order] (the ViewModel/DataStore value)
+    // whenever it changes AND no drag is active - see the LaunchedEffect below. Updated instantly (not
+    // waiting for the DataStore round-trip) the moment a drag ends, so the grid never flickers back to
+    // a stale arrangement while that write is still in flight. Reads `draggingId` fresh each time this
+    // effect (re)starts (keyed on `order`), so it never clobbers an in-progress drag's own localOrder
+    // mutations with a late/duplicate Flow emission.
+    var localOrder by remember { mutableStateOf(order) }
+    LaunchedEffect(order) {
+        if (draggingId == null) localOrder = order
+    }
+
+    // Frozen the instant a drag starts: the structural order used to lay out the grid for the rest of
+    // that drag. Null while idle.
+    var dragStartOrder by remember { mutableStateOf<List<String>?>(null) }
+    // Which id currently occupies each structural slot if the drag were dropped right now - starts
+    // equal to dragStartOrder and gets a "move" applied every time the dragged chip's center crosses
+    // into a different slot's bounds. Null while idle.
+    var previewOrder by remember { mutableStateOf<List<String>?>(null) }
+    // Raw cumulative finger delta (container-local px) since the long-press fired - drives the dragged
+    // chip's own translation 1:1 with the finger and, combined with its frozen start slot, is how we
+    // hit-test which slot it's currently over.
+    var dragOffset by remember { mutableStateOf(Offset.Zero) }
+    // Frozen at drag start: index-aligned with dragStartOrder, each slot's measured (position, size) in
+    // container-local px.
+    var slotRectsByIndex by remember { mutableStateOf<List<Rect>>(emptyList()) }
+
+    var containerCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
+    val liveRects = remember { mutableStateMapOf<String, Rect>() }
+
+    val layoutOrder = dragStartOrder ?: localOrder
+
+    Column(
+        modifier = modifier.onGloballyPositioned { containerCoordinates = it },
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        layoutOrder.chunked(2).forEach { rowIds ->
+            val rowIsDragging = draggingId != null && rowIds.contains(draggingId)
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.fillMaxWidth().zIndex(if (rowIsDragging) 1f else 0f)
+            ) {
+                rowIds.forEach { id ->
+                    val def = definitions[id]
+                    if (def == null) {
+                        Spacer(modifier = Modifier.weight(1f))
+                        return@forEach
+                    }
+                    val isDragging = draggingId == id
+                    val baseIndex = layoutOrder.indexOf(id)
+                    val previewIndex = previewOrder?.indexOf(id)
+                    val shuffleTarget = if (!isDragging && previewIndex != null && previewIndex >= 0 &&
+                        previewIndex < slotRectsByIndex.size && baseIndex >= 0 && baseIndex < slotRectsByIndex.size
+                    ) {
+                        slotRectsByIndex[previewIndex].topLeft - slotRectsByIndex[baseIndex].topLeft
+                    } else {
+                        Offset.Zero
+                    }
+                    val animatedShuffle by animateOffsetAsState(shuffleTarget, label = "quicklink-shuffle-$id")
+                    // graphicsLayer's block below runs at draw time, not composition, so it can't read
+                    // composable-only APIs like MaterialTheme directly - capture the shape here instead.
+                    val chipShape = MaterialTheme.shapes.large
+
+                    QuickLinkChip(
+                        emoji = def.emoji,
+                        label = def.label,
+                        onClick = def.onClick,
+                        modifier = Modifier
+                            .weight(1f)
+                            .onGloballyPositioned { coords ->
+                                val container = containerCoordinates ?: return@onGloballyPositioned
+                                val topLeft = container.localPositionOf(coords, Offset.Zero)
+                                liveRects[id] = Rect(topLeft, coords.size.toSize())
+                            }
+                            .zIndex(if (isDragging) 1f else 0f)
+                            .graphicsLayer {
+                                if (isDragging) {
+                                    translationX = dragOffset.x
+                                    translationY = dragOffset.y
+                                    scaleX = 1.06f
+                                    scaleY = 1.06f
+                                    shadowElevation = 16f
+                                    shape = chipShape
+                                } else {
+                                    translationX = animatedShuffle.x
+                                    translationY = animatedShuffle.y
+                                }
+                            }
+                            .pointerInput(id) {
+                                detectDragGesturesAfterLongPress(
+                                    onDragStart = start@{
+                                        val order0 = localOrder
+                                        val rects = order0.map { linkId -> liveRects[linkId] }
+                                        if (rects.any { it == null }) return@start
+                                        dragStartOrder = order0
+                                        previewOrder = order0
+                                        slotRectsByIndex = rects.filterNotNull()
+                                        dragOffset = Offset.Zero
+                                        draggingId = id
+                                    },
+                                    onDrag = drag@{ change, amount ->
+                                        if (draggingId != id) return@drag
+                                        change.consume()
+                                        dragOffset += amount
+                                        val startOrder = dragStartOrder ?: return@drag
+                                        val rects = slotRectsByIndex
+                                        val startIndex = startOrder.indexOf(id)
+                                        if (startIndex < 0 || startIndex >= rects.size) return@drag
+                                        val startRect = rects[startIndex]
+                                        val draggedCenter = Offset(
+                                            startRect.left + startRect.width / 2f,
+                                            startRect.top + startRect.height / 2f
+                                        ) + dragOffset
+                                        val targetIndex = rects.indexOfFirst { it.contains(draggedCenter) }
+                                        if (targetIndex < 0) return@drag
+                                        val current = previewOrder ?: startOrder
+                                        if (current.indexOf(id) == targetIndex) return@drag
+                                        val mutable = current.toMutableList()
+                                        mutable.remove(id)
+                                        mutable.add(targetIndex.coerceIn(0, mutable.size), id)
+                                        previewOrder = mutable
+                                    },
+                                    onDragEnd = {
+                                        val finalOrder = previewOrder ?: localOrder
+                                        localOrder = finalOrder
+                                        onReorder(finalOrder)
+                                        draggingId = null
+                                        dragStartOrder = null
+                                        previewOrder = null
+                                        dragOffset = Offset.Zero
+                                    },
+                                    onDragCancel = {
+                                        draggingId = null
+                                        dragStartOrder = null
+                                        previewOrder = null
+                                        dragOffset = Offset.Zero
+                                    }
+                                )
+                            }
+                    )
+                }
+                if (rowIds.size == 1) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+            }
         }
     }
 }
