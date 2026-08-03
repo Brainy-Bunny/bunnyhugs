@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Auto-update feature: exposes only this app's app-specific external files directory (where
+     UpdateChecker.downloadApk saves the downloaded release APK) via FileProvider, so the system
+     package installer can read it through a content:// URI without any broader file access. -->
+<paths>
+    <external-files-path name="updates" path="." />
+    <cache-path name="updates_cache" path="." />
+</paths>

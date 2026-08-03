@@ -20,6 +20,12 @@
          levels only (26-28); inert/unused on API 29+, where MediaStore.Downloads needs no permission. -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
 
+    <!-- Auto-update feature ONLY: this app is otherwise fully offline by design (no accounts, no
+         servers - see the "About" text in Settings). This single deliberate exception lets
+         UpdateChecker do one read-only GET against the public GitHub Releases API and, if a newer
+         release exists, download its signed APK asset - never used for anything else. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
@@ -61,6 +67,36 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+
+        <!-- Feature F: fires yearly for each milestone via an explicit PendingIntent scheduled by
+             MilestoneAlarmScheduler - never targeted by anything outside this app, so exported=false. -->
+        <receiver
+            android:name=".notif.MilestoneAlarmReceiver"
+            android:exported="false" />
+
+        <!-- Auto-update: tapping the "Update available" notification lands here first (rather than
+             going straight to a raw ACTION_VIEW install intent) so a device that hasn't yet granted
+             "install unknown apps" for Twogether gets routed to that settings screen instead of the
+             tap silently doing nothing - see UpdateInstallActivity. -->
+        <activity
+            android:name=".ui.update.UpdateInstallActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Twogether.Dialog"
+            android:excludeFromRecents="true" />
+
+        <!-- Auto-update: lets UpdateInstallActivity hand the downloaded APK (stored in this app's
+             app-specific external files dir, so no storage permission is needed to write it) to the
+             system package installer via a content:// URI, as required on API 24+ (raw file:// URIs
+             passed to another app are blocked by StrictMode/FileUriExposedException). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
     </application>
 </manifest>

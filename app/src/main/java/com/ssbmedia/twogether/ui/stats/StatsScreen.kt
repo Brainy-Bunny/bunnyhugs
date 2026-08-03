@@ -27,11 +27,15 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.stats.StatsCalculator
+import com.ssbmedia.twogether.stats.Trend
 import com.ssbmedia.twogether.ui.components.SectionHeader
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
 import com.ssbmedia.twogether.ui.components.StatCard
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
+import java.time.format.DateTimeFormatter
+import java.time.format.TextStyle
+import java.util.Locale
 
 class StatsViewModel : ViewModel() {
     val sessions = ServiceLocator.sessionRepository.observeAll()
@@ -122,6 +126,70 @@ fun StatsScreen(onBack: () -> Unit, onOpenBadges: () -> Unit) {
                 }
             }
             item {
+                // Feature E: more stats, all read off the same merged/deduped session timeline above -
+                // see StatsCalculator's doc for exactly how each one is derived.
+                SectionHeader("Your story so far")
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                    StatCard(
+                        emoji = "💞",
+                        label = "Together since",
+                        value = stats.togetherSince?.format(DateTimeFormatter.ofPattern("MMM d, yyyy")) ?: "—",
+                        modifier = Modifier.weight(1f)
+                    )
+                    StatCard(
+                        emoji = trendEmoji(stats.monthTrend),
+                        label = "This month vs last",
+                        value = trendLabel(stats.monthTrend),
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
+                    StatCard(
+                        emoji = "📈",
+                        label = "Most met month",
+                        value = stats.mostMetMonth?.let { "${monthLabel(it.yearMonth)} (${it.value.toInt()}d)" } ?: "—",
+                        modifier = Modifier.weight(1f)
+                    )
+                    StatCard(
+                        emoji = "⏰",
+                        label = "Most hours month",
+                        value = stats.mostHoursMonth?.let { "${monthLabel(it.yearMonth)} (${"%.1f".format(it.value)}h)" } ?: "—",
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
+                    StatCard(
+                        emoji = "🌞",
+                        label = "Longest single day",
+                        value = stats.longestSingleDay?.let { "${"%.1f".format(it.hours)}h" } ?: "—",
+                        modifier = Modifier.weight(1f)
+                    )
+                    StatCard(
+                        emoji = "🔁",
+                        label = "Avg. days between meetups",
+                        value = stats.avgDaysBetweenMeetups?.let { "%.1f".format(it) } ?: "—",
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                stats.longestSingleDay?.let {
+                    Text(
+                        text = "Longest day together was ${it.date.format(DateTimeFormatter.ofPattern("MMM d, yyyy"))}.",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
+                stats.longestApart?.let { gap ->
+                    val fmt = DateTimeFormatter.ofPattern("MMM d, yyyy")
+                    val start = java.time.Instant.ofEpochMilli(gap.startMillis).atZone(java.time.ZoneId.systemDefault()).toLocalDate()
+                    val end = java.time.Instant.ofEpochMilli(gap.endMillis).atZone(java.time.ZoneId.systemDefault()).toLocalDate()
+                    Text(
+                        text = "Longest apart: ${"%.1f".format(gap.days)} days (${start.format(fmt)} – ${end.format(fmt)}).",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
+                }
+            }
+            item {
                 androidx.compose.material3.OutlinedButton(onClick = onOpenBadges, modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.large) {
                     Text("🏅 View Badges")
                 }
@@ -134,4 +202,19 @@ private fun formatMinutes(totalMinutes: Long): String {
     val hours = totalMinutes / 60
     val minutes = totalMinutes % 60
     return if (hours > 0) "${hours}h ${minutes}m" else "${minutes}m"
+}
+
+private fun monthLabel(yearMonth: java.time.YearMonth): String =
+    "${yearMonth.month.getDisplayName(TextStyle.SHORT, Locale.getDefault())} ${yearMonth.year}"
+
+private fun trendEmoji(trend: Trend): String = when (trend) {
+    Trend.UP -> "📈"
+    Trend.DOWN -> "📉"
+    Trend.FLAT -> "➡️"
+}
+
+private fun trendLabel(trend: Trend): String = when (trend) {
+    Trend.UP -> "Up"
+    Trend.DOWN -> "Down"
+    Trend.FLAT -> "About the same"
 }

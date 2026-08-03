@@ -87,8 +87,54 @@ interface MomentDao {
     @Query("SELECT * FROM moments ORDER BY takenAt DESC")
     suspend fun getAll(): List<Moment>
 
+    @Query("SELECT * FROM moments WHERE syncId = :syncId LIMIT 1")
+    suspend fun getBySyncId(syncId: String): Moment?
+
     /** Wipes every row - used only by Feature 4's backup restore, which always fully repopulates this
      * table immediately afterward inside the same DB transaction. */
     @Query("DELETE FROM moments")
+    suspend fun clearAll()
+}
+
+@Dao
+interface MomentNoteDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(note: MomentNote)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAll(notes: List<MomentNote>)
+
+    @Query("SELECT * FROM moment_notes WHERE momentSyncId = :momentSyncId")
+    fun observeForMoment(momentSyncId: String): Flow<List<MomentNote>>
+
+    @Query("SELECT * FROM moment_notes WHERE authorDeviceId = :deviceId")
+    suspend fun getAllForAuthor(deviceId: String): List<MomentNote>
+
+    @Query("SELECT * FROM moment_notes")
+    suspend fun getAll(): List<MomentNote>
+
+    /** Wipes every row - used only by Feature 4's backup restore, which always fully repopulates this
+     * table immediately afterward inside the same DB transaction. */
+    @Query("DELETE FROM moment_notes")
+    suspend fun clearAll()
+}
+
+@Dao
+interface MilestoneDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(milestone: Milestone)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAll(milestones: List<Milestone>)
+
+    @Query("SELECT * FROM milestones WHERE deleted = 0 ORDER BY month ASC, day ASC")
+    fun observeActive(): Flow<List<Milestone>>
+
+    @Query("SELECT * FROM milestones")
+    suspend fun getAll(): List<Milestone>
+
+    /** Wipes every row - used only by Feature 4's backup restore, which always fully repopulates this
+     * table immediately afterward inside the same DB transaction. */
+    @Query("DELETE FROM milestones")
     suspend fun clearAll()
 }

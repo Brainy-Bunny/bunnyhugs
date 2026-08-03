@@ -300,11 +300,11 @@ private fun sessionsOverlapping(sessions: List<TogetherSession>, day: LocalDate,
     val dayStart = day.atStartOfDay(zone).toInstant().toEpochMilli()
     val dayEnd = day.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
     val now = System.currentTimeMillis()
-    // Same clamp as StatsCalculator.effectiveOpenSessionCutoff: an open session's displayed end must
-    // never be credited past its last confirmed sighting + the absence timeout.
-    val openCutoff = StatsCalculator.effectiveOpenSessionCutoff(now, lastSeenAt)
     return sessions.filter { s ->
-        val end = s.endedAt ?: openCutoff
+        // Same clamp as StatsCalculator.effectiveOpenSessionEnd: an open session's displayed end must
+        // never be credited past its newest confirmed sighting + the absence timeout. Computed per row
+        // because the no-lastSeenAt fallback is bounded by that row's own startedAt.
+        val end = s.endedAt ?: StatsCalculator.effectiveOpenSessionEnd(s.startedAt, now, lastSeenAt)
         s.startedAt < dayEnd && end > dayStart
     }
 }

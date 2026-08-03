@@ -6,10 +6,11 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import java.util.UUID
 
 @Database(
-    entities = [TogetherSession::class, DateIdea::class, TimeCapsule::class, Moment::class],
-    version = 2,
+    entities = [TogetherSession::class, DateIdea::class, TimeCapsule::class, Moment::class, MomentNote::class, Milestone::class],
+    version = 3,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -17,6 +18,8 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun dateIdeaDao(): DateIdeaDao
     abstract fun timeCapsuleDao(): TimeCapsuleDao
     abstract fun momentDao(): MomentDao
+    abstract fun momentNoteDao(): MomentNoteDao
+    abstract fun milestoneDao(): MilestoneDao
 
     companion object {
         @Volatile private var INSTANCE: AppDatabase? = null
@@ -33,6 +36,69 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v2 -> v3, this feature batch:
+         *  - together_sessions.syncId (Feature A cross-device sync identity)
+         *  - moments.syncId + moments.isRemote (Feature D)
+         *  - new moment_notes table (Feature D)
+         *  - new milestones table (Feature F)
+         *
+         * syncId columns are added as TEXT NOT NULL DEFAULT '' (SQLite has no UUID() builtin to default
+         * to something unique per row in the ALTER TABLE itself), then immediately backfilled row-by-row
+         * with a real random UUID via [backfillSyncIds] - safe to do independently on each existing
+         * install since these pre-migration rows predate sync entirely and can never collide with
+         * whatever a partner's device independently backfills for its own pre-existing rows.
+         */
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE together_sessions ADD COLUMN syncId TEXT NOT NULL DEFAULT ''")
+                backfillSyncIds(db, "together_sessions")
+
+                db.execSQL("ALTER TABLE moments ADD COLUMN syncId TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE moments ADD COLUMN isRemote INTEGER NOT NULL DEFAULT 0")
+                backfillSyncIds(db, "moments")
+
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS moment_notes (
+                        momentSyncId TEXT NOT NULL,
+                        authorDeviceId TEXT NOT NULL,
+                        text TEXT NOT NULL,
+                        updatedAt INTEGER NOT NULL,
+                        deleted INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY(momentSyncId, authorDeviceId)
+                    )
+                    """.trimIndent()
+                )
+
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS milestones (
+                        id TEXT NOT NULL PRIMARY KEY,
+                        label TEXT NOT NULL,
+                        month INTEGER NOT NULL,
+                        day INTEGER NOT NULL,
+                        year INTEGER,
+                        createdAt INTEGER NOT NULL,
+                        updatedAt INTEGER NOT NULL,
+                        deleted INTEGER NOT NULL DEFAULT 0
+                    )
+                    """.trimIndent()
+                )
+            }
+
+            private fun backfillSyncIds(db: SupportSQLiteDatabase, table: String) {
+                val cursor = db.query("SELECT id FROM $table WHERE syncId = ''")
+                cursor.use {
+                    val idIndex = it.getColumnIndexOrThrow("id")
+                    while (it.moveToNext()) {
+                        val rowId = it.getLong(idIndex)
+                        db.execSQL("UPDATE $table SET syncId = ? WHERE id = ?", arrayOf(UUID.randomUUID().toString(), rowId))
+                    }
+                }
+            }
+        }
+
         fun get(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -40,10 +106,10 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "twogether.db"
                 )
-                    .addMigrations(MIGRATION_1_2)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                     // Safety net only for a FUTURE schema version we didn't write a real migration for -
-                    // the 1->2 path above is always handled for real by MIGRATION_1_2, so existing users'
-                    // sessions/moments/date-ideas/capsules are never silently wiped by this.
+                    // the 1->2 and 2->3 paths above are always handled for real, so existing users'
+                    // sessions/moments/date-ideas/capsules/notes/milestones are never silently wiped by this.
                     .fallbackToDestructiveMigration()
                     .build().also { INSTANCE = it }
             }

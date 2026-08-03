@@ -110,7 +110,8 @@ fun HomeScreen(
     onNavigateStats: () -> Unit,
     onNavigateCapsules: () -> Unit,
     onNavigateBadges: () -> Unit,
-    onNavigateCamera: () -> Unit
+    onNavigateCamera: () -> Unit,
+    onNavigateMilestones: () -> Unit = {}
 ) {
     val vm: HomeViewModel = viewModel(factory = SimpleViewModelFactory { HomeViewModel() })
     val pairingInfo by vm.pairingInfo.collectAsState()
@@ -317,6 +318,7 @@ fun HomeScreen(
                             Triple("📊", "Stats", onNavigateStats),
                             Triple("⏳", "Time Capsules", onNavigateCapsules),
                             Triple("🏅", "Badges", onNavigateBadges),
+                            Triple("🎉", "Milestones", onNavigateMilestones),
                             Triple("📷", "Take a photo", onNavigateCamera)
                         )
                     ) { (emoji, label, action) ->

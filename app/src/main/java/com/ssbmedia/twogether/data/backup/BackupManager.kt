@@ -14,9 +14,12 @@ import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.data.datastore.LastConnectionInfo
 import com.ssbmedia.twogether.data.datastore.PairingInfo
 import com.ssbmedia.twogether.data.db.DateIdea
+import com.ssbmedia.twogether.data.db.Milestone
 import com.ssbmedia.twogether.data.db.Moment
+import com.ssbmedia.twogether.data.db.MomentNote
 import com.ssbmedia.twogether.data.db.TimeCapsule
 import com.ssbmedia.twogether.data.db.TogetherSession
+import com.ssbmedia.twogether.notif.MilestoneAlarmScheduler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -40,8 +43,10 @@ import java.util.zip.ZipOutputStream
  * the Android platform) rather than a new serialization/zip dependency.
  *
  * Format (see [BACKUP_FORMAT_VERSION]):
- *   manifest.json       - one JSON object with pairing/settings/badgeUnlocks + the four Room tables
- *   photos/<id>_<name>  - one entry per Moment whose photo file still exists on disk
+ *   manifest.json       - one JSON object with pairing/settings/badgeUnlocks + every Room table
+ *                          (sessions, dateIdeas, timeCapsules, moments, momentNotes, milestones)
+ *   photos/<id>_<name>  - one entry per Moment whose photo file still exists on disk locally (a
+ *                          remote-stub Moment - see Moment.isRemote's doc - never has one)
  *
  * Storage location: the public MediaStore Downloads/"Twogether Backups" collection (API 29+), falling
  * back to the legacy public Downloads/"Twogether Backups" folder on API 26-28 (pre-scoped-storage).
@@ -67,7 +72,11 @@ import java.util.zip.ZipOutputStream
  */
 object BackupManager {
     private const val MANIFEST_ENTRY = "manifest.json"
-    private const val BACKUP_FORMAT_VERSION = 1
+    /** v1 -> v2 (this feature batch): added sessions[].syncId, moments[].syncId/isRemote,
+     * momentNotes[], milestones[], settings.localDeviceId. restoreBackup() accepts EITHER version -
+     * a v1 backup simply has empty/defaulted values for everything new (see the parse* functions'
+     * optString/optBoolean fallbacks below), so old backups remain fully restorable. */
+    private const val BACKUP_FORMAT_VERSION = 2
     const val BACKUP_FOLDER_NAME = "Twogether Backups"
     private val RELATIVE_DIR = Environment.DIRECTORY_DOWNLOADS + "/" + BACKUP_FOLDER_NAME
 
@@ -122,13 +131,16 @@ object BackupManager {
             val dateIdeas = db.dateIdeaDao().getAll()
             val timeCapsules = db.timeCapsuleDao().getAll()
             val moments = db.momentDao().getAll()
+            val momentNotes = db.momentNoteDao().getAll()
+            val milestones = db.milestoneDao().getAll()
             val pairing = ServiceLocator.pairingStore.current()
             val lastConnection = ServiceLocator.pairingStore.currentLastConnection()
             val settings = ServiceLocator.settingsStore.current()
             val badgeUnlocks = ServiceLocator.badgeUnlocksStore.current()
 
             val manifest = buildManifest(
-                sessions, dateIdeas, timeCapsules, moments, pairing, lastConnection, settings, badgeUnlocks
+                sessions, dateIdeas, timeCapsules, moments, momentNotes, milestones,
+                pairing, lastConnection, settings, badgeUnlocks
             )
 
             // Write to a cache-dir temp file first and only move it into the real backups folder once
@@ -175,6 +187,8 @@ object BackupManager {
         dateIdeas: List<DateIdea>,
         timeCapsules: List<TimeCapsule>,
         moments: List<Moment>,
+        momentNotes: List<MomentNote>,
+        milestones: List<Milestone>,
         pairing: PairingInfo,
         lastConnection: LastConnectionInfo,
         settings: AppSettings,
@@ -203,6 +217,7 @@ object BackupManager {
             put("pinEnabled", settings.pinEnabled)
             put("lastSyncAt", settings.lastSyncAt)
             put("deviceTieBreakByte", settings.deviceTieBreakByte)
+            put("localDeviceId", settings.localDeviceId)
         })
 
         put("badgeUnlocks", JSONObject().apply {
@@ -216,6 +231,7 @@ object BackupManager {
                     put("startedAt", s.startedAt)
                     put("endedAt", s.endedAt)
                     put("isManual", s.isManual)
+                    put("syncId", s.syncId)
                 })
             }
         })
@@ -253,6 +269,35 @@ object BackupManager {
                     put("takenAt", m.takenAt)
                     put("sessionId", m.sessionId)
                     put("photoZipEntry", if (File(m.photoUri).isFile) photoZipEntryName(m) else JSONObject.NULL)
+                    put("syncId", m.syncId)
+                    put("isRemote", m.isRemote)
+                })
+            }
+        })
+
+        put("momentNotes", JSONArray().apply {
+            momentNotes.forEach { n ->
+                put(JSONObject().apply {
+                    put("momentSyncId", n.momentSyncId)
+                    put("authorDeviceId", n.authorDeviceId)
+                    put("text", n.text)
+                    put("updatedAt", n.updatedAt)
+                    put("deleted", n.deleted)
+                })
+            }
+        })
+
+        put("milestones", JSONArray().apply {
+            milestones.forEach { m ->
+                put(JSONObject().apply {
+                    put("id", m.id)
+                    put("label", m.label)
+                    put("month", m.month)
+                    put("day", m.day)
+                    put("year", m.year)
+                    put("createdAt", m.createdAt)
+                    put("updatedAt", m.updatedAt)
+                    put("deleted", m.deleted)
                 })
             }
         })
@@ -314,7 +359,11 @@ object BackupManager {
             for (key in requiredKeys) {
                 if (!root.has(key)) return@withContext BackupResult(false, null, "This backup file is corrupt or incomplete (missing '$key').")
             }
-            if (root.optInt("backupFormatVersion", -1) != BACKUP_FORMAT_VERSION) {
+            // momentNotes/milestones are intentionally NOT in requiredKeys above - a v1 backup (made
+            // before this feature batch) simply won't have them, and that's fine; optJSONArray below
+            // treats a missing array the same as an empty one rather than failing the whole restore.
+            val version = root.optInt("backupFormatVersion", -1)
+            if (version < 1 || version > BACKUP_FORMAT_VERSION) {
                 return@withContext BackupResult(false, null, "This backup was made by an incompatible version of Twogether.")
             }
 
@@ -324,6 +373,8 @@ object BackupManager {
                     dateIdeas = parseDateIdeas(root.getJSONArray("dateIdeas")),
                     timeCapsules = parseTimeCapsules(root.getJSONArray("timeCapsules")),
                     moments = parseMoments(root.getJSONArray("moments")),
+                    momentNotes = parseMomentNotes(root.optJSONArray("momentNotes")),
+                    milestones = parseMilestones(root.optJSONArray("milestones")),
                     pairingJson = root.getJSONObject("pairing"),
                     settingsJson = root.getJSONObject("settings"),
                     badgeUnlocks = root.getJSONObject("badgeUnlocks").let { obj ->
@@ -345,6 +396,10 @@ object BackupManager {
                 parsed.timeCapsules.forEach { db.timeCapsuleDao().insert(it) }
                 db.momentDao().clearAll()
                 parsed.moments.forEach { db.momentDao().insert(it.moment) }
+                db.momentNoteDao().clearAll()
+                if (parsed.momentNotes.isNotEmpty()) db.momentNoteDao().upsertAll(parsed.momentNotes)
+                db.milestoneDao().clearAll()
+                if (parsed.milestones.isNotEmpty()) db.milestoneDao().upsertAll(parsed.milestones)
             }
 
             val p = parsed.pairingJson
@@ -368,7 +423,8 @@ object BackupManager {
                 pinHash = s.optStringOrNull("pinHash"),
                 pinEnabled = s.optBoolean("pinEnabled", false),
                 lastSyncAt = s.optLong("lastSyncAt", 0L),
-                deviceTieBreakByte = if (s.isNull("deviceTieBreakByte")) null else s.optInt("deviceTieBreakByte")
+                deviceTieBreakByte = if (s.isNull("deviceTieBreakByte")) null else s.optInt("deviceTieBreakByte"),
+                localDeviceId = s.optStringOrNull("localDeviceId")
             )
 
             ServiceLocator.badgeUnlocksStore.restoreRaw(parsed.badgeUnlocks)
@@ -382,7 +438,16 @@ object BackupManager {
                 extracted.copyTo(destFile, overwrite = true)
             }
 
-            BackupResult(true, zipUri, "Restored ${parsed.sessions.size} session(s), ${parsed.moments.size} photo(s), ${parsed.dateIdeas.size} date idea(s), ${parsed.timeCapsules.size} capsule(s).")
+            // Feature F: re-arm every restored milestone's yearly alarm - a fresh install (the disaster
+            // scenario backup/restore exists for) starts with none scheduled at all.
+            MilestoneAlarmScheduler.scheduleAll(context, parsed.milestones.filter { !it.deleted })
+
+            BackupResult(
+                true, zipUri,
+                "Restored ${parsed.sessions.size} session(s), ${parsed.moments.size} photo(s), " +
+                    "${parsed.dateIdeas.size} date idea(s), ${parsed.timeCapsules.size} capsule(s), " +
+                    "${parsed.milestones.size} milestone(s)."
+            )
         } catch (e: Exception) {
             BackupResult(false, null, "Restore failed: ${e.message ?: e.javaClass.simpleName}")
         } finally {
@@ -395,6 +460,8 @@ object BackupManager {
         val dateIdeas: List<DateIdea>,
         val timeCapsules: List<TimeCapsule>,
         val moments: List<MomentWithZipHint>,
+        val momentNotes: List<MomentNote>,
+        val milestones: List<Milestone>,
         val pairingJson: JSONObject,
         val settingsJson: JSONObject,
         val badgeUnlocks: Map<String, Long>
@@ -409,11 +476,15 @@ object BackupManager {
 
     private fun parseSessions(arr: JSONArray): List<TogetherSession> = (0 until arr.length()).map { i ->
         val o = arr.getJSONObject(i)
+        // syncId defaults to a fresh random UUID for a v1 backup (made before Feature A existed) - safe
+        // to backfill independently here, same reasoning as AppDatabase.MIGRATION_2_3's backfill.
+        val syncId = o.optStringOrNull("syncId")?.takeIf { it.isNotBlank() } ?: java.util.UUID.randomUUID().toString()
         TogetherSession(
             id = o.getLong("id"),
             startedAt = o.getLong("startedAt"),
             endedAt = if (o.isNull("endedAt")) null else o.getLong("endedAt"),
-            isManual = o.optBoolean("isManual", false)
+            isManual = o.optBoolean("isManual", false),
+            syncId = syncId
         )
     }
 
@@ -442,13 +513,47 @@ object BackupManager {
 
     private fun parseMoments(arr: JSONArray): List<MomentWithZipHint> = (0 until arr.length()).map { i ->
         val o = arr.getJSONObject(i)
+        val syncId = o.optStringOrNull("syncId")?.takeIf { it.isNotBlank() } ?: java.util.UUID.randomUUID().toString()
         val moment = Moment(
             id = o.getLong("id"),
             photoUri = o.getString("photoUri"),
             takenAt = o.getLong("takenAt"),
-            sessionId = if (o.isNull("sessionId")) null else o.getLong("sessionId")
+            sessionId = if (o.isNull("sessionId")) null else o.getLong("sessionId"),
+            syncId = syncId,
+            isRemote = o.optBoolean("isRemote", false)
         )
         MomentWithZipHint(moment, o.optStringOrNull("photoZipEntry"))
+    }
+
+    private fun parseMomentNotes(arr: JSONArray?): List<MomentNote> {
+        if (arr == null) return emptyList()
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            MomentNote(
+                momentSyncId = o.getString("momentSyncId"),
+                authorDeviceId = o.getString("authorDeviceId"),
+                text = o.optString("text", ""),
+                updatedAt = o.getLong("updatedAt"),
+                deleted = o.optBoolean("deleted", false)
+            )
+        }
+    }
+
+    private fun parseMilestones(arr: JSONArray?): List<Milestone> {
+        if (arr == null) return emptyList()
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            Milestone(
+                id = o.getString("id"),
+                label = o.getString("label"),
+                month = o.getInt("month"),
+                day = o.getInt("day"),
+                year = if (o.isNull("year")) null else o.optInt("year"),
+                createdAt = o.getLong("createdAt"),
+                updatedAt = o.getLong("updatedAt"),
+                deleted = o.optBoolean("deleted", false)
+            )
+        }
     }
 
     private fun JSONObject.optStringOrNull(key: String): String? =

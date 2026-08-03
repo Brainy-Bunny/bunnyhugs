@@ -49,8 +49,10 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.BuildConfig
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.ble.ProximityStateMachine
+import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.data.backup.BackupManager
 import com.ssbmedia.twogether.data.datastore.AppSettings
+import com.ssbmedia.twogether.data.update.UpdateChecker
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.lock.AppLockManager
 import com.ssbmedia.twogether.lock.PinUtil
@@ -72,6 +74,21 @@ class SettingsViewModel : ViewModel() {
 
     fun setNotificationsEnabled(enabled: Boolean) {
         viewModelScope.launch { ServiceLocator.settingsStore.setNotificationsEnabled(enabled) }
+    }
+
+    fun setAutoUpdateCheckEnabled(enabled: Boolean) {
+        viewModelScope.launch { ServiceLocator.settingsStore.setAutoUpdateCheckEnabled(enabled) }
+    }
+
+    /** Launched on the app-scoped coroutine (same reasoning as backupNow() below - a mid-check screen
+     * navigation must not cancel a download that's already in flight) rather than viewModelScope.
+     * Bypasses both the auto-check toggle and the throttle window: an explicit tap on "Check for
+     * updates now" is its own consent, independent of the "automatically" setting. */
+    fun checkForUpdatesNow(context: Context, onResult: (UpdateChecker.CheckOutcome) -> Unit) {
+        ServiceLocator.applicationScope.launch {
+            val outcome = UpdateChecker.checkAndNotify(context.applicationContext)
+            onResult(outcome)
+        }
     }
 
     fun setPin(pin: String) {
@@ -111,11 +128,14 @@ class SettingsViewModel : ViewModel() {
             if (openSession != null) {
                 val persisted = ServiceLocator.proximityStateStore.current()
                 val now = System.currentTimeMillis()
-                val clampedEnd = if (persisted.lastSeenAt > 0L) {
-                    minOf(now, persisted.lastSeenAt + ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS)
-                } else {
-                    now
-                }
+                // Bounded by the newest CONFIRMED sighting (maxOf(lastSeenAt, startedAt)) + the absence
+                // timeout, never by a bare "now" - see StatsCalculator.effectiveOpenSessionEnd's doc for
+                // why the old lastSeenAt<=0 fallback to "now" was an unbounded-inflation hole here too.
+                val clampedEnd = StatsCalculator.effectiveOpenSessionEnd(
+                    startedAt = openSession.startedAt,
+                    now = now,
+                    lastSeenAt = persisted.lastSeenAt
+                )
                 ServiceLocator.sessionRepository.endSession(openSession, clampedEnd.coerceAtLeast(openSession.startedAt))
             }
             ServiceLocator.proximityStateStore.update {
@@ -159,6 +179,8 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
     val context = LocalContext.current
     var isBackingUp by remember { mutableStateOf(false) }
     var backupMessage by remember { mutableStateOf<String?>(null) }
+    var isCheckingForUpdate by remember { mutableStateOf(false) }
+    var updateCheckMessage by remember { mutableStateOf<String?>(null) }
 
     Scaffold(
         topBar = {
@@ -257,6 +279,39 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                 }
             }
 
+            SettingsSection(title = "Updates") {
+                SettingsRow(
+                    label = "Check for updates automatically",
+                    subtitle = "Uses the internet just for this — everything else in Twogether stays fully offline"
+                ) {
+                    Switch(
+                        checked = settings.autoUpdateCheckEnabled,
+                        onCheckedChange = { vm.setAutoUpdateCheckEnabled(it) }
+                    )
+                }
+                SettingsRow(label = "Check for updates now", subtitle = "Current version: ${BuildConfig.VERSION_NAME}") {
+                    if (isCheckingForUpdate) {
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp))
+                    } else {
+                        TextButton(onClick = {
+                            isCheckingForUpdate = true
+                            vm.checkForUpdatesNow(context) { outcome ->
+                                isCheckingForUpdate = false
+                                updateCheckMessage = when (outcome) {
+                                    is UpdateChecker.CheckOutcome.UpdateAvailable ->
+                                        "Update ${outcome.info.versionName} downloaded — check your notifications to install it."
+                                    UpdateChecker.CheckOutcome.UpToDate -> "You're up to date."
+                                    UpdateChecker.CheckOutcome.DownloadFailed ->
+                                        "Found a newer version, but the download failed. Check your connection and try again."
+                                    UpdateChecker.CheckOutcome.CheckFailed ->
+                                        "Couldn't check for updates. Check your connection and try again."
+                                }
+                            }
+                        }) { Text("Check now") }
+                    }
+                }
+            }
+
             SettingsSection(title = "About") {
                 SettingsRow(label = "Version", subtitle = BuildConfig.VERSION_NAME) {}
                 SettingsRow(label = "Twogether", subtitle = "Made for the two of you 💕 — fully offline, no accounts, no servers.") {}
@@ -300,6 +355,15 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
             title = { Text("Backup") },
             text = { Text(backupMessage.orEmpty()) },
             confirmButton = { TextButton(onClick = { backupMessage = null }) { Text("OK") } }
+        )
+    }
+
+    if (updateCheckMessage != null) {
+        AlertDialog(
+            onDismissRequest = { updateCheckMessage = null },
+            title = { Text("Check for updates") },
+            text = { Text(updateCheckMessage.orEmpty()) },
+            confirmButton = { TextButton(onClick = { updateCheckMessage = null }) { Text("OK") } }
         )
     }
 

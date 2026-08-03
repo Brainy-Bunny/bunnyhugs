@@ -12,8 +12,17 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.util.Log
+import com.ssbmedia.twogether.data.datastore.SettingsStore
 import com.ssbmedia.twogether.data.db.DateIdea
+import com.ssbmedia.twogether.data.db.Milestone
+import com.ssbmedia.twogether.data.db.Moment
+import com.ssbmedia.twogether.data.db.MomentNote
+import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.data.repo.DateIdeaRepository
+import com.ssbmedia.twogether.data.repo.MilestoneRepository
+import com.ssbmedia.twogether.data.repo.MomentNoteRepository
+import com.ssbmedia.twogether.data.repo.MomentRepository
+import com.ssbmedia.twogether.data.repo.SessionRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -21,44 +30,91 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 
 /**
- * Tiny custom GATT protocol piggybacked on the proximity connection: exchange the whole date-ideas
- * list as chunked JSON over one write+notify characteristic, then merge last-write-wins locally.
- * One side acts as GATT server (passive), the other as GATT client (initiates) - the caller decides
- * the role via a deterministic tie-break so both phones never both try the same role.
+ * Tiny custom GATT protocol piggybacked on the proximity connection: exchange ONE combined JSON
+ * envelope covering date ideas, closed together-sessions (Feature A), moment metadata + per-partner
+ * moment notes (Feature D), and milestones (Feature F) as chunked bytes over one write+notify
+ * characteristic, then merge each piece locally with its own table-appropriate strategy. One side acts
+ * as GATT server (passive), the other as GATT client (initiates) - the caller decides the role via a
+ * deterministic tie-break so both phones never both try the same role.
+ *
+ * Bundling everything into one envelope (rather than a separate GATT exchange per table) keeps the
+ * connection/handshake/MTU-negotiation machinery below exactly as it was for the original date-ideas-only
+ * version - only serialize()/deserialize() and what happens with the parsed result changed.
  *
  * Every connection must first prove it knows the shared pair secret (a short handshake token derived
  * from the pairing code, see BleConstants.HANDSHAKE_TOKEN_*) before any real chunk data is accepted -
  * without this, any nearby stranger's GATT client could connect to our open server and read back the
- * couple's date-ideas list, or write a forged tombstone to delete a real item (merge is last-write-wins
- * with no origin check otherwise).
+ * couple's data, or write a forged tombstone to delete a real item (merge is last-write-wins with no
+ * origin check otherwise).
  */
 class GattSyncManager(
     private val context: Context,
-    private val repository: DateIdeaRepository,
+    private val dateIdeaRepository: DateIdeaRepository,
+    private val sessionRepository: SessionRepository,
+    private val momentRepository: MomentRepository,
+    private val momentNoteRepository: MomentNoteRepository,
+    private val milestoneRepository: MilestoneRepository,
+    private val settingsStore: SettingsStore,
     private val scope: CoroutineScope
 ) {
     private val bluetoothManager get() = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
 
     // ---- shared chunk protocol helpers ----
 
-    private fun serialize(ideas: List<DateIdea>): ByteArray {
-        val arr = JSONArray()
-        for (idea in ideas) {
-            val o = JSONObject()
-            o.put("id", idea.id)
-            o.put("text", idea.text)
-            o.put("category", idea.category ?: JSONObject.NULL)
-            o.put("done", idea.done)
-            o.put("updatedAt", idea.updatedAt)
-            o.put("deleted", idea.deleted)
-            arr.put(o)
-        }
-        return arr.toString().toByteArray(Charsets.UTF_8)
+    /** Gathers everything this device has to offer into one combined JSON payload:
+     *  - dateIdeas: the full local list (unchanged from before - DateIdeaRepository.mergeRemote is
+     *    already a full last-write-wins merge, so sending the whole list every time is correct and cheap).
+     *  - sessions: CLOSED sessions only (endedAt != null). Feature A deliberately never sends an open
+     *    session - an in-progress session copied onto the partner's device as "still open" would let two
+     *    devices each show a different "currently open" row; each device's own open session closes
+     *    naturally through its own normal proximity logic instead.
+     *  - moments: metadata only (see Moment.isRemote's doc) so the partner can reference/annotate a
+     *    moment they don't have the photo bytes for.
+     *  - notes: only THIS device's own notes (authorDeviceId == our id) - the receiving side treats
+     *    every row here as "the partner's", never re-merges its own notes back onto itself.
+     *  - milestones: the full local list (same full-list LWW-merge shape as dateIdeas).
+     */
+    private suspend fun buildPayload(): ByteArray {
+        val deviceId = settingsStore.getOrCreateLocalDeviceId()
+        val obj = JSONObject()
+        obj.put("dateIdeas", serializeDateIdeas(dateIdeaRepository.getAll()))
+        obj.put("sessions", serializeSessions(sessionRepository.getAll().filter { it.endedAt != null }))
+        obj.put("moments", serializeMoments(momentRepository.getAll()))
+        obj.put("notes", serializeNotes(momentNoteRepository.getAllForAuthor(deviceId)))
+        obj.put("milestones", serializeMilestones(milestoneRepository.getAll()))
+        return obj.toString().toByteArray(Charsets.UTF_8)
     }
 
-    private fun deserialize(bytes: ByteArray): List<DateIdea> {
-        if (bytes.isEmpty()) return emptyList()
-        val arr = JSONArray(String(bytes, Charsets.UTF_8))
+    /** Applies a received combined payload: merges each table with its own strategy (see each
+     * repository's mergeRemote / mergeRemoteSessions / mergeRemoteStubs doc for why they differ), then
+     * returns nothing - callers just proceed to send their own payload back / finish the sync. */
+    private suspend fun applyPayload(bytes: ByteArray) {
+        val deviceId = settingsStore.getOrCreateLocalDeviceId()
+        val root = JSONObject(String(bytes, Charsets.UTF_8))
+        dateIdeaRepository.mergeRemote(deserializeDateIdeas(root.optJSONArray("dateIdeas")))
+        sessionRepository.mergeRemoteSessions(deserializeSessions(root.optJSONArray("sessions")))
+        momentRepository.mergeRemoteStubs(deserializeMoments(root.optJSONArray("moments")))
+        momentNoteRepository.mergeRemote(deserializeNotes(root.optJSONArray("notes")), deviceId)
+        milestoneRepository.mergeRemote(deserializeMilestones(root.optJSONArray("milestones")))
+    }
+
+    private fun serializeDateIdeas(ideas: List<DateIdea>): JSONArray {
+        val arr = JSONArray()
+        for (idea in ideas) {
+            arr.put(JSONObject().apply {
+                put("id", idea.id)
+                put("text", idea.text)
+                put("category", idea.category ?: JSONObject.NULL)
+                put("done", idea.done)
+                put("updatedAt", idea.updatedAt)
+                put("deleted", idea.deleted)
+            })
+        }
+        return arr
+    }
+
+    private fun deserializeDateIdeas(arr: JSONArray?): List<DateIdea> {
+        if (arr == null) return emptyList()
         return (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
             DateIdea(
@@ -68,6 +124,123 @@ class GattSyncManager(
                 done = o.getBoolean("done"),
                 updatedAt = o.getLong("updatedAt"),
                 deleted = o.getBoolean("deleted")
+            )
+        }
+    }
+
+    private fun serializeSessions(sessions: List<TogetherSession>): JSONArray {
+        val arr = JSONArray()
+        for (s in sessions) {
+            arr.put(JSONObject().apply {
+                put("syncId", s.syncId)
+                put("startedAt", s.startedAt)
+                put("endedAt", s.endedAt ?: JSONObject.NULL)
+                put("isManual", s.isManual)
+            })
+        }
+        return arr
+    }
+
+    private fun deserializeSessions(arr: JSONArray?): List<TogetherSession> {
+        if (arr == null) return emptyList()
+        return (0 until arr.length()).mapNotNull { i ->
+            val o = arr.getJSONObject(i)
+            val syncId = o.optString("syncId", "")
+            if (syncId.isBlank() || o.isNull("endedAt")) return@mapNotNull null
+            TogetherSession(
+                startedAt = o.getLong("startedAt"),
+                endedAt = o.getLong("endedAt"),
+                isManual = o.optBoolean("isManual", false),
+                syncId = syncId
+            )
+        }
+    }
+
+    private fun serializeMoments(moments: List<Moment>): JSONArray {
+        val arr = JSONArray()
+        for (m in moments) {
+            arr.put(JSONObject().apply {
+                put("syncId", m.syncId)
+                put("photoUri", m.photoUri)
+                put("takenAt", m.takenAt)
+            })
+        }
+        return arr
+    }
+
+    private fun deserializeMoments(arr: JSONArray?): List<Moment> {
+        if (arr == null) return emptyList()
+        return (0 until arr.length()).mapNotNull { i ->
+            val o = arr.getJSONObject(i)
+            val syncId = o.optString("syncId", "")
+            if (syncId.isBlank()) return@mapNotNull null
+            Moment(
+                photoUri = o.optString("photoUri", ""),
+                takenAt = o.getLong("takenAt"),
+                syncId = syncId,
+                isRemote = true
+            )
+        }
+    }
+
+    private fun serializeNotes(notes: List<MomentNote>): JSONArray {
+        val arr = JSONArray()
+        for (n in notes) {
+            arr.put(JSONObject().apply {
+                put("momentSyncId", n.momentSyncId)
+                put("authorDeviceId", n.authorDeviceId)
+                put("text", n.text)
+                put("updatedAt", n.updatedAt)
+                put("deleted", n.deleted)
+            })
+        }
+        return arr
+    }
+
+    private fun deserializeNotes(arr: JSONArray?): List<MomentNote> {
+        if (arr == null) return emptyList()
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            MomentNote(
+                momentSyncId = o.getString("momentSyncId"),
+                authorDeviceId = o.getString("authorDeviceId"),
+                text = o.optString("text", ""),
+                updatedAt = o.getLong("updatedAt"),
+                deleted = o.optBoolean("deleted", false)
+            )
+        }
+    }
+
+    private fun serializeMilestones(milestones: List<Milestone>): JSONArray {
+        val arr = JSONArray()
+        for (m in milestones) {
+            arr.put(JSONObject().apply {
+                put("id", m.id)
+                put("label", m.label)
+                put("month", m.month)
+                put("day", m.day)
+                put("year", m.year ?: JSONObject.NULL)
+                put("createdAt", m.createdAt)
+                put("updatedAt", m.updatedAt)
+                put("deleted", m.deleted)
+            })
+        }
+        return arr
+    }
+
+    private fun deserializeMilestones(arr: JSONArray?): List<Milestone> {
+        if (arr == null) return emptyList()
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            Milestone(
+                id = o.getString("id"),
+                label = o.getString("label"),
+                month = o.getInt("month"),
+                day = o.getInt("day"),
+                year = if (o.isNull("year")) null else o.getInt("year"),
+                createdAt = o.getLong("createdAt"),
+                updatedAt = o.getLong("updatedAt"),
+                deleted = o.optBoolean("deleted", false)
             )
         }
     }
@@ -221,17 +394,16 @@ class GattSyncManager(
                         serverIncoming.remove(addr)
                         buffer.toByteArray()
                     }
-                    val remoteIdeas = try {
-                        deserialize(raw)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to parse incoming sync payload - reporting failure instead of a silent empty merge", e)
-                        scope.launch { activeServerOnSyncDone(false) }
-                        return
-                    }
                     scope.launch {
-                        repository.mergeRemote(remoteIdeas)
-                        val ourIdeas = repository.getAll()
-                        sendToClient(device, ourIdeas)
+                        try {
+                            applyPayload(raw)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to parse incoming sync payload - reporting failure instead of a silent empty merge", e)
+                            activeServerOnSyncDone(false)
+                            return@launch
+                        }
+                        val payload = buildPayload()
+                        sendToClient(device, payload)
                         activeServerOnSyncDone(true)
                     }
                 }
@@ -275,10 +447,10 @@ class GattSyncManager(
         }
     }
 
-    private fun sendToClient(device: BluetoothDevice, ideas: List<DateIdea>) {
+    private fun sendToClient(device: BluetoothDevice, payload: ByteArray) {
         val mtu = synchronized(serverLock) { deviceMtus[device.address] } ?: DEFAULT_ATT_MTU
         val chunkPayload = effectiveChunkPayload(mtu, BluetoothGatt.GATT_SUCCESS)
-        val chunks = toChunks(serialize(ideas), chunkPayload).toMutableList()
+        val chunks = toChunks(payload, chunkPayload).toMutableList()
         if (chunks.isEmpty()) return
         val first = chunks.removeAt(0)
         synchronized(serverLock) { serverOutQueue[device.address] = chunks }
@@ -434,8 +606,8 @@ class GattSyncManager(
                 }
                 if (firstHandshakeAck) {
                     scope.launch {
-                        val localIdeas = repository.getAll()
-                        synchronized(clientLock) { clientOutQueue = toChunks(serialize(localIdeas), clientChunkPayload).toMutableList() }
+                        val payload = buildPayload()
+                        synchronized(clientLock) { clientOutQueue = toChunks(payload, clientChunkPayload).toMutableList() }
                         sendNextClientChunk(gatt, characteristic)
                     }
                     return
@@ -452,18 +624,15 @@ class GattSyncManager(
                 if (flag == BleConstants.CHUNK_FLAG_LAST) {
                     val raw = clientIncoming.toByteArray()
                     clientIncoming.reset()
-                    val remoteIdeas = try {
-                        deserialize(raw)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to parse incoming sync payload - reporting failure instead of a silent empty merge", e)
-                        scope.launch {
+                    scope.launch {
+                        try {
+                            applyPayload(raw)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to parse incoming sync payload - reporting failure instead of a silent empty merge", e)
                             finish(false)
                             try { gatt.disconnect() } catch (e2: SecurityException) { /* ignore */ }
+                            return@launch
                         }
-                        return
-                    }
-                    scope.launch {
-                        repository.mergeRemote(remoteIdeas)
                         finish(true)
                         try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
                     }

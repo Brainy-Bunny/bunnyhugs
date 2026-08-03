@@ -12,15 +12,26 @@ import com.ssbmedia.twogether.MainActivity
 import com.ssbmedia.twogether.R
 import com.ssbmedia.twogether.ble.BlePermissions
 import com.ssbmedia.twogether.ui.snooze.SnoozeActivity
+import com.ssbmedia.twogether.ui.update.UpdateInstallActivity
+import java.io.File
 
 object Notifications {
     const val CHANNEL_STATUS = "status"
     const val CHANNEL_REMINDERS = "reminders"
+    const val CHANNEL_MILESTONES = "milestones"
+    const val CHANNEL_UPDATES = "updates"
 
     const val STATUS_NOTIFICATION_ID = 1001
     const val REMINDER_NOTIFICATION_ID = 1002
+    /** Base id for a milestone's yearly notification - offset by a stable per-milestone hash so
+     * different milestones never clobber each other's notification (see MilestoneAlarmScheduler). */
+    const val MILESTONE_NOTIFICATION_ID_BASE = 2000
+    const val UPDATE_NOTIFICATION_ID = 3000
 
     const val EXTRA_OPEN_CAMERA = "open_camera"
+    /** Feature F: carries which milestone to open the "throughout the years" retrospective for, when the
+     * user taps a milestone's yearly notification - mirrors EXTRA_OPEN_CAMERA's pattern. */
+    const val EXTRA_OPEN_MILESTONE_ID = "open_milestone_id"
 
     fun ensureChannels(context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -37,8 +48,20 @@ object Notifications {
         ).apply {
             description = "A gentle nudge to snap a photo when you've been together a while"
         }
+        val milestoneChannel = NotificationChannel(
+            CHANNEL_MILESTONES, "Anniversaries & milestones", NotificationManager.IMPORTANCE_DEFAULT
+        ).apply {
+            description = "Yearly reminders for the dates you two have marked as milestones"
+        }
+        val updatesChannel = NotificationChannel(
+            CHANNEL_UPDATES, "App updates", NotificationManager.IMPORTANCE_DEFAULT
+        ).apply {
+            description = "Lets you know when a newer version of Twogether is ready to install"
+        }
         manager.createNotificationChannel(statusChannel)
         manager.createNotificationChannel(reminderChannel)
+        manager.createNotificationChannel(milestoneChannel)
+        manager.createNotificationChannel(updatesChannel)
     }
 
     fun buildStatusNotification(context: Context, contentText: String): Notification {
@@ -106,5 +129,64 @@ object Notifications {
     fun cancelPhotoReminder(context: Context) {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
         manager.cancel(REMINDER_NOTIFICATION_ID)
+    }
+
+    /** Feature F: the yearly "it's [label] today!" notification. Tapping it opens the app straight into
+     * that milestone's "throughout the years" photo retrospective, same EXTRA-on-intent pattern as the
+     * photo reminder's camera shortcut above. */
+    fun showMilestoneNotification(context: Context, milestoneId: String, label: String): Boolean {
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return false
+        if (!BlePermissions.hasNotificationPermission(context)) return false
+
+        val openIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(EXTRA_OPEN_MILESTONE_ID, milestoneId)
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            context, milestoneId.hashCode(), openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_MILESTONES)
+            .setSmallIcon(R.drawable.ic_notification_heart)
+            .setContentTitle("Today is $label 💛")
+            .setContentText("Tap to relive your photos from this day over the years")
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+
+        manager.notify(MILESTONE_NOTIFICATION_ID_BASE + (milestoneId.hashCode() and 0x0FFFFFFF), notification)
+        return true
+    }
+
+    /** Auto-update: posted once UpdateChecker has already downloaded [apkFile] for a confirmed-newer
+     * release. Tapping it goes through UpdateInstallActivity (NOT a raw install Intent directly)
+     * so a device that hasn't yet granted "install unknown apps" for Twogether gets routed to that
+     * settings screen instead of the tap silently doing nothing - see that activity's doc comment. */
+    fun showUpdateAvailableNotification(context: Context, apkFile: File, versionName: String): Boolean {
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return false
+        if (!BlePermissions.hasNotificationPermission(context)) return false
+
+        val installIntent = Intent(context, UpdateInstallActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            putExtra(UpdateInstallActivity.EXTRA_APK_PATH, apkFile.absolutePath)
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            context, UPDATE_NOTIFICATION_ID, installIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_UPDATES)
+            .setSmallIcon(R.drawable.ic_notification_heart)
+            .setContentTitle("Update available")
+            .setContentText("Twogether $versionName is ready — tap to install")
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+
+        manager.notify(UPDATE_NOTIFICATION_ID, notification)
+        return true
     }
 }

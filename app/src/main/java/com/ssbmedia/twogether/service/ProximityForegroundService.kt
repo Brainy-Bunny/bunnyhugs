@@ -66,7 +66,16 @@ class ProximityForegroundService : LifecycleService() {
         super.onCreate()
         advertiser = AdvertiserManager(this)
         scanner = ScannerManager(this)
-        gattSync = GattSyncManager(this, ServiceLocator.dateIdeaRepository, lifecycleScope)
+        gattSync = GattSyncManager(
+            this,
+            ServiceLocator.dateIdeaRepository,
+            ServiceLocator.sessionRepository,
+            ServiceLocator.momentRepository,
+            ServiceLocator.momentNoteRepository,
+            ServiceLocator.milestoneRepository,
+            ServiceLocator.settingsStore,
+            lifecycleScope
+        )
 
         Notifications.ensureChannels(this)
 
@@ -199,11 +208,19 @@ class ProximityForegroundService : LifecycleService() {
     private suspend fun selfHealOrphanedSession(persisted: ProximityPersistedState, isStale: Boolean, now: Long) {
         val openSession = ServiceLocator.sessionRepository.getOpenSession() ?: return
         if (persisted.isTogether && !isStale) return // plausibly still together right now; normal flow (a real apart transition) will close it correctly.
-        val clampedEnd = if (persisted.lastSeenAt > 0L) {
-            minOf(now, persisted.lastSeenAt + stateMachine.absenceTimeoutMillis)
-        } else {
-            now
-        }.coerceAtLeast(openSession.startedAt)
+        // Bounded by the newest CONFIRMED sighting (maxOf(lastSeenAt, startedAt)) + the absence timeout,
+        // never by a bare "now" - see StatsCalculator.effectiveOpenSessionEnd's doc. Falling back to
+        // "now" when lastSeenAt was 0/absent used to bake the entire wall-clock gap into the row here,
+        // permanently and irreversibly: restoring a backup that contains an open session onto a
+        // replacement phone (whose proximity DataStore is at defaults, since restore deliberately does
+        // not restore proximity state) landed exactly in this branch and credited every day between the
+        // backup and the restore as real together-time.
+        val clampedEnd = StatsCalculator.effectiveOpenSessionEnd(
+            startedAt = openSession.startedAt,
+            now = now,
+            lastSeenAt = persisted.lastSeenAt,
+            absenceTimeoutMillis = stateMachine.absenceTimeoutMillis
+        ).coerceAtLeast(openSession.startedAt)
         Log.i(TAG, "Self-healing orphaned open session id=${openSession.id} (service wasn't running to close it)")
         ServiceLocator.sessionRepository.endSession(openSession, clampedEnd)
     }
@@ -435,11 +452,12 @@ class ProximityForegroundService : LifecycleService() {
             // timeout on restart, using "now" would credit the entire downtime gap as together-time.
             // lastSeenAt reflects the last real sighting (restored from persisted state if this is a
             // post-restart catch-up), so the session can never be credited past that + the timeout.
-            val clampedEnd = if (stateMachine.lastSeenAt > 0L) {
-                minOf(now, stateMachine.lastSeenAt + stateMachine.absenceTimeoutMillis)
-            } else {
-                now
-            }
+            val clampedEnd = StatsCalculator.effectiveOpenSessionEnd(
+                startedAt = openSession.startedAt,
+                now = now,
+                lastSeenAt = stateMachine.lastSeenAt,
+                absenceTimeoutMillis = stateMachine.absenceTimeoutMillis
+            )
             ServiceLocator.sessionRepository.endSession(openSession, clampedEnd.coerceAtLeast(openSession.startedAt))
         }
         continuousTogetherSinceMillis = 0L

@@ -20,6 +20,7 @@ import com.ssbmedia.twogether.ui.camera.CameraScreen
 import com.ssbmedia.twogether.ui.capsules.CapsulesScreen
 import com.ssbmedia.twogether.ui.dateideas.DateIdeasScreen
 import com.ssbmedia.twogether.ui.home.HomeScreen
+import com.ssbmedia.twogether.ui.milestones.MilestonesScreen
 import com.ssbmedia.twogether.ui.moments.MomentsScreen
 import com.ssbmedia.twogether.ui.settings.SettingsScreen
 import com.ssbmedia.twogether.ui.stats.StatsScreen
@@ -35,7 +36,7 @@ private val bottomItems = listOf(
 )
 
 @Composable
-fun TwogetherNavHost(cameraTrigger: Int, onUnpaired: () -> Unit) {
+fun TwogetherNavHost(cameraTrigger: Int, onUnpaired: () -> Unit, openMilestoneId: String? = null) {
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
@@ -43,6 +44,14 @@ fun TwogetherNavHost(cameraTrigger: Int, onUnpaired: () -> Unit) {
     LaunchedEffect(cameraTrigger) {
         if (cameraTrigger > 0) {
             navController.navigate(Screen.Camera.route) { launchSingleTop = true }
+        }
+    }
+
+    // Feature F: tapping a milestone's yearly notification opens the app straight into the Milestones
+    // screen with that milestone's retrospective pre-opened (see MilestonesScreen's initialMilestoneId).
+    LaunchedEffect(openMilestoneId) {
+        if (openMilestoneId != null) {
+            navController.navigate(Screen.Milestones.route) { launchSingleTop = true }
         }
     }
 
@@ -82,7 +91,8 @@ fun TwogetherNavHost(cameraTrigger: Int, onUnpaired: () -> Unit) {
                     onNavigateStats = { navController.navigate(Screen.Stats.route) },
                     onNavigateCapsules = { navController.navigate(Screen.Capsules.route) },
                     onNavigateBadges = { navController.navigate(Screen.Badges.route) },
-                    onNavigateCamera = { navController.navigate(Screen.Camera.route) }
+                    onNavigateCamera = { navController.navigate(Screen.Camera.route) },
+                    onNavigateMilestones = { navController.navigate(Screen.Milestones.route) }
                 )
             }
             composable(Screen.Calendar.route) { CalendarScreen(onBack = { navController.popBackStack() }) }
@@ -91,6 +101,9 @@ fun TwogetherNavHost(cameraTrigger: Int, onUnpaired: () -> Unit) {
             composable(Screen.Stats.route) { StatsScreen(onBack = { navController.popBackStack() }, onOpenBadges = { navController.navigate(Screen.Badges.route) }) }
             composable(Screen.Capsules.route) { CapsulesScreen(onBack = { navController.popBackStack() }) }
             composable(Screen.Badges.route) { BadgesScreen(onBack = { navController.popBackStack() }) }
+            composable(Screen.Milestones.route) {
+                MilestonesScreen(onBack = { navController.popBackStack() }, initialMilestoneId = openMilestoneId)
+            }
             composable(Screen.Settings.route) { SettingsScreen(onBack = { navController.popBackStack() }, onUnpaired = onUnpaired) }
             composable(Screen.Camera.route) {
                 CameraScreen(

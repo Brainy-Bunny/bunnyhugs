@@ -31,6 +31,7 @@ import com.ssbmedia.twogether.ui.theme.TwogetherTheme
 class MainActivity : ComponentActivity() {
 
     private val cameraTrigger = mutableIntStateOf(0)
+    private val milestoneTrigger = mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -38,6 +39,7 @@ class MainActivity : ComponentActivity() {
         if (intent?.getBooleanExtra(Notifications.EXTRA_OPEN_CAMERA, false) == true) {
             cameraTrigger.intValue = 1
         }
+        intent?.getStringExtra(Notifications.EXTRA_OPEN_MILESTONE_ID)?.let { milestoneTrigger.value = it }
 
         setContent {
             TwogetherTheme {
@@ -52,6 +54,7 @@ class MainActivity : ComponentActivity() {
                     var pairingInfo by remember { mutableStateOf<PairingInfo?>(null) }
                     var settings by remember { mutableStateOf<AppSettings?>(null) }
                     val trigger by cameraTrigger
+                    val milestoneId by milestoneTrigger
 
                     LaunchedEffect(Unit) {
                         ServiceLocator.pairingStore.info.collect { pairingInfo = it }
@@ -76,7 +79,8 @@ class MainActivity : ComponentActivity() {
                         loadedSettings.pinEnabled && AppLockManager.isLocked -> PinLockScreen()
                         else -> TwogetherNavHost(
                             cameraTrigger = trigger,
-                            onUnpaired = { stopProximityService() }
+                            onUnpaired = { stopProximityService() },
+                            openMilestoneId = milestoneId
                         )
                     }
                 }
@@ -90,6 +94,7 @@ class MainActivity : ComponentActivity() {
         if (intent.getBooleanExtra(Notifications.EXTRA_OPEN_CAMERA, false)) {
             cameraTrigger.intValue += 1
         }
+        intent.getStringExtra(Notifications.EXTRA_OPEN_MILESTONE_ID)?.let { milestoneTrigger.value = it }
     }
 
     private fun startProximityService() {

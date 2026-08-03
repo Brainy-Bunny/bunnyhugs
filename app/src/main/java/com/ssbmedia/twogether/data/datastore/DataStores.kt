@@ -13,6 +13,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import java.util.UUID
 
 // A torn/corrupted preferences file (e.g. a write interrupted by a crash or power loss) throws
 // CorruptionException on every future read forever without a corruptionHandler - which, for the
@@ -187,7 +188,22 @@ data class AppSettings(
     val lastSyncAt: Long = 0L,
     val deviceTieBreakByte: Int? = null,
     val lastBackupAt: Long = 0L,
-    val lastBackupOk: Boolean = false
+    val lastBackupOk: Boolean = false,
+    /** Feature D: this install's stable identity, used to tag which side authored a MomentNote (see
+     * MomentNoteRepository). Generated once via getOrCreateLocalDeviceId(); deliberately included in
+     * backup/restore (BackupManager) so restoring onto a replacement phone after a loss keeps this
+     * person's own notes recognized as "mine" rather than misattributed as the partner's. */
+    val localDeviceId: String? = null,
+    /** Auto-update: whether app start / the daily UpdateWorker are allowed to hit the GitHub Releases
+     * API at all. Defaults on, but is a real opt-out - this is the one deliberate exception to this
+     * app's otherwise fully-offline design (see the INTERNET permission's manifest comment), so it
+     * must stay under the user's control. The manual "Check for updates now" button in Settings
+     * ignores this (an explicit tap is its own consent) - see UpdateChecker/SettingsScreen. */
+    val autoUpdateCheckEnabled: Boolean = true,
+    /** Auto-update: wall-clock time of the last *attempted* update check (success or failure),
+     * whichever of app-start or UpdateWorker ran it - throttles app-start's own check so reopening
+     * the app repeatedly can't re-hit the network every time; see UpdateChecker.MIN_CHECK_INTERVAL_MS. */
+    val lastUpdateCheckAt: Long = 0L
 )
 
 class SettingsStore(private val context: Context) {
@@ -200,6 +216,9 @@ class SettingsStore(private val context: Context) {
         val TIE_BREAK = intPreferencesKey("device_tie_break_byte")
         val LAST_BACKUP_AT = longPreferencesKey("last_backup_at")
         val LAST_BACKUP_OK = booleanPreferencesKey("last_backup_ok")
+        val LOCAL_DEVICE_ID = stringPreferencesKey("local_device_id")
+        val AUTO_UPDATE_ENABLED = booleanPreferencesKey("auto_update_check_enabled")
+        val LAST_UPDATE_CHECK_AT = longPreferencesKey("last_update_check_at")
     }
 
     val settings: Flow<AppSettings> = context.settingsDs.data.map { p ->
@@ -211,8 +230,23 @@ class SettingsStore(private val context: Context) {
             lastSyncAt = p[Keys.LAST_SYNC] ?: 0L,
             deviceTieBreakByte = p[Keys.TIE_BREAK],
             lastBackupAt = p[Keys.LAST_BACKUP_AT] ?: 0L,
-            lastBackupOk = p[Keys.LAST_BACKUP_OK] ?: false
+            lastBackupOk = p[Keys.LAST_BACKUP_OK] ?: false,
+            localDeviceId = p[Keys.LOCAL_DEVICE_ID],
+            autoUpdateCheckEnabled = p[Keys.AUTO_UPDATE_ENABLED] ?: true,
+            lastUpdateCheckAt = p[Keys.LAST_UPDATE_CHECK_AT] ?: 0L
         )
+    }
+
+    /** Returns this install's persistent random device identity (Feature D), generating it once if
+     * missing - same read-then-write-inside-one-edit{} pattern as getOrCreateTieBreakByte() below, for
+     * the same reason (two concurrent callers must not each generate and persist a different id). */
+    suspend fun getOrCreateLocalDeviceId(): String {
+        var result = ""
+        context.settingsDs.edit { p ->
+            val existing = p[Keys.LOCAL_DEVICE_ID]
+            result = if (existing != null) existing else UUID.randomUUID().toString().also { p[Keys.LOCAL_DEVICE_ID] = it }
+        }
+        return result
     }
 
     /** Returns this install's persistent random role tie-break byte, generating it once if missing.
@@ -273,6 +307,14 @@ class SettingsStore(private val context: Context) {
         context.settingsDs.edit { it[Keys.LAST_SYNC] = time }
     }
 
+    suspend fun setAutoUpdateCheckEnabled(enabled: Boolean) {
+        context.settingsDs.edit { it[Keys.AUTO_UPDATE_ENABLED] = enabled }
+    }
+
+    suspend fun setLastUpdateCheckAt(time: Long) {
+        context.settingsDs.edit { it[Keys.LAST_UPDATE_CHECK_AT] = time }
+    }
+
     /** Records the outcome of the most recent backup attempt (manual "Back up now" or the weekly
      * WorkManager job), so Settings can show "Last backup: ..." / "failed" without the caller having to
      * plumb a one-shot result through separately. */
@@ -289,7 +331,7 @@ class SettingsStore(private val context: Context) {
      * not the couple's data, and get set again right after this call completes anyway). */
     suspend fun restoreRaw(
         defaultSnoozeMinutes: Int, notificationsEnabled: Boolean, pinHash: String?, pinEnabled: Boolean,
-        lastSyncAt: Long, deviceTieBreakByte: Int?
+        lastSyncAt: Long, deviceTieBreakByte: Int?, localDeviceId: String? = null
     ) {
         context.settingsDs.edit { p ->
             p[Keys.SNOOZE_MIN] = defaultSnoozeMinutes
@@ -298,6 +340,12 @@ class SettingsStore(private val context: Context) {
             p[Keys.PIN_ENABLED] = pinEnabled
             p[Keys.LAST_SYNC] = lastSyncAt
             if (deviceTieBreakByte != null) p[Keys.TIE_BREAK] = deviceTieBreakByte else p.remove(Keys.TIE_BREAK)
+            // Deliberately NOT cleared when null (unlike the other fields above) - an older backup made
+            // before Feature D existed simply won't have this key, and this device's own already-generated
+            // id (if any) must survive that restore rather than being wiped, or a fresh
+            // getOrCreateLocalDeviceId() call right after would mint a new one anyway; either way there's
+            // no "restore to blank" case worth supporting here.
+            if (localDeviceId != null) p[Keys.LOCAL_DEVICE_ID] = localDeviceId
         }
     }
 }

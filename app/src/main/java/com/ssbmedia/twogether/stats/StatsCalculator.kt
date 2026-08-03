@@ -6,9 +6,23 @@ import java.time.DayOfWeek
 import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
+import java.time.YearMonth
 import java.time.ZoneId
-import java.time.temporal.IsoFields
 import java.time.temporal.WeekFields
+
+/** A calendar month plus a metric value for it - used by [TogetherStats.mostMetMonth] (value = distinct
+ * together-days that month) and [TogetherStats.mostHoursMonth] (value = together-hours that month). */
+data class MonthStat(val yearMonth: YearMonth, val value: Double)
+
+/** A single calendar date plus a metric value - used by [TogetherStats.longestSingleDay] (hours). */
+data class DayStat(val date: LocalDate, val hours: Double)
+
+/** Simple up/down/flat trend signal - see [TogetherStats.monthTrend]'s doc for exactly what's compared. */
+enum class Trend { UP, DOWN, FLAT }
+
+/** A gap between two consecutive "meetups" (see [StatsCalculator] clustering doc), with the actual
+ * millis range it spans so the UI can render e.g. "12 days apart, March 3 – March 15, 2026". */
+data class GapInfo(val days: Double, val startMillis: Long, val endMillis: Long)
 
 data class TogetherStats(
     val totalHoursAllTime: Double,
@@ -24,60 +38,129 @@ data class TogetherStats(
     /** Total distinct calendar days with any together-time at all (BLE-detected or manually backfilled).
      * Same qualifying-day set the Calendar screen highlights - computed once here off the same
      * buildDailyMinuteMap() so the two screens can never drift apart. */
-    val totalDaysTogether: Int
+    val totalDaysTogether: Int,
+    // ---- Feature E: more stats, all derived from the same merged/deduped session data above ----
+    /** The calendar month with the most distinct together-days. */
+    val mostMetMonth: MonthStat?,
+    /** The calendar month with the most cumulative together-hours. */
+    val mostHoursMonth: MonthStat?,
+    /** The single calendar day with the most together-hours. */
+    val longestSingleDay: DayStat?,
+    /** The date of the very first-ever recorded session (BLE-detected or manual), across all history -
+     * computed from raw session start times, not the merged/clamped timeline, so it's never affected by
+     * how open sessions get clamped. */
+    val togetherSince: LocalDate?,
+    /** This month's hours-so-far vs the SAME elapsed window of last month (e.g. "first 9 days of this
+     * month" vs "first 9 days of last month") - not this-month-partial vs last-month-total, which would
+     * unfairly always trend down until the month is almost over. UP/DOWN uses a 5% deadband either side
+     * so tiny noise doesn't flip-flop the label. */
+    val monthTrend: Trend,
+    /** Average days between the end of one "meetup" and the start of the next (null if fewer than 2
+     * meetups exist yet). A "meetup" clusters sessions/merged-intervals separated by less than
+     * [MEETUP_GAP_MILLIS] into one, so a couple who went apart for an hour and came back the same day
+     * still counts as a single meetup, not two. */
+    val avgDaysBetweenMeetups: Double?,
+    /** The single longest gap between two consecutive meetups, with the actual date range it spans. */
+    val longestApart: GapInfo?
 )
 
 private const val REUNION_GAP_MILLIS = 30 * 60 * 1000L
 
+/** Gap threshold used to cluster individual sessions/merged intervals into a single "meetup" for
+ * [TogetherStats.avgDaysBetweenMeetups] / [TogetherStats.longestApart] - a couple apart for less than
+ * this (e.g. a coffee run, a short errand) during an otherwise-continuous day together still counts as
+ * one meetup, not two separate ones. Deliberately larger than REUNION_GAP_MILLIS (which flags ANY gap
+ * worth celebrating as a reunion) since "distinct meetup" is a coarser, daily-life-scale concept. */
+private const val MEETUP_GAP_MILLIS = 4 * 60 * 60 * 1000L
+
+/** Arbitrary fixed date used only as a field-template base in computeWeeklyStreaks' previousWeekKey -
+ * see its doc for why this must NOT be LocalDate.now(). Any date works; this one is a plain, safely
+ * mid-week/mid-year Monday. */
+private val FIXED_WEEK_ANCHOR: LocalDate = LocalDate.of(2000, 1, 3)
+
 object StatsCalculator {
 
     /**
-     * The effective "as of now" cutoff to use in place of an open (endedAt == null) session's live
-     * duration. Mirrors the SAME clamp every WRITE path already applies when it actually closes a
-     * session (see ProximityForegroundService.handleBecameApart / selfHealOrphanedSession /
-     * SettingsScreen.unpair): an open session's credited duration must never run past the last
-     * confirmed sighting of the partner (lastSeenAt) plus the absence timeout.
+     * The effective end timestamp to credit an open (endedAt == null) session up to. Mirrors the SAME
+     * clamp every WRITE path applies when it actually closes a session (see
+     * ProximityForegroundService.handleBecameApart / selfHealOrphanedSession / SettingsScreen.unpair):
+     * an open session's credited duration must never run past the newest CONFIRMED sighting of the
+     * partner plus the absence timeout.
      *
      * Without this, any READ of an open session (stats totals, capsule-unlock eligibility, badge
      * progress, calendar day totals) that naively substitutes "now" for a missing endedAt would let a
      * stale/orphaned open row (service killed, BLE permission revoked so it never restarts to self-heal,
      * a reboot, etc) silently "grow" forever every single time anything reads it - which is especially
      * dangerous for Time Capsules, since crossing a threshold there performs a real, irreversible write
-     * (unlockedAt). [lastSeenAt] <= 0 means "no sighting info available" (e.g. a screen that hasn't
-     * loaded proximity state yet) and intentionally falls back to the old unclamped "now" behavior rather
-     * than always reporting a zero-length open session.
+     * (unlockedAt).
+     *
+     * "Newest confirmed sighting" is `maxOf(lastSeenAt, startedAt)`, NOT lastSeenAt alone. [startedAt]
+     * is itself a confirmed sighting timestamp: a BLE session row only ever gets created from
+     * ProximityForegroundService.handleBecameTogether(now), which runs immediately after
+     * ProximityStateMachine.onBeaconSeen(now) confirmed the partner's beacon at that exact instant. That
+     * matters because [lastSeenAt] can legitimately be 0/absent while an open session row still exists -
+     * most importantly right after BackupManager.restoreBackup() writes a backed-up open session onto a
+     * phone whose proximity DataStore is still at its defaults (restore deliberately does not restore
+     * proximity state, and a replacement phone has none), and equally after DataStores.kt's
+     * ReplaceFileCorruptionHandler resets a torn proximity_state file to emptyPreferences(). This used to
+     * fall back to a completely UNCLAMPED "now", which credited the entire wall-clock gap between when
+     * the backup was taken and when it was restored as real together-time (verified: a 30-day-old open
+     * session reported 723.5h and irreversibly unlocked every time capsule up to 500h). Falling back to
+     * startedAt keeps the fallback bounded by actual evidence instead.
      */
-    fun effectiveOpenSessionCutoff(
+    fun effectiveOpenSessionEnd(
+        startedAt: Long,
         now: Long,
         lastSeenAt: Long,
         absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
-    ): Long = if (lastSeenAt > 0L) minOf(now, lastSeenAt + absenceTimeoutMillis) else now
+    ): Long = minOf(now, maxOf(lastSeenAt, startedAt) + absenceTimeoutMillis)
 
     fun compute(
         sessions: List<TogetherSession>,
         now: Long = System.currentTimeMillis(),
         zone: ZoneId = ZoneId.systemDefault(),
         /** Latest confirmed partner sighting (ProximityPersistedState.lastSeenAt), used to clamp an
-         * open session's live duration - see [effectiveOpenSessionCutoff]. Pass 0L only when this
-         * information genuinely isn't available yet. */
+         * open session's live duration - see [effectiveOpenSessionEnd]. Pass 0L only when this
+         * information genuinely isn't available yet; that case is still bounded by the session's own
+         * startedAt rather than running unclamped to [now]. */
         lastSeenAt: Long = 0L,
         absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
     ): TogetherStats {
-        val openCutoff = effectiveOpenSessionCutoff(now, lastSeenAt, absenceTimeoutMillis)
+
+        // Computed from raw session start times (not the merged/clamped timeline below) so it reflects
+        // the true first-ever recorded moment regardless of how open sessions get clamped elsewhere.
+        val togetherSince = sessions.minByOrNull { it.startedAt }
+            ?.let { LocalDateTime.ofInstant(Instant.ofEpochMilli(it.startedAt), zone).toLocalDate() }
 
         // Merges possibly-overlapping session intervals (e.g. a manually backfilled "today, 2h" entry
         // stacked on top of BLE-detected time already logged that day) into a normalized,
         // non-overlapping timeline before any duration math happens - so overlapping rows count real
         // elapsed time once, not twice, no matter how the overlap got there. This is read-side only;
         // nothing about how sessions are validated/inserted needs to change for this to be correct.
-        val merged = mergedIntervals(sessions, openCutoff)
+        val merged = mergedIntervals(sessions, now, lastSeenAt, absenceTimeoutMillis)
         if (merged.isEmpty()) {
-            return TogetherStats(0.0, 0.0, 0.0, 0, 0, 0, 0, 0, 0, null, 0)
+            return TogetherStats(
+                totalHoursAllTime = 0.0, totalHoursThisWeek = 0.0, totalHoursThisMonth = 0.0,
+                currentDailyStreak = 0, longestDailyStreak = 0, currentWeeklyStreak = 0, longestWeeklyStreak = 0,
+                longestSessionMinutes = 0, reunionCount = 0, favoriteDayOfWeek = null, totalDaysTogether = 0,
+                mostMetMonth = null, mostHoursMonth = null, longestSingleDay = null, togetherSince = togetherSince,
+                monthTrend = Trend.FLAT, avgDaysBetweenMeetups = null, longestApart = null
+            )
         }
 
         val totalHoursAllTime = merged.sumOf { it.end - it.start } / 3_600_000.0
 
-        val today = LocalDate.now(zone)
+        // Deliberately derived from the `now` parameter (not LocalDate.now(zone), the real wall clock)
+        // so this whole function is a pure function of its inputs and "today" can never race ahead of
+        // `now` itself. A caller (e.g. HomeScreen.kt) may pass a `now` that's a few/tens of seconds stale
+        // versus the real clock (its ticker only refreshes every 30s) - if `today` were computed from the
+        // TRUE wall clock instead, then right after any ISO-week or month boundary tick, startOfWeek/
+        // startOfMonth would already reflect the new week/month while `now` (the clip range's upper
+        // bound below) still reflected the old one, making rangeEnd < rangeStart for every interval and
+        // silently reporting 0.0 for totalHoursThisWeek/totalHoursThisMonth even though the couple has
+        // real together-time already inside the new week/month - a real, reproducible under-count on
+        // every single week rollover. See StatsCalculatorAuditTest's "BUG - totalHoursThisWeek..." test.
+        val today = LocalDateTime.ofInstant(Instant.ofEpochMilli(now), zone).toLocalDate()
         val startOfWeek = today.with(java.time.DayOfWeek.MONDAY).atStartOfDay(zone).toInstant().toEpochMilli()
         val startOfMonth = today.withDayOfMonth(1).atStartOfDay(zone).toInstant().toEpochMilli()
 
@@ -113,6 +196,48 @@ object StatsCalculator {
             ?.takeIf { it.value > 0 }
             ?.key
 
+        // ---- Feature E ----
+
+        val hoursByMonth = HashMap<YearMonth, Double>()
+        val daysByMonth = HashMap<YearMonth, Int>()
+        minutesPerDay.forEach { (date, minutes) ->
+            val ym = YearMonth.from(date)
+            hoursByMonth[ym] = (hoursByMonth[ym] ?: 0.0) + minutes / 60.0
+            daysByMonth[ym] = (daysByMonth[ym] ?: 0) + 1
+        }
+        val mostMetMonth = daysByMonth.maxByOrNull { it.value }?.let { MonthStat(it.key, it.value.toDouble()) }
+        val mostHoursMonth = hoursByMonth.maxByOrNull { it.value }?.let { MonthStat(it.key, it.value) }
+
+        val longestSingleDay = minutesPerDay.maxByOrNull { it.value }?.let { DayStat(it.key, it.value / 60.0) }
+
+        val elapsedIntoMonth = (now - startOfMonth).coerceAtLeast(0L)
+        val lastMonthStart = today.minusMonths(1).withDayOfMonth(1).atStartOfDay(zone).toInstant().toEpochMilli()
+        val hoursThisMonthSoFar = merged.sumOf { clippedIntervalMillis(it, startOfMonth, startOfMonth + elapsedIntoMonth) } / 3_600_000.0
+        // Cap the "last month" window's end at startOfMonth (this month's start, i.e. last month's real
+        // exclusive end) - NEVER let it run past into this month. Without this cap, on any day-of-month
+        // that's further in than the previous (shorter) month's total length - e.g. "now" = March 30
+        // (elapsedIntoMonth ~29.5 days) compared against February (only 28 days) - lastMonthStart +
+        // elapsedIntoMonth spills past Feb's real end and back into March itself, double-attributing
+        // THIS month's own hours into the "last month" figure too and silently hiding a genuine increase
+        // (or fabricating a decrease) behind a wrongly-inflated "last month" number.
+        val lastMonthWindowEnd = minOf(lastMonthStart + elapsedIntoMonth, startOfMonth)
+        val hoursLastMonthSameWindow = merged.sumOf { clippedIntervalMillis(it, lastMonthStart, lastMonthWindowEnd) } / 3_600_000.0
+        val monthTrend = when {
+            hoursThisMonthSoFar > hoursLastMonthSameWindow * 1.05 -> Trend.UP
+            hoursThisMonthSoFar < hoursLastMonthSameWindow * 0.95 -> Trend.DOWN
+            else -> Trend.FLAT
+        }
+
+        val meetups = clusterMeetups(merged)
+        val avgDaysBetweenMeetups = if (meetups.size >= 2) {
+            (1 until meetups.size).map { (meetups[it].start - meetups[it - 1].end) / 86_400_000.0 }.average()
+        } else null
+        val longestApart = if (meetups.size >= 2) {
+            (1 until meetups.size)
+                .map { GapInfo((meetups[it].start - meetups[it - 1].end) / 86_400_000.0, meetups[it - 1].end, meetups[it].start) }
+                .maxByOrNull { it.days }
+        } else null
+
         return TogetherStats(
             totalHoursAllTime = totalHoursAllTime,
             totalHoursThisWeek = totalHoursThisWeek,
@@ -124,19 +249,32 @@ object StatsCalculator {
             longestSessionMinutes = longestSessionMinutes,
             reunionCount = reunionCount,
             favoriteDayOfWeek = favoriteDayOfWeek,
-            totalDaysTogether = qualifyingDays.size
+            totalDaysTogether = qualifyingDays.size,
+            mostMetMonth = mostMetMonth,
+            mostHoursMonth = mostHoursMonth,
+            longestSingleDay = longestSingleDay,
+            togetherSince = togetherSince,
+            monthTrend = monthTrend,
+            avgDaysBetweenMeetups = avgDaysBetweenMeetups,
+            longestApart = longestApart
         )
     }
 
     private data class Interval(val start: Long, val end: Long)
 
-    /** Sorts sessions by start, clamps any open one's end via [effectiveOpenSessionCutoff]-derived
-     * [openCutoff], drops degenerate non-positive-duration rows, then merges overlapping/touching
-     * intervals into a normalized non-overlapping timeline. Shared by [compute] and
-     * [buildDailyMinuteMap] so both can never drift apart on how overlap is resolved. */
-    private fun mergedIntervals(sessions: List<TogetherSession>, openCutoff: Long): List<Interval> {
+    /** Sorts sessions by start, clamps any open one's end via [effectiveOpenSessionEnd] (per row, since
+     * the fallback bound depends on that row's own startedAt), drops degenerate non-positive-duration
+     * rows, then merges overlapping/touching intervals into a normalized non-overlapping timeline.
+     * Shared by [compute] and [buildDailyMinuteMap] so both can never drift apart on how overlap is
+     * resolved. */
+    private fun mergedIntervals(
+        sessions: List<TogetherSession>,
+        now: Long,
+        lastSeenAt: Long,
+        absenceTimeoutMillis: Long
+    ): List<Interval> {
         val raw = sessions
-            .map { Interval(it.startedAt, it.endedAt ?: openCutoff) }
+            .map { Interval(it.startedAt, it.endedAt ?: effectiveOpenSessionEnd(it.startedAt, now, lastSeenAt, absenceTimeoutMillis)) }
             .filter { it.end > it.start }
             .sortedBy { it.start }
         if (raw.isEmpty()) return emptyList()
@@ -153,6 +291,22 @@ object StatsCalculator {
         return merged
     }
 
+    /** Feature E: greedily groups consecutive merged intervals separated by less than
+     * [MEETUP_GAP_MILLIS] into one "meetup" - see [TogetherStats.avgDaysBetweenMeetups]'s doc. */
+    private fun clusterMeetups(mergedSorted: List<Interval>): List<Interval> {
+        if (mergedSorted.isEmpty()) return emptyList()
+        val out = mutableListOf(mergedSorted.first())
+        for (interval in mergedSorted.drop(1)) {
+            val last = out.last()
+            if (interval.start - last.end < MEETUP_GAP_MILLIS) {
+                out[out.lastIndex] = last.copy(end = maxOf(last.end, interval.end))
+            } else {
+                out.add(interval)
+            }
+        }
+        return out
+    }
+
     private fun clippedIntervalMillis(interval: Interval, rangeStart: Long, rangeEnd: Long): Long {
         val start = maxOf(interval.start, rangeStart)
         val end = minOf(interval.end, rangeEnd)
@@ -165,13 +319,12 @@ object StatsCalculator {
         sessions: List<TogetherSession>,
         now: Long = System.currentTimeMillis(),
         zone: ZoneId = ZoneId.systemDefault(),
-        /** See [compute]'s doc - forwarded to [effectiveOpenSessionCutoff] so an open session's minutes
+        /** See [compute]'s doc - forwarded to [effectiveOpenSessionEnd] so an open session's minutes
          * here can't grow unbounded off a stale/orphaned row either. */
         lastSeenAt: Long = 0L,
         absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
     ): Map<LocalDate, Long> {
-        val openCutoff = effectiveOpenSessionCutoff(now, lastSeenAt, absenceTimeoutMillis)
-        val merged = mergedIntervals(sessions, openCutoff)
+        val merged = mergedIntervals(sessions, now, lastSeenAt, absenceTimeoutMillis)
         val map = HashMap<LocalDate, Long>()
         for (interval in merged) {
             var cursor = interval.start
@@ -223,8 +376,13 @@ object StatsCalculator {
         if (qualifyingWeeks.isEmpty()) return 0 to 0
 
         fun previousWeekKey(key: Pair<Int, Int>): Pair<Int, Int> {
-            // Approximate: step back 7 days from the first day of that ISO week.
-            val approxDate = LocalDate.now().with(WeekFields.ISO.weekBasedYear(), key.first.toLong())
+            // Step back 7 days from the Monday of that ISO week. Anchored on a FIXED reference date
+            // (not LocalDate.now()/today) so this is a pure function of `key` alone - using the real
+            // wall clock as a throwaway "template" date here was harmless in practice (the weekBasedYear/
+            // weekOfWeekBasedYear/dayOfWeek fields set below fully determine the result) but needlessly
+            // tied this to the system default zone, which could differ from the `zone` this whole
+            // StatsCalculator.compute() call was asked to use.
+            val approxDate = FIXED_WEEK_ANCHOR.with(WeekFields.ISO.weekBasedYear(), key.first.toLong())
                 .with(WeekFields.ISO.weekOfWeekBasedYear(), key.second.toLong())
                 .with(WeekFields.ISO.dayOfWeek(), 1L)
             val prev = approxDate.minusWeeks(1)

@@ -6,11 +6,14 @@ import android.content.Intent
 import androidx.core.content.ContextCompat
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.ble.BlePermissions
+import com.ssbmedia.twogether.notif.MilestoneAlarmScheduler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
-/** Restarts the proximity foreground service after a reboot, if this device is already paired. */
+/** Restarts the proximity foreground service after a reboot, if this device is already paired. Also
+ * re-arms every milestone's yearly alarm (Feature F) - AlarmManager alarms are wiped by a reboot and
+ * are NOT automatically restored, regardless of pairing state. */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
@@ -27,6 +30,8 @@ class BootReceiver : BroadcastReceiver() {
                     val serviceIntent = Intent(appContext, ProximityForegroundService::class.java)
                     ContextCompat.startForegroundService(appContext, serviceIntent)
                 }
+                val milestones = ServiceLocator.milestoneRepository.getAll().filter { !it.deleted }
+                MilestoneAlarmScheduler.scheduleAll(appContext, milestones)
             } finally {
                 pendingResult.finish()
             }
