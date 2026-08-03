@@ -1,0 +1,27 @@
+# Secrets — never commit
+credentials/
+*.jks
+*.keystore
+keystore.properties
+
+# Local machine config
+local.properties
+
+# Build outputs
+/build/
+app/build/
+*.apk
+*.aab
+
+# Gradle / Kotlin
+.gradle/
+.kotlin/
+gradle-app.setting
+
+# IDE (not used here, but just in case)
+.idea/
+*.iml
+
+# Misc
+qa_logs/
+.DS_Store

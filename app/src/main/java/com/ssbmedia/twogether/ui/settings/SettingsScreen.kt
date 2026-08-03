@@ -1,0 +1,392 @@
+package com.ssbmedia.twogether.ui.settings
+
+import android.content.Context
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.ssbmedia.twogether.BuildConfig
+import com.ssbmedia.twogether.ServiceLocator
+import com.ssbmedia.twogether.ble.ProximityStateMachine
+import com.ssbmedia.twogether.data.backup.BackupManager
+import com.ssbmedia.twogether.data.datastore.AppSettings
+import com.ssbmedia.twogether.events.AppEvents
+import com.ssbmedia.twogether.lock.AppLockManager
+import com.ssbmedia.twogether.lock.PinUtil
+import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+class SettingsViewModel : ViewModel() {
+    val settings = ServiceLocator.settingsStore.settings
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), AppSettings())
+
+    fun setSnoozeMinutes(min: Int) {
+        viewModelScope.launch { ServiceLocator.settingsStore.setDefaultSnoozeMinutes(min) }
+    }
+
+    fun setNotificationsEnabled(enabled: Boolean) {
+        viewModelScope.launch { ServiceLocator.settingsStore.setNotificationsEnabled(enabled) }
+    }
+
+    fun setPin(pin: String) {
+        viewModelScope.launch {
+            ServiceLocator.settingsStore.setPin(PinUtil.hash(pin))
+            // AppLockManager.isLocked defaults to true and is otherwise only cleared by successfully
+            // entering the PIN on PinLockScreen. Without this, turning PIN lock on for the first time
+            // (isLocked has never been flipped false yet) immediately re-shows the lock screen right
+            // after the user just typed the same PIN into the "set PIN" dialog - forcing them to
+            // enter it twice in a row for no reason. The user is already authenticated in this
+            // session (they're sitting in Settings), so unlock immediately.
+            AppLockManager.unlock()
+        }
+    }
+
+    fun clearPin() {
+        viewModelScope.launch { ServiceLocator.settingsStore.clearPin() }
+    }
+
+    fun unpair(onDone: () -> Unit) {
+        // Deliberately launched on the app-scoped coroutine, NOT viewModelScope: the pairingStore.unpair()
+        // write below flips MainActivity's pairing state, which disposes SettingsScreen (and cancels its
+        // viewModelScope) as soon as that recomposition lands - which can race ahead of this same
+        // coroutine resuming to run its remaining lines (AppEvents.emitUnpaired() / onDone(), which is
+        // what actually calls stopProximityService()). If viewModelScope had won that race, the proximity
+        // foreground service (and its persistent notification) would be left running orphaned - BLE
+        // itself would self-heal within ~5s via the ticker's own pairing check, but the notification would
+        // linger until the process was killed. ServiceLocator.applicationScope outlives the screen, so
+        // this always runs to completion regardless of how fast the navigation change disposes the screen.
+        ServiceLocator.applicationScope.launch {
+            // Unpairing while together used to leave any open TogetherSession row open forever (nothing
+            // else would ever close it, since the service tears down BLE/GATT for this pairing right
+            // after), which made Home's "together" status and all-time-hours stats grow unbounded
+            // forever. Close it first, clamped the same way the service itself clamps a normal
+            // apart-transition (never later than the last real sighting + the absence timeout).
+            val openSession = ServiceLocator.sessionRepository.getOpenSession()
+            if (openSession != null) {
+                val persisted = ServiceLocator.proximityStateStore.current()
+                val now = System.currentTimeMillis()
+                val clampedEnd = if (persisted.lastSeenAt > 0L) {
+                    minOf(now, persisted.lastSeenAt + ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS)
+                } else {
+                    now
+                }
+                ServiceLocator.sessionRepository.endSession(openSession, clampedEnd.coerceAtLeast(openSession.startedAt))
+            }
+            ServiceLocator.proximityStateStore.update {
+                it.copy(isTogether = false, continuousTogetherSince = 0L, currentSessionId = -1L, pendingReunionCelebration = false)
+            }
+            ServiceLocator.pairingStore.unpair()
+            AppEvents.emitUnpaired()
+            onDone()
+        }
+    }
+
+    /** Launched on applicationScope for consistency with unpair() above, so a mid-backup screen
+     * navigation can't truncate a backup either. (Restore itself - which DOES have the same
+     * dispose-mid-flight landmine as unpair() - is handled by the shared RestoreBackupButton composable,
+     * used here and from PairingScreen's onboarding landing; see its doc comment.) */
+    fun backupNow(context: Context, onResult: (BackupManager.BackupResult) -> Unit) {
+        ServiceLocator.applicationScope.launch {
+            val result = BackupManager.createBackup(context.applicationContext)
+            onResult(result)
+        }
+    }
+}
+
+@Composable
+fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
+    val vm: SettingsViewModel = viewModel(factory = SimpleViewModelFactory { SettingsViewModel() })
+    val settings by vm.settings.collectAsState()
+    var partnerName by remember { mutableStateOf("") }
+    var pairingCode by remember { mutableStateOf("") }
+
+    LaunchedEffect(Unit) {
+        val info = ServiceLocator.pairingStore.current()
+        partnerName = info.partnerName
+        pairingCode = info.pairPlainCode.orEmpty()
+    }
+
+    var showPinDialog by remember { mutableStateOf(false) }
+    var showUnpairConfirm by remember { mutableStateOf(false) }
+    var showSnoozeDialog by remember { mutableStateOf(false) }
+
+    val context = LocalContext.current
+    var isBackingUp by remember { mutableStateOf(false) }
+    var backupMessage by remember { mutableStateOf<String?>(null) }
+
+    Scaffold(
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = { Text("Settings") },
+                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "Back") } }
+            )
+        }
+    ) { padding ->
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(padding).verticalScroll(rememberScrollState()).padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            SettingsSection(title = "Notifications") {
+                SettingsRow(label = "Notifications enabled", subtitle = "15-minute photo nudges and updates") {
+                    Switch(checked = settings.notificationsEnabled, onCheckedChange = { vm.setNotificationsEnabled(it) })
+                }
+                SettingsRow(label = "Default snooze length", subtitle = "${settings.defaultSnoozeMinutes} minutes") {
+                    TextButton(onClick = { showSnoozeDialog = true }) { Text("Change") }
+                }
+            }
+
+            SettingsSection(title = "Privacy") {
+                SettingsRow(label = "App lock (PIN)", subtitle = if (settings.pinEnabled) "On — required to open the app" else "Off") {
+                    Switch(
+                        checked = settings.pinEnabled,
+                        onCheckedChange = { enabled ->
+                            if (enabled) showPinDialog = true else vm.clearPin()
+                        }
+                    )
+                }
+                if (settings.pinEnabled) {
+                    SettingsRow(label = "Change PIN", subtitle = "Update your app lock code") {
+                        TextButton(onClick = { showPinDialog = true }) { Text("Change") }
+                    }
+                }
+            }
+
+            SettingsSection(title = "Pairing") {
+                SettingsRow(label = "Paired with", subtitle = partnerName.ifBlank { "—" }) {}
+                if (pairingCode.isNotBlank()) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                        Text("Your pairing code", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "Share this with your partner's phone if they ever need to rejoin (lost data, factory reset, reinstall).",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Card(
+                            shape = MaterialTheme.shapes.medium,
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                            modifier = Modifier.padding(top = 8.dp)
+                        ) {
+                            Text(
+                                text = pairingCode.chunked(3).joinToString("  "),
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp)
+                            )
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+                SettingsRow(label = "Unpair this phone", subtitle = "Disconnects from your partner locally") {
+                    TextButton(onClick = { showUnpairConfirm = true }) { Text("Unpair") }
+                }
+            }
+
+            SettingsSection(title = "Backup & Restore") {
+                val lastBackupSubtitle = when {
+                    isBackingUp -> "Backing up…"
+                    settings.lastBackupAt <= 0L -> "Never backed up yet — a weekly backup runs automatically"
+                    else -> {
+                        val fmt = remember { SimpleDateFormat("MMM d, h:mm a", Locale.getDefault()) }
+                        val whenText = fmt.format(Date(settings.lastBackupAt))
+                        if (settings.lastBackupOk) "Last backup: $whenText" else "Last backup FAILED: $whenText"
+                    }
+                }
+                SettingsRow(label = "Back up now", subtitle = lastBackupSubtitle) {
+                    if (isBackingUp) {
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp))
+                    } else {
+                        TextButton(onClick = {
+                            isBackingUp = true
+                            vm.backupNow(context) { result ->
+                                isBackingUp = false
+                                backupMessage = result.message
+                            }
+                        }) { Text("Back up now") }
+                    }
+                }
+                SettingsRow(label = "Restore from backup", subtitle = "Loads sessions, photos, and pairing from a saved backup file") {
+                    com.ssbmedia.twogether.ui.backup.RestoreBackupButton { onClick ->
+                        TextButton(onClick = onClick) { Text("Restore") }
+                    }
+                }
+            }
+
+            SettingsSection(title = "About") {
+                SettingsRow(label = "Version", subtitle = BuildConfig.VERSION_NAME) {}
+                SettingsRow(label = "Twogether", subtitle = "Made for the two of you 💕 — fully offline, no accounts, no servers.") {}
+            }
+        }
+    }
+
+    if (showSnoozeDialog) {
+        SnoozeDefaultDialog(
+            current = settings.defaultSnoozeMinutes,
+            onDismiss = { showSnoozeDialog = false },
+            onSave = { vm.setSnoozeMinutes(it); showSnoozeDialog = false }
+        )
+    }
+
+    if (showPinDialog) {
+        SetPinDialog(onDismiss = { showPinDialog = false }, onSave = { pin -> vm.setPin(pin); showPinDialog = false })
+    }
+
+    if (showUnpairConfirm) {
+        val displayName = partnerName.trim().ifBlank { "your partner's" }
+        AlertDialog(
+            onDismissRequest = { showUnpairConfirm = false },
+            title = { Text("Unpair this phone?") },
+            text = {
+                Text(
+                    "This won't delete your history, photos, or stats — they stay on this phone. " +
+                        "You'll just need to reconnect with $displayName phone to resume tracking time together."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { showUnpairConfirm = false; vm.unpair(onUnpaired) }) { Text("Unpair") }
+            },
+            dismissButton = { TextButton(onClick = { showUnpairConfirm = false }) { Text("Cancel") } }
+        )
+    }
+
+    if (backupMessage != null) {
+        AlertDialog(
+            onDismissRequest = { backupMessage = null },
+            title = { Text("Backup") },
+            text = { Text(backupMessage.orEmpty()) },
+            confirmButton = { TextButton(onClick = { backupMessage = null }) { Text("OK") } }
+        )
+    }
+
+}
+
+@Composable
+private fun SettingsSection(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Card(shape = MaterialTheme.shapes.large, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            content()
+        }
+    }
+}
+
+@Composable
+private fun SettingsRow(label: String, subtitle: String, trailing: @Composable () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(label, style = MaterialTheme.typography.bodyLarge)
+            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        trailing()
+    }
+}
+
+@Composable
+private fun SnoozeDefaultDialog(current: Int, onDismiss: () -> Unit, onSave: (Int) -> Unit) {
+    var text by remember { mutableStateOf(current.toString()) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Default snooze length") },
+        text = {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it.filter { c -> c.isDigit() }.take(4) },
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth()
+            )
+        },
+        confirmButton = { TextButton(onClick = { onSave((text.toIntOrNull() ?: current).coerceIn(1, 720)) }) { Text("Save") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
+@Composable
+private fun SetPinDialog(onDismiss: () -> Unit, onSave: (String) -> Unit) {
+    var pin by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Set a PIN") },
+        text = {
+            Column {
+                Text("Choose a 4-6 digit PIN.", style = MaterialTheme.typography.bodySmall)
+                OutlinedTextField(
+                    value = pin,
+                    onValueChange = { pin = it.filter { c -> c.isDigit() }.take(6) },
+                    label = { Text("PIN") },
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                )
+                OutlinedTextField(
+                    value = confirm,
+                    onValueChange = { confirm = it.filter { c -> c.isDigit() }.take(6) },
+                    label = { Text("Confirm PIN") },
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                )
+                error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp)) }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                when {
+                    pin.length < 4 -> error = "PIN must be at least 4 digits"
+                    pin != confirm -> error = "PINs don't match"
+                    else -> onSave(pin)
+                }
+            }) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
