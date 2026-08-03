@@ -39,6 +39,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.ssbmedia.twogether.ServiceLocator
+import com.ssbmedia.twogether.events.AppEvents
 import kotlinx.coroutines.launch
 import java.io.File
 import java.text.SimpleDateFormat
@@ -166,6 +167,14 @@ fun CameraScreen(onSaved: () -> Unit, onCancel: () -> Unit) {
                                             ServiceLocator.momentRepository.add(outputFile.absolutePath, openSession?.id)
                                             isSaving = false
                                             showSaved = true
+                                            // A new photo only auto-syncs out via the next apart->together
+                                            // transition otherwise - if we're already together right now (the
+                                            // common case, since this screen is usually opened while together),
+                                            // kick a sync immediately so it doesn't wait for a disconnect/reconnect
+                                            // cycle that might not happen again this session.
+                                            if (ServiceLocator.proximityStateStore.current().isTogether) {
+                                                AppEvents.requestManualSync()
+                                            }
                                         }
                                     }
 

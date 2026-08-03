@@ -52,6 +52,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
+import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
@@ -81,6 +82,12 @@ class CalendarViewModel : ViewModel() {
     fun addManualSession(startedAt: Long, endedAt: Long) {
         viewModelScope.launch {
             ServiceLocator.sessionRepository.addManualSession(startedAt, endedAt)
+            // Same reasoning as Date Ideas' add/toggle/delete and a new photo capture - don't make a
+            // freshly-backfilled session wait for the next reconnect or the 15-minute catch-all if
+            // we're already together right now.
+            if (ServiceLocator.proximityStateStore.current().isTogether) {
+                AppEvents.requestManualSync()
+            }
         }
     }
 }

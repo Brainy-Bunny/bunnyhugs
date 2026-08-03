@@ -99,16 +99,33 @@ fun MomentsScreen(onBack: () -> Unit, onNavigateCamera: () -> Unit) {
             }
         }
     ) { padding ->
+        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+            if (transferring.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.secondaryContainer)
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Text(
+                        text = if (transferring.size == 1) "Syncing 1 photo…" else "Syncing ${transferring.size} photos…",
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(start = 10.dp)
+                    )
+                }
+            }
         if (moments.isEmpty()) {
             EmptyState(
                 emoji = "📸",
                 title = "No moments yet",
                 subtitle = "Photos you take together will show up here, grouped by day.",
-                modifier = Modifier.fillMaxSize().padding(padding)
+                modifier = Modifier.fillMaxSize()
             )
         } else {
             LazyColumn(
-                modifier = Modifier.fillMaxSize().padding(padding),
+                modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
@@ -134,6 +151,7 @@ fun MomentsScreen(onBack: () -> Unit, onNavigateCamera: () -> Unit) {
                     }
                 }
             }
+        }
         }
 
         selected?.let { moment ->

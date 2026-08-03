@@ -336,6 +336,26 @@ class ProximityForegroundService : LifecycleService() {
             ServiceLocator.timeCapsuleRepository.unlockEligible(hours.toFloat())
         }
 
+        // Catch-all periodic sync while continuously together: the transition-based trigger (on the
+        // apart->together edge) and the per-action triggers (Date Ideas add/check/delete, a new photo
+        // captured) cover the common cases, but anything that slips through those - a trigger that
+        // silently didn't fire, content added by some future feature that forgets to wire its own
+        // trigger, or simply a very long together-session where new content keeps accumulating - would
+        // otherwise wait for the NEXT apart->together edge, which might not happen again this session.
+        // Every 15 minutes while genuinely together, just try again regardless of what triggered (or
+        // didn't trigger) since the last attempt - startGattSyncIfNeeded's own tie-break/role logic and
+        // the merge layer's idempotency mean a redundant sync here is a harmless no-op, not a duplicate.
+        if (secondsElapsed % 900 == 0L && stateMachine.isTogether) {
+            try {
+                val device = lastSeenDevice
+                if (device != null) {
+                    startGattSyncIfNeeded(device, lastSeenTieBreak, manual = false)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Periodic catch-all sync failed - will retry in 15 minutes", e)
+            }
+        }
+
         updateNotification(now)
         updateBatteryOptimizationNotification()
 
