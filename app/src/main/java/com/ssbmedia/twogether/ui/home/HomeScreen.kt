@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -309,19 +310,22 @@ fun HomeScreen(
                 SectionHeader("Quick links")
             }
             item {
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    items(
-                        listOf(
-                            Triple("📅", "Calendar", onNavigateCalendar),
-                            Triple("💌", "Date Ideas", onNavigateDateIdeas),
-                            Triple("📸", "Moments", onNavigateMoments),
-                            Triple("📊", "Stats", onNavigateStats),
-                            Triple("⏳", "Time Capsules", onNavigateCapsules),
-                            Triple("🏅", "Badges", onNavigateBadges),
-                            Triple("🎉", "Milestones", onNavigateMilestones),
-                            Triple("📷", "Take a photo", onNavigateCamera)
-                        )
-                    ) { (emoji, label, action) ->
+                // Was a LazyRow (horizontally scrolling) with no visual hint that it scrolled - once
+                // there were more than 3 chips (Time Capsules/Badges/Milestones added later), those last
+                // ones became invisible unless you happened to swipe left with no affordance telling you
+                // to. FlowRow wraps everything onto as many lines as needed instead, so every quick link
+                // is always visible without any hidden/undiscoverable content.
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    listOf(
+                        Triple("📅", "Calendar", onNavigateCalendar),
+                        Triple("💌", "Date Ideas", onNavigateDateIdeas),
+                        Triple("📸", "Moments", onNavigateMoments),
+                        Triple("📊", "Stats", onNavigateStats),
+                        Triple("⏳", "Time Capsules", onNavigateCapsules),
+                        Triple("🏅", "Badges", onNavigateBadges),
+                        Triple("🎉", "Milestones", onNavigateMilestones),
+                        Triple("📷", "Take a photo", onNavigateCamera)
+                    ).forEach { (emoji, label, action) ->
                         QuickLinkChip(emoji = emoji, label = label, onClick = action)
                     }
                 }

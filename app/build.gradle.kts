@@ -27,8 +27,8 @@ android {
         applicationId = "com.ssbmedia.twogether"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "1.3"
+        versionCode = 6
+        versionName = "1.3.1"
     }
 
     signingConfigs {
