@@ -28,6 +28,17 @@ object AppLockManager : DefaultLifecycleObserver {
 
     fun unlock() {
         isLocked = false
+        resetFailedPinAttempts()
+    }
+
+    /** Resets just the failed-attempt throttle, without touching [isLocked] - for a successful PIN
+     * verification that happens OUTSIDE the main lock screen (e.g. SettingsScreen's
+     * VerifyCurrentPinDialog, which shares this same counter - see its own doc), where the app is already
+     * unlocked and flipping [isLocked] would be meaningless. MINOR fix: without this, wrong guesses typed
+     * into that dialog used to linger in the counter even after a subsequent correct one, so a single
+     * wrong PIN typed anywhere afterward (including on the main lock screen, later) could trigger an
+     * immediate lockout instead of needing FAILED_ATTEMPTS_BEFORE_LOCKOUT fresh wrong guesses. */
+    fun resetFailedPinAttempts() {
         failedPinAttempts = 0
         pinLockedOutUntilMillis = 0L
     }

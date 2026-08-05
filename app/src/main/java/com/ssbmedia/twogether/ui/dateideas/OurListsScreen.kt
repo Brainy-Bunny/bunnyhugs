@@ -46,6 +46,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
+import com.ssbmedia.twogether.data.db.DEFAULT_LIST_ID
 import com.ssbmedia.twogether.data.db.DateIdea
 import com.ssbmedia.twogether.data.db.ListCategory
 import com.ssbmedia.twogether.events.AppEvents
@@ -68,6 +69,28 @@ class OurListsViewModel : ViewModel() {
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val ideas = ServiceLocator.dateIdeaRepository.observeActive()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    init {
+        // Opportunistic self-heal, same reasoning as CapsulesViewModel's own init collector: the sync-
+        // time sweep in GattSyncManager.applyPayload (via ListCategoryRepository.mergeRemoteWithIdeas)
+        // already catches a newly-orphaned idea the moment it arrives, but this also catches anything
+        // that became orphaned BEFORE that sweep existed, or from a legacy build, simply by opening this
+        // screen, rather than requiring a fresh sync to ever notice it.
+        //
+        // BLOCKER fix, round 2: this used to derive "the current valid list ids" from
+        // combine(lists, ideas)'s own snapshot and pass it into reassignOrphans() as a caller-supplied
+        // set - but lists/ideas are two SEPARATE Room Flows that don't update in lockstep with each
+        // other even when the underlying write that changed both was atomic (see
+        // ListCategoryRepository.reassignOrphanIdeas' doc for the full reasoning), so that snapshot could
+        // itself be transiently inconsistent and cause exactly the corruption this mechanism exists to
+        // prevent. A single one-shot call to the no-arg self-heal entry point on screen open - which
+        // reads both tables fresh, itself, at the moment it runs - has no such risk, and is all this
+        // "catch legacy corruption" backstop was ever meant to do; ongoing/future corruption from a live
+        // sync is already handled atomically by the GattSyncManager path.
+        viewModelScope.launch {
+            ServiceLocator.listCategoryRepository.reassignOrphanIdeas()
+        }
+    }
 
     // Feature B: debounces an auto-sync request so a burst of quick actions (checking off several
     // ideas in a row, etc) fires one GATT round-trip after things settle rather than one per action.
@@ -343,8 +366,15 @@ private fun ListCategoryCard(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                IconButton(onClick = onDeleteClick) {
-                    Icon(Icons.Filled.Delete, contentDescription = "Delete list")
+                // The default "Date Ideas" list is the permanent fallback DateIdeaRepository.reassignOrphans
+                // relies on always existing (see its doc) - deleting it would let a future orphaned idea get
+                // reassigned into a list that itself doesn't resolve, reproducing the exact "invisible
+                // forever" bug that mechanism exists to prevent. No delete affordance for it at all, rather
+                // than a tap that would silently no-op against ListCategoryRepository.delete's own guard.
+                if (list.id != DEFAULT_LIST_ID) {
+                    IconButton(onClick = onDeleteClick) {
+                        Icon(Icons.Filled.Delete, contentDescription = "Delete list")
+                    }
                 }
                 Icon(
                     imageVector = if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,

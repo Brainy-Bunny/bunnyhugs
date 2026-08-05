@@ -25,6 +25,11 @@ object Notifications {
      * nag is clearly distinguishable from the normal always-on "together/apart" status notification
      * rather than folded into its text - see buildBatteryWarningNotification's doc. */
     const val CHANNEL_BATTERY_WARNING = "battery_warning"
+    /** MAJOR fix: a backup restore that gave up after repeated failed attempts (see
+     * BackupManager.resumePendingRestoreIfAny's doc) used to leave the user unpaired/PIN-less with a
+     * partially-restored phone and zero indication anything had even been attempted, since
+     * TwogetherApp.onCreate silently discarded that call's result. */
+    const val CHANNEL_BACKUP = "backup"
 
     const val STATUS_NOTIFICATION_ID = 1001
     const val REMINDER_NOTIFICATION_ID = 1002
@@ -33,6 +38,7 @@ object Notifications {
     const val MILESTONE_NOTIFICATION_ID_BASE = 2000
     const val UPDATE_NOTIFICATION_ID = 3000
     const val BATTERY_WARNING_NOTIFICATION_ID = 4000
+    const val RESTORE_GAVE_UP_NOTIFICATION_ID = 5000
 
     const val EXTRA_OPEN_CAMERA = "open_camera"
     /** Feature F: carries which milestone to open the "throughout the years" retrospective for, when the
@@ -70,11 +76,17 @@ object Notifications {
             description = "Warns you if Android's battery optimization might interrupt background tracking"
             setShowBadge(false)
         }
+        val backupChannel = NotificationChannel(
+            CHANNEL_BACKUP, "Backup & restore", NotificationManager.IMPORTANCE_DEFAULT
+        ).apply {
+            description = "Lets you know if a backup restore couldn't be completed"
+        }
         manager.createNotificationChannel(statusChannel)
         manager.createNotificationChannel(reminderChannel)
         manager.createNotificationChannel(milestoneChannel)
         manager.createNotificationChannel(updatesChannel)
         manager.createNotificationChannel(batteryChannel)
+        manager.createNotificationChannel(backupChannel)
     }
 
     fun buildStatusNotification(context: Context, contentText: String): Notification {
@@ -170,6 +182,35 @@ object Notifications {
             .build()
 
         manager.notify(MILESTONE_NOTIFICATION_ID_BASE + (milestoneId.hashCode() and 0x0FFFFFFF), notification)
+        return true
+    }
+
+    /** MAJOR fix: posted when BackupManager.resumePendingRestoreIfAny gives up on a restore after
+     * repeated failed silent attempts - without this, the user could be left unpaired/PIN-less with a
+     * partially-restored phone and no indication a restore had even been attempted, since its result was
+     * previously discarded silently by TwogetherApp.onCreate. */
+    fun showRestoreGaveUpNotification(context: Context): Boolean {
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return false
+        if (!BlePermissions.hasNotificationPermission(context)) return false
+
+        val openIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            context, RESTORE_GAVE_UP_NOTIFICATION_ID, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_BACKUP)
+            .setSmallIcon(R.drawable.ic_notification_heart)
+            .setContentTitle("Restore couldn't be completed")
+            .setContentText("Open Twogether to check your pairing and PIN, then try restoring again.")
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+
+        manager.notify(RESTORE_GAVE_UP_NOTIFICATION_ID, notification)
         return true
     }
 

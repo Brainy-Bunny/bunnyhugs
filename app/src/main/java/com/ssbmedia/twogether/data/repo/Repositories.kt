@@ -3,6 +3,7 @@ package com.ssbmedia.twogether.data.repo
 import android.content.Context
 import androidx.room.withTransaction
 import com.ssbmedia.twogether.data.db.AppDatabase
+import com.ssbmedia.twogether.data.db.DEFAULT_LIST_ID
 import com.ssbmedia.twogether.data.db.DateIdea
 import com.ssbmedia.twogether.data.db.DateIdeaDao
 import com.ssbmedia.twogether.data.db.ListCategory
@@ -146,6 +147,33 @@ class DateIdeaRepository(private val dao: DateIdeaDao) {
             l == null || r.updatedAt > l.updatedAt
         }
         if (toUpsert.isNotEmpty()) dao.upsertAll(toUpsert)
+    }
+
+    /**
+     * Self-heals orphaned ideas - a real, if narrow, race that isn't specific to any one merge: while two
+     * devices are apart, one deletes a whole list (cascading a soft-delete to every idea IT can currently
+     * see in that list - see ListCategoryRepository.delete), while the OTHER independently adds a brand
+     * new idea to that same list. Neither device did anything wrong in isolation, but once they sync, the
+     * list itself correctly ends up deleted (a real LWW-tombstone decision) while the new idea - which the
+     * deleting device never knew existed, so could never have cascaded to - still points at a listId that
+     * no longer resolves to anything active. Since the UI only ever renders ideas nested under an active
+     * list card, an idea like that becomes invisible forever with nothing telling anyone it happened.
+     *
+     * Reassigns any currently-active idea whose listId isn't in [validListIds] back to DEFAULT_LIST_ID,
+     * bumping its updatedAt so the repair itself propagates to the partner's phone via the same
+     * tombstone-sync mechanism on the next connection - both devices converge on the same "rescued into
+     * Date Ideas" outcome, not just whichever one happened to run this first.
+     *
+     * Low-level primitive - always call it via ListCategoryRepository.reassignOrphanIdeas() rather than
+     * computing [validListIds] yourself, unless you have a specific reason not to (that function's own doc
+     * explains why a caller-supplied set, especially one derived from independently-updating Flows, is
+     * NOT safe here).
+     */
+    suspend fun reassignOrphans(validListIds: Set<String>) {
+        val orphans = dao.getAll().filter { !it.deleted && it.listId !in validListIds }
+        if (orphans.isEmpty()) return
+        val now = System.currentTimeMillis()
+        dao.upsertAll(orphans.map { it.copy(listId = DEFAULT_LIST_ID, updatedAt = now) })
     }
 }
 
@@ -447,6 +475,15 @@ class ListCategoryRepository(
      * invisible in the UI (which only ever groups ideas under an active list card), with no way to
      * reach it again to delete or restore it. */
     suspend fun delete(category: ListCategory) {
+        // BLOCKER fix: DEFAULT_LIST_ID must never actually go away - DateIdeaRepository.reassignOrphans
+        // relies on it always resolving as the permanent fallback for orphaned ideas (see its doc). If it
+        // could be deleted, an orphan would get reassigned into a list that itself doesn't exist, and -
+        // worse - since reassignOrphans is also driven reactively by OurListsViewModel's own Flow
+        // collector, every re-run would see the same still-orphaned ideas again and write them again,
+        // an unbounded loop of DB writes/Flow emissions for as long as that screen is open. The UI already
+        // hides the delete affordance for this list (see OurListsScreen's ListCategoryCard), this is the
+        // backstop in case anything else ever calls delete() directly.
+        if (category.id == DEFAULT_LIST_ID) return
         database.withTransaction {
             dao.upsert(category.copy(deleted = true, updatedAt = System.currentTimeMillis()))
             dateIdeaRepository.getAll()
@@ -456,13 +493,75 @@ class ListCategoryRepository(
     }
 
     /** Union+tombstone merge by id + updatedAt, same LWW shape as MilestoneRepository.mergeRemote - these
-     * are simple, rarely-edited rows, so plain last-write-wins is appropriate. */
+     * are simple, rarely-edited rows, so plain last-write-wins is appropriate.
+     *
+     * BLOCKER fix: a delete-tombstone for DEFAULT_LIST_ID is never applied, regardless of updatedAt - a
+     * partner device (an older/buggy build, or any other way its own copy got soft-deleted) must never be
+     * able to remove the one list this device's own reassignOrphans() permanently depends on existing. Any
+     * NON-delete update to it (e.g. a rename) still applies normally. */
     suspend fun mergeRemote(remote: List<ListCategory>) {
         val local = dao.getAll().associateBy { it.id }
         val toUpsert = remote.filter { r ->
+            if (r.id == DEFAULT_LIST_ID && r.deleted) return@filter false
             val l = local[r.id]
             l == null || r.updatedAt > l.updatedAt
         }
         if (toUpsert.isNotEmpty()) dao.upsertAll(toUpsert)
+    }
+
+    /** BLOCKER fix: merges a sync payload's DateIdea AND ListCategory tables, then reassigns orphans -
+     * all inside ONE database transaction, called by GattSyncManager.applyPayload instead of doing the
+     * three steps as separate top-level suspend calls. */
+    suspend fun mergeRemoteWithIdeas(remoteCategories: List<ListCategory>, remoteIdeas: List<DateIdea>) {
+        database.withTransaction {
+            dateIdeaRepository.mergeRemote(remoteIdeas)
+            mergeRemote(remoteCategories)
+            reassignOrphanIdeas()
+        }
+    }
+
+    /**
+     * Self-heal entry point for DateIdeaRepository.reassignOrphans - reads the CURRENT set of valid list
+     * ids ITSELF, fresh, at the moment this actually runs, rather than accepting a caller-supplied
+     * snapshot.
+     *
+     * BLOCKER fix, round 2: wrapping mergeRemoteWithIdeas' three steps in one database.withTransaction
+     * (round 1's fix) guarantees the WRITE is atomic, but does NOT guarantee two SEPARATE Room Flows
+     * (ListCategoryDao.observeActive() and DateIdeaDao.observeActive(), as consumed independently by
+     * OurListsViewModel's `lists`/`ideas` StateFlows) become visible to a `combine()` of them at the same
+     * instant - each Flow independently re-queries and re-emits once notified of invalidation, and those
+     * two re-queries are separate async operations with no ordering guarantee between them, even though
+     * the underlying transaction that triggered both was atomic. A caller that fed in `combine(lists,
+     * ideas)`'s snapshot (as OurListsViewModel's opportunistic collector used to) could therefore still
+     * observe the ideas-Flow's post-sync value paired with the lists-Flow's PRE-sync value, compute
+     * orphans against a stale/incomplete valid-list-id set, and permanently misfile a real idea - the
+     * exact corruption this whole mechanism exists to prevent, just one layer further down than round 1's
+     * fix reached. Reading fresh via [dao] directly here sidesteps that entirely: by the time ANY
+     * observer's invalidation callback fires for a committed transaction, the transaction is already fully
+     * committed in SQLite, so a direct read at that moment (bypassing both StateFlows' own cached/lagging
+     * values) always sees the complete, consistent post-transaction state for both tables.
+     *
+     * Also self-heals DEFAULT_LIST_ID itself if it's ever found inactive (deleted or missing) - e.g. a
+     * pre-hardening build's local delete, or a not-yet-restored-through backup - by resurrecting its
+     * existing row (preserving name/createdAt) or synthesizing a fresh one. Without this, an orphan would
+     * get reassigned to a list that itself doesn't resolve, immediately becoming an orphan again on the
+     * very next run - an unbounded loop for as long as anything keeps calling this (every sync, and every
+     * time OurListsScreen is open).
+     */
+    suspend fun reassignOrphanIdeas() {
+        database.withTransaction {
+            val allCategories = dao.getAll()
+            var validIds = allCategories.filter { !it.deleted }.map { it.id }.toSet()
+            if (DEFAULT_LIST_ID !in validIds) {
+                val now = System.currentTimeMillis()
+                val existing = allCategories.firstOrNull { it.id == DEFAULT_LIST_ID }
+                dao.upsert(
+                    existing?.copy(deleted = false, updatedAt = now)
+                        ?: ListCategory(id = DEFAULT_LIST_ID, name = "Date Ideas", createdAt = now, updatedAt = now)
+                )
+                validIds = validIds + DEFAULT_LIST_ID
+            }
+            dateIdeaRepository.reassignOrphans(validIds)
+        }
     }
 }

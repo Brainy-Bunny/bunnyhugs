@@ -27,6 +27,7 @@ import com.ssbmedia.twogether.data.repo.MomentNoteRepository
 import com.ssbmedia.twogether.data.repo.MomentRepository
 import com.ssbmedia.twogether.data.repo.SessionRepository
 import com.ssbmedia.twogether.events.AppEvents
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -37,6 +38,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.security.SecureRandom
 
 /**
  * Tiny custom GATT protocol piggybacked on the proximity connection: exchange ONE combined JSON
@@ -50,11 +52,18 @@ import java.io.File
  * connection/handshake/MTU-negotiation machinery below exactly as it was for the original date-ideas-only
  * version - only serialize()/deserialize() and what happens with the parsed result changed.
  *
- * Every connection must first prove it knows the shared pair secret (a short handshake token derived
- * from the pairing code, see BleConstants.HANDSHAKE_TOKEN_*) before any real chunk data is accepted -
- * without this, any nearby stranger's GATT client could connect to our open server and read back the
- * couple's data, or write a forged tombstone to delete a real item (merge is last-write-wins with no
- * origin check otherwise).
+ * Every connection must first prove it knows the shared pair secret before any real chunk data is
+ * accepted - without this, any nearby stranger's GATT client could connect to our open server and read
+ * back the couple's data, or write a forged tombstone to delete a real item (merge is last-write-wins
+ * with no origin check otherwise). This is a nonce/HMAC challenge-response, NOT a static bearer token:
+ * the moment a client subscribes to the sync characteristic's notifications, the server generates a
+ * fresh random nonce (BleConstants.HANDSHAKE_NONCE_BYTES) and notifies it back immediately, before
+ * authenticating anything; the client's first characteristic WRITE is then
+ * BleConstants.computeHandshakeResponse(handshakeKey, thatNonce) rather than the key itself, which the
+ * server independently recomputes from its own copy of handshakeKey (both sides derive the same key from
+ * the shared pairing code, see BleConstants.HANDSHAKE_TOKEN_*) and the nonce it issued, and compares. A
+ * fresh nonce every connection means a captured response can never be replayed against a later
+ * connection - see startServer/connectAsClient below and BleConstants' class doc.
  *
  * FEATURE 2 (photo sync): once the metadata JSON round-trip above completes, the CLIENT side (the only
  * side that ever actively initiates anything, matching the existing central/peripheral role split) also
@@ -142,8 +151,16 @@ class GattSyncManager(
     private suspend fun applyPayload(bytes: ByteArray): List<RemoteMomentInfo> {
         val deviceId = settingsStore.getOrCreateLocalDeviceId()
         val root = JSONObject(String(bytes, Charsets.UTF_8))
-        dateIdeaRepository.mergeRemote(deserializeDateIdeas(root.optJSONArray("dateIdeas")))
-        listCategoryRepository.mergeRemote(deserializeListCategories(root.optJSONArray("listCategories")))
+        // Self-heal: a remote idea can arrive pointing at a list that got deleted on the OTHER device
+        // while this one was independently adding to it (see DateIdeaRepository.reassignOrphans' doc for
+        // the exact race). Both merges + the reassign sweep run as ONE atomic transaction (see
+        // ListCategoryRepository.mergeRemoteWithIdeas' doc) so no Flow observer - notably
+        // OurListsViewModel's own opportunistic reassignOrphans collector - can ever see an intermediate
+        // state where one table's merge has committed but the other's hasn't yet.
+        listCategoryRepository.mergeRemoteWithIdeas(
+            deserializeListCategories(root.optJSONArray("listCategories")),
+            deserializeDateIdeas(root.optJSONArray("dateIdeas"))
+        )
         sessionRepository.mergeRemoteSessions(deserializeSessions(root.optJSONArray("sessions")))
         val momentsArr = root.optJSONArray("moments")
         momentRepository.mergeRemoteStubs(deserializeMoments(momentsArr))
@@ -521,6 +538,8 @@ class GattSyncManager(
             if (momentRepository.getBySyncId(syncId)?.deleted == true) {
                 withContext(Dispatchers.IO) { destFile.delete() }
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.w(TAG, "Failed to save received photo for moment $syncId", e)
             withContext(Dispatchers.IO) { tempFile.delete() }
@@ -553,8 +572,16 @@ class GattSyncManager(
 
     // ---- SERVER side ----
 
+    // MINOR fix: same reasoning as expectedHandshakeKey below - all three are written from startServer()/
+    // stopServer() (called from the service's own coroutine) but read from GATT binder-thread callbacks,
+    // and none of that is covered by serverLock's guard set. Most exposed on the explicitly-supported
+    // repeat startServer() call (a "Sync now" tap while the server's already open, see its own doc below)
+    // - without @Volatile a binder thread could observe a stale reference to any of these.
+    @Volatile
     private var gattServer: BluetoothGattServer? = null
+    @Volatile
     private var serverCharacteristic: BluetoothGattCharacteristic? = null
+    @Volatile
     private var serverPhotoCharacteristic: BluetoothGattCharacteristic? = null
     private val serverIncoming = HashMap<String, ByteArrayOutputStream>()
     private val serverOutQueue = HashMap<String, MutableList<ByteArray>>()
@@ -566,11 +593,19 @@ class GattSyncManager(
     private val serverPhotoOutQueue = HashMap<String, MutableList<ByteArray>>()
     private val authenticatedDevices = HashSet<String>()
     private val deviceMtus = HashMap<String, Int>()
+    // Per-device nonce issued at CCCD-subscribe time (see onDescriptorWriteRequest) and consumed the
+    // moment that device's handshake response is verified - see the nonce/HMAC handshake doc at the top
+    // of this file.
+    private val serverNonces = HashMap<String, ByteArray>()
     // Guards serverIncoming / serverOutQueue / serverPhotoIncoming / serverPhotoOutQueue /
-    // authenticatedDevices / deviceMtus, which are otherwise mutated both from GATT binder-thread
-    // callbacks and from coroutines launched via [scope].
+    // authenticatedDevices / deviceMtus / serverNonces, which are otherwise mutated both from GATT
+    // binder-thread callbacks and from coroutines launched via [scope].
     private val serverLock = Any()
-    private var expectedHandshakeToken: ByteArray = ByteArray(0)
+    // MINOR fix: read from GATT binder-thread callbacks (onCharacteristicWriteRequest) but written from
+    // startServer() - not covered by serverLock's own guard set (a lock there wouldn't help a caller that
+    // isn't taking it), so @Volatile is what actually guarantees a write here is visible to those reads.
+    @Volatile
+    private var expectedHandshakeKey: ByteArray = ByteArray(0)
 
     // The most recently registered "sync finished" callback. Kept as a mutable field (rather than
     // captured directly in the BluetoothGattServerCallback closure below) so that startServer() can be
@@ -579,10 +614,13 @@ class GattSyncManager(
     // next completed sync, without tearing down and re-registering the whole GATT service each time
     // (which would drop any in-flight write from the other side, and can fail outright if the
     // characteristic is added again while a service with the same UUID is still registered).
+    // MINOR fix: same reasoning as expectedHandshakeKey/gattServer above - written from startServer()
+    // (repeat-call case especially), read from binder-thread callbacks (onCharacteristicWriteRequest).
+    @Volatile
     private var activeServerOnSyncDone: (Boolean) -> Unit = {}
 
-    fun startServer(handshakeToken: ByteArray, onSyncDone: (Boolean) -> Unit) {
-        expectedHandshakeToken = handshakeToken
+    fun startServer(handshakeKey: ByteArray, onSyncDone: (Boolean) -> Unit) {
+        expectedHandshakeKey = handshakeKey
         activeServerOnSyncDone = onSyncDone
         if (gattServer != null) {
             // Already listening this session (new callback is wired in above for whenever the next real
@@ -646,6 +684,7 @@ class GattSyncManager(
                         serverPhotoIncoming.remove(addr)
                         serverPhotoOutQueue.remove(addr)
                         deviceMtus.remove(addr)
+                        serverNonces.remove(addr)
                     }
                 }
             }
@@ -662,13 +701,19 @@ class GattSyncManager(
                 val isAuthenticated = synchronized(serverLock) { authenticatedDevices.contains(addr) }
 
                 if (!isAuthenticated) {
-                    // The very first write from a not-yet-authenticated device must be exactly the
-                    // shared-secret-derived handshake token, proving it knows our pairing code, before
+                    // The very first write from a not-yet-authenticated device must be the correct
+                    // HMAC(handshakeKey, nonce) response to the nonce THIS device was issued when it
+                    // subscribed (see onDescriptorWriteRequest below and this file's top-of-file doc) -
+                    // proving it knows our pairing code without ever transmitting the key itself - before
                     // we accept or act on anything else it sends (on EITHER characteristic - the client
                     // always sends the handshake on the sync characteristic first, see connectAsClient).
-                    val ok = expectedHandshakeToken.isNotEmpty() && value.contentEquals(expectedHandshakeToken)
+                    val nonce = synchronized(serverLock) { serverNonces[addr] }
+                    val expected = if (nonce != null && expectedHandshakeKey.isNotEmpty()) {
+                        BleConstants.computeHandshakeResponse(expectedHandshakeKey, nonce)
+                    } else null
+                    val ok = expected != null && value.contentEquals(expected)
                     if (ok) {
-                        synchronized(serverLock) { authenticatedDevices.add(addr) }
+                        synchronized(serverLock) { authenticatedDevices.add(addr); serverNonces.remove(addr) }
                         if (responseNeeded) {
                             try {
                                 gattServer?.sendResponse(device, requestId, android.bluetooth.BluetoothGatt.GATT_SUCCESS, offset, null)
@@ -709,6 +754,8 @@ class GattSyncManager(
                     scope.launch {
                         try {
                             applyPayload(raw)
+                        } catch (e: CancellationException) {
+                            throw e
                         } catch (e: Exception) {
                             Log.w(TAG, "Failed to parse incoming sync payload - reporting failure instead of a silent empty merge", e)
                             activeServerOnSyncDone(false)
@@ -733,6 +780,23 @@ class GattSyncManager(
                     try {
                         gattServer?.sendResponse(device, requestId, android.bluetooth.BluetoothGatt.GATT_SUCCESS, offset, null)
                     } catch (e: SecurityException) { Log.w(TAG, "sendResponse failed", e) }
+                }
+                // MINOR fix: only issue a nonce to a device that isn't authenticated yet. Our own client
+                // never re-subscribes mid-connection, so this guard is unreachable in normal operation
+                // today, but without it, any CCCD write on the sync characteristic from an ALREADY
+                // authenticated device would inject a fresh raw (unframed) notification into the stream
+                // that device is otherwise parsing as flag-framed JSON chunks, corrupting whatever sync
+                // was in progress - defensive robustness against any future/OEM-quirk re-subscribe.
+                val alreadyAuthenticated = synchronized(serverLock) { authenticatedDevices.contains(device.address) }
+                if (descriptor.characteristic.uuid == BleConstants.SYNC_CHARACTERISTIC_UUID && !alreadyAuthenticated) {
+                    // The client just subscribed to sync notifications - the earliest point at which we
+                    // can push it anything - so issue a fresh random nonce right away for it to sign with
+                    // the shared handshake key (see this file's top-of-file doc). A brand new nonce every
+                    // subscribe/connection means a handshake response captured from a past connection is
+                    // never valid again.
+                    val nonce = ByteArray(BleConstants.HANDSHAKE_NONCE_BYTES).also { SecureRandom().nextBytes(it) }
+                    synchronized(serverLock) { serverNonces[device.address] = nonce }
+                    sendRawNotification(device, nonce)
                 }
             }
 
@@ -823,6 +887,8 @@ class GattSyncManager(
             scope.launch {
                 try {
                     processPhotoFrame(frame, isServerSide = true, device = device)
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to process incoming photo frame", e)
                 }
@@ -853,7 +919,13 @@ class GattSyncManager(
             // MAJOR fix: file reads inherit this class's dispatcher (Dispatchers.Main.immediate via
             // ProximityForegroundService's lifecycleScope) unless explicitly moved off it - see
             // savePhotoBytes's doc.
-            val bytes = try { withContext(Dispatchers.IO) { file.readBytes() } } catch (e: Exception) { continue }
+            val bytes = try {
+                withContext(Dispatchers.IO) { file.readBytes() }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                continue
+            }
             framesToSend += buildPhotoDataFrame(id, bytes)
         }
         framesToSend += buildPhotoDoneFrame()
@@ -883,6 +955,7 @@ class GattSyncManager(
             gattServer?.close()
         } catch (e: SecurityException) { /* ignore */ }
         gattServer = null
+        serverCharacteristic = null
         serverPhotoCharacteristic = null
         synchronized(serverLock) {
             serverIncoming.clear()
@@ -891,6 +964,10 @@ class GattSyncManager(
             serverPhotoOutQueue.clear()
             authenticatedDevices.clear()
             deviceMtus.clear()
+            // MINOR fix: hygiene - every lingering entry here is for a nonce that was never successfully
+            // authenticated against (a successful auth already removes its own entry), so this isn't
+            // exploitable either way, but a stopped server shouldn't leave stale per-device state behind.
+            serverNonces.clear()
         }
     }
 
@@ -912,7 +989,7 @@ class GattSyncManager(
     private var clientPhotoReceivedCount = 0
     private var clientPhotoExpectedCount = 0
 
-    fun connectAsClient(device: BluetoothDevice, handshakeToken: ByteArray, onSyncDone: (Boolean) -> Unit) {
+    fun connectAsClient(device: BluetoothDevice, handshakeKey: ByteArray, onSyncDone: (Boolean) -> Unit) {
         if (!BlePermissions.hasBlePermissions(context)) return onSyncDone(false)
         // A previous attempt that timed out or failed before its onConnectionStateChange(DISCONNECTED)
         // callback ever fired (e.g. the peer never responded at all) would otherwise leave its
@@ -944,6 +1021,12 @@ class GattSyncManager(
         // Set once both the sync AND photo characteristics have enabled notifications, so the handshake
         // (the actual start of real data exchange) never races ahead of either subscription being ready.
         var syncCccdDone = false
+        // Completed by onCharacteristicChanged the moment the server's handshake nonce notification
+        // arrives (always the very first notification on the sync characteristic - see this file's
+        // top-of-file doc) - awaited (with a timeout) right before computing+sending the handshake
+        // response, since the nonce can arrive at any point after this device's CCCD write, independent
+        // of when the photo characteristic's own subscription finishes.
+        val nonceDeferred = CompletableDeferred<ByteArray>()
 
         // Guards against calling onSyncDone() twice (e.g. once from a failure path and again from the
         // disconnect that follows it) and makes sure a connection that drops before completing - GATT
@@ -1042,21 +1125,47 @@ class GattSyncManager(
                 }
 
                 // Both characteristics now have notifications enabled - prove we know the shared pair
-                // secret before sending any real data. The server ignores/rejects everything until it
-                // sees this exact token as the first write (see startServer's handshake check).
+                // secret before sending any real data, by answering the server's handshake nonce (already
+                // in flight or about to be - see startServer's onDescriptorWriteRequest) with
+                // HMAC(handshakeKey, nonce) rather than a static token. The server ignores/rejects
+                // everything until it sees this exact response as the first write (see startServer's
+                // handshake check).
                 val characteristic = service?.getCharacteristic(BleConstants.SYNC_CHARACTERISTIC_UUID)
                 if (characteristic == null) {
                     finish(false)
                     return
                 }
-                try {
-                    characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                    @Suppress("DEPRECATION")
-                    characteristic.value = handshakeToken
-                    @Suppress("DEPRECATION")
-                    gatt.writeCharacteristic(characteristic)
-                } catch (e: SecurityException) {
-                    finish(false)
+                scope.launch {
+                    val nonce = withTimeoutOrNull(HANDSHAKE_NONCE_TIMEOUT_MILLIS) { nonceDeferred.await() }
+                    if (nonce == null) {
+                        Log.w(TAG, "Timed out waiting for server's handshake nonce")
+                        finish(false)
+                        // MEDIUM fix: without this, a connection that times out waiting for the nonce
+                        // (e.g. the peer is on the pre-nonce protocol and never sends one) left the GATT
+                        // link itself open - finish(false) only resolves the caller's result, it doesn't
+                        // tear down the connection. onConnectionStateChange's own DISCONNECTED cleanup
+                        // never got a chance to run, so the link (and, server-side, its authenticated-
+                        // device slot/nonce entry) would linger until something else eventually closed it.
+                        try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
+                        return@launch
+                    }
+                    // MINOR fix: computeHandshakeResponse moved inside the try - a JCE failure (e.g. an
+                    // unsupported algorithm on some OEM's crypto provider) used to be able to escape
+                    // uncaught into [scope], since the try below only ever wrapped the actual GATT write.
+                    try {
+                        val response = BleConstants.computeHandshakeResponse(handshakeKey, nonce)
+                        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                        @Suppress("DEPRECATION")
+                        characteristic.value = response
+                        @Suppress("DEPRECATION")
+                        gatt.writeCharacteristic(characteristic)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to compute/send handshake response", e)
+                        finish(false)
+                        try { gatt.disconnect() } catch (e2: SecurityException) { /* ignore */ }
+                    }
                 }
             }
 
@@ -1095,6 +1204,15 @@ class GattSyncManager(
                 val value = characteristic.value ?: return
                 if (value.isEmpty()) return
 
+                if (characteristic.uuid == BleConstants.SYNC_CHARACTERISTIC_UUID && !nonceDeferred.isCompleted) {
+                    // The very first notification the server ever sends on the sync characteristic is
+                    // always its handshake nonce (see startServer's onDescriptorWriteRequest) - raw bytes,
+                    // no chunk-flag framing, since the server won't send real (flag-framed) JSON data
+                    // until AFTER it has authenticated this device via that nonce's HMAC response.
+                    nonceDeferred.complete(value)
+                    return
+                }
+
                 if (characteristic.uuid == BleConstants.PHOTO_CHARACTERISTIC_UUID) {
                     val flag = value[0]
                     if (value.size > 1) {
@@ -1114,6 +1232,8 @@ class GattSyncManager(
                         scope.launch {
                             try {
                                 processPhotoFrame(frame, isServerSide = false, device = null)
+                            } catch (e: CancellationException) {
+                                throw e
                             } catch (e: Exception) {
                                 Log.w(TAG, "Failed to process incoming photo frame", e)
                             }
@@ -1130,6 +1250,8 @@ class GattSyncManager(
                     scope.launch {
                         val remoteMomentInfo = try {
                             applyPayload(raw)
+                        } catch (e: CancellationException) {
+                            throw e
                         } catch (e: Exception) {
                             Log.w(TAG, "Failed to parse incoming sync payload - reporting failure instead of a silent empty merge", e)
                             finish(false)
@@ -1141,6 +1263,8 @@ class GattSyncManager(
                         // undo the metadata sync that already genuinely succeeded above.
                         try {
                             runPhotoPhaseAsClient(gatt, remoteMomentInfo)
+                        } catch (e: CancellationException) {
+                            throw e
                         } catch (e: Exception) {
                             Log.w(TAG, "Photo phase failed - metadata sync itself already succeeded", e)
                         }
@@ -1232,7 +1356,13 @@ class GattSyncManager(
             val frames = mutableListOf<ByteArray>()
             for (moment in toSend) {
                 // MAJOR fix: keep this file read off the Main dispatcher - see savePhotoBytes's doc.
-                val bytes = try { withContext(Dispatchers.IO) { File(moment.photoUri).readBytes() } } catch (e: Exception) { null } ?: continue
+                val bytes = try {
+                    withContext(Dispatchers.IO) { File(moment.photoUri).readBytes() }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    null
+                } ?: continue
                 frames += buildPhotoDataFrame(moment.syncId, bytes)
             }
             if (toRequestIds.isNotEmpty()) frames += buildPhotoRequestFrame(toRequestIds)
@@ -1277,6 +1407,12 @@ class GattSyncManager(
         private const val ATT_HEADER_BYTES = 3
         private const val CHUNK_FLAG_HEADER_BYTES = 1
         private const val MIN_CHUNK_PAYLOAD = 5
+
+        /** How long the client waits for the server's handshake nonce notification (see this file's
+         * top-of-file doc) before giving up on this connection attempt - generous relative to how fast a
+         * local GATT notification normally arrives after a CCCD write completes, since the only realistic
+         * cause of a real delay this long is a stalled/dying connection that should fail anyway. */
+        private const val HANDSHAKE_NONCE_TIMEOUT_MILLIS = 10_000L
 
         /** Feature 2: how many photos this device will push AND how many it will request, PER DIRECTION,
          * per together-session - see computeToSend/computeToRequestIds and this class's top-of-file doc

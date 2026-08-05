@@ -2,6 +2,8 @@ package com.ssbmedia.twogether.ble
 
 import android.os.ParcelUuid
 import java.util.UUID
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 /**
  * KNOWN ACCEPTED MVP LIMITATION (not fixed in this pass): the advertisement broadcast by
@@ -17,6 +19,11 @@ import java.util.UUID
  * GATT *server* role. It does NOT protect a client connecting to an impersonated server - an active
  * attacker posing as the partner's server could still receive a real client's data. Reversal of an
  * extracted raw pairing-code hash is still meaningfully harder thanks to the strengthened hash.
+ *
+ * The GATT handshake itself is nonce/HMAC-based (see computeHandshakeResponse below, and
+ * GattSyncManager's class doc), NOT a static bearer token - a captured handshake response is worthless
+ * replayed against a later connection, since the server issues a brand new random nonce every time a
+ * device subscribes to the sync characteristic and only that exact nonce's HMAC is accepted.
  */
 object BleConstants {
     /** Shared by every Twogether install so the scanner can find any Twogether beacon at the OS filter level. */
@@ -36,14 +43,42 @@ object BleConstants {
     const val SECRET_PREFIX_BYTES = 4
 
     /**
-     * How many hex chars of the pair-code hash we use to derive the GATT handshake token (see
-     * GattSyncManager) - taken from a hex range that starts right AFTER the bytes used for
-     * SECRET_PREFIX_BYTES above, so the handshake token is never fully exposed by the (unauthenticated,
-     * public) BLE advertisement itself. A naive stranger scanning nearby BLE devices only ever sees the
-     * first SECRET_PREFIX_BYTES bytes over the air.
+     * How many hex chars of the pair-code hash we use to derive the shared GATT handshake KEY (see
+     * GattSyncManager / computeHandshakeResponse below) - taken from a hex range that starts right AFTER
+     * the bytes used for SECRET_PREFIX_BYTES above, so this key material is never overlapping with the
+     * (unauthenticated, public) BLE advertisement's own prefix bytes. This key is never itself put on the
+     * air - only a per-connection random nonce and its HMAC response are - so, unlike the old static-token
+     * scheme, that non-overlap is now just defense in depth rather than the only thing standing between a
+     * sniffer and a usable credential.
      */
     const val HANDSHAKE_TOKEN_BYTES = 8
     const val HANDSHAKE_TOKEN_HEX_OFFSET = SECRET_PREFIX_BYTES * 2
+
+    /** Size, in bytes, of the random nonce the GATT server issues to a freshly-subscribed client at the
+     * start of every connection - see GattSyncManager's onDescriptorWriteRequest. Regenerated fresh per
+     * connection, so a captured handshake response can never be replayed against a later one. */
+    const val HANDSHAKE_NONCE_BYTES = 16
+
+    /** Truncation length of the HMAC-SHA256 handshake response - see computeHandshakeResponse. 16 bytes
+     * (128 bits) of MAC output is comfortably beyond brute-force reach while staying well under any BLE
+     * MTU, so it never needs its own chunking. */
+    const val HANDSHAKE_RESPONSE_BYTES = 16
+
+    /**
+     * Computes the handshake response both sides independently derive for one connection:
+     * HMAC-SHA256(handshakeKey, nonce), truncated to HANDSHAKE_RESPONSE_BYTES. The CLIENT computes this
+     * once it receives the server's nonce and writes it as its first characteristic write; the SERVER
+     * computes its own expected value from the same handshakeKey and the nonce IT generated, then compares
+     * in onCharacteristicWriteRequest. Neither side ever transmits handshakeKey itself - only the public
+     * nonce and this one-way MAC of it - so observing any number of past handshakes never helps forge a
+     * future one (a fresh nonce makes every response unique), unlike the previous static-token scheme
+     * this replaces.
+     */
+    fun computeHandshakeResponse(handshakeKey: ByteArray, nonce: ByteArray): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(handshakeKey, "HmacSHA256"))
+        return mac.doFinal(nonce).copyOf(HANDSHAKE_RESPONSE_BYTES)
+    }
 
     /** Chunk protocol: 1 flag byte (0 = more chunks follow, 1 = last chunk) + payload. */
     const val CHUNK_FLAG_MORE: Byte = 0

@@ -49,9 +49,11 @@ import com.ssbmedia.twogether.data.datastore.LastConnectionInfo
 import com.ssbmedia.twogether.data.datastore.PairingStore
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
 import com.ssbmedia.twogether.util.Hashing
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 enum class PairStep { LANDING, CREATE_SHOW_CODE, JOIN_ENTER_CODE, PARTNER_INFO, PERMISSIONS }
 
@@ -108,7 +110,8 @@ class PairingViewModel(private val pairingStore: PairingStore) : ViewModel() {
 
     fun finishPairing(onDone: () -> Unit) {
         viewModelScope.launch {
-            val hash = Hashing.strengthenedPairingCodeHex(pendingCode)
+            // BLOCKER fix: off Main - see PinUtil.hash's doc, same 600k-round PBKDF2 cost applies here.
+            val hash = withContext(Dispatchers.Default) { Hashing.strengthenedPairingCodeHex(pendingCode) }
             pairingStore.savePairing(hash, pendingCode, partnerName, partnerEmoji)
             onDone()
         }

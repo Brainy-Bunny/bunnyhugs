@@ -219,7 +219,25 @@ data class AppSettings(
     val quickLinksOrder: String? = null,
     /** See [ThemeMode]'s own doc. Deliberately per-device (like quickLinksOrder above), not synced
      * between partners - each person's phone can independently follow-system/force-light/force-dark. */
-    val themeMode: ThemeMode = ThemeMode.SYSTEM
+    val themeMode: ThemeMode = ThemeMode.SYSTEM,
+    /** Non-null while a backup restore is in flight or was interrupted before completing (process death,
+     * force-close) - the app-private path of the cached backup zip BackupManager.restoreBackupDurable
+     * copied the user's picked file to before touching anything live. Checked on every app start
+     * (TwogetherApp.onCreate) so an interrupted restore automatically resumes and retries until it fully
+     * succeeds, rather than silently leaving the phone in a half-restored state with no recovery path -
+     * see restoreBackupDurable's own doc for why true cross-storage-engine atomicity isn't achievable
+     * here (Room and DataStore are separate engines with no shared transaction), so "resume until it
+     * actually finishes" is the real fix instead. Cleared the moment a restore from this path succeeds. */
+    val pendingRestorePath: String? = null,
+    /** Count of consecutive NON-permanent failures for the restore at [pendingRestorePath] (see
+     * BackupManager.BackupResult.permanent's doc for permanent-vs-not). MAJOR fix: without a cap, a
+     * deterministic-but-not-detected-as-permanent failure (e.g. the device is out of storage, so the
+     * live Room tables get wiped+repopulated but the trailing photo-copy step throws) would otherwise
+     * retry - and re-wipe the DB - on every single app launch forever, destroying any real data created
+     * since. Reset to 0 whenever a NEW restore starts (restoreBackupDurable); once it exceeds
+     * BackupManager's retry cap, the attempt is treated as permanent and the pending state is given up
+     * on, same as a validation failure. */
+    val pendingRestoreAttempts: Int = 0
 )
 
 class SettingsStore(private val context: Context) {
@@ -237,6 +255,8 @@ class SettingsStore(private val context: Context) {
         val LAST_UPDATE_CHECK_AT = longPreferencesKey("last_update_check_at")
         val QUICK_LINKS_ORDER = stringPreferencesKey("quick_links_order")
         val THEME_MODE = stringPreferencesKey("theme_mode")
+        val PENDING_RESTORE_PATH = stringPreferencesKey("pending_restore_path")
+        val PENDING_RESTORE_ATTEMPTS = intPreferencesKey("pending_restore_attempts")
     }
 
     val settings: Flow<AppSettings> = context.settingsDs.data.map { p ->
@@ -255,7 +275,9 @@ class SettingsStore(private val context: Context) {
             quickLinksOrder = p[Keys.QUICK_LINKS_ORDER],
             // Defensive against a value from a future app version this build doesn't recognize (an
             // enum name Room/DataStore can't map back) - falls back to SYSTEM rather than crashing.
-            themeMode = p[Keys.THEME_MODE]?.let { raw -> runCatching { ThemeMode.valueOf(raw) }.getOrNull() } ?: ThemeMode.SYSTEM
+            themeMode = p[Keys.THEME_MODE]?.let { raw -> runCatching { ThemeMode.valueOf(raw) }.getOrNull() } ?: ThemeMode.SYSTEM,
+            pendingRestorePath = p[Keys.PENDING_RESTORE_PATH],
+            pendingRestoreAttempts = p[Keys.PENDING_RESTORE_ATTEMPTS] ?: 0
         )
     }
 
@@ -348,6 +370,31 @@ class SettingsStore(private val context: Context) {
 
     suspend fun setThemeMode(mode: ThemeMode) {
         context.settingsDs.edit { it[Keys.THEME_MODE] = mode.name }
+    }
+
+    /** See [AppSettings.pendingRestorePath]'s doc. [path] null clears it (a restore either fully
+     * succeeded or was never attempted); non-null marks one as in-flight/needing resume. Also
+     * resets/clears [AppSettings.pendingRestoreAttempts] in the same edit, since a null path always means
+     * "no attempt in progress to count" and a fresh non-null path always means a brand new restore whose
+     * attempt count must start over at 0, never inherit a previous restore's count. */
+    suspend fun setPendingRestorePath(path: String?) {
+        context.settingsDs.edit { p ->
+            if (path != null) p[Keys.PENDING_RESTORE_PATH] = path else p.remove(Keys.PENDING_RESTORE_PATH)
+            p.remove(Keys.PENDING_RESTORE_ATTEMPTS)
+        }
+    }
+
+    /** Atomically increments [AppSettings.pendingRestoreAttempts] and returns the new count - see its
+     * own doc for why this exists. Read-modify-write inside one edit{} so two near-simultaneous callers
+     * (which shouldn't happen given BackupManager's restoreMutex, but this is cheap insurance) can't lose
+     * an increment to each other. */
+    suspend fun incrementPendingRestoreAttempts(): Int {
+        var newCount = 0
+        context.settingsDs.edit { p ->
+            newCount = (p[Keys.PENDING_RESTORE_ATTEMPTS] ?: 0) + 1
+            p[Keys.PENDING_RESTORE_ATTEMPTS] = newCount
+        }
+        return newCount
     }
 
     /** Records the outcome of the most recent backup attempt (manual "Back up now" or the weekly

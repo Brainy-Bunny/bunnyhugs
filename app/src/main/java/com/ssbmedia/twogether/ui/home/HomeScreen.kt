@@ -79,6 +79,8 @@ import com.ssbmedia.twogether.ui.components.PulsingHeart
 import com.ssbmedia.twogether.ui.components.QuickLinkChip
 import com.ssbmedia.twogether.ui.components.SectionHeader
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import java.io.File
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -86,6 +88,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** Stable ids for each Home "Quick links" chip - persisted as the drag-and-drop reorder preference
  * (SettingsStore.setQuickLinksOrder) instead of the display label, which could change wording later
@@ -156,10 +159,23 @@ class HomeViewModel : ViewModel() {
     // Picked once per Home visit (this ViewModel instance) — a simple "throwback" surface.
     val randomMoment: MutableStateFlow<Moment?> = MutableStateFlow(null)
 
-    fun pickRandomMomentIfNeeded(all: List<Moment>) {
-        if (randomMoment.value == null && all.isNotEmpty()) {
-            randomMoment.value = all.random()
-        }
+    /** Only ever picks from moments this device actually HOLDS the photo bytes for - a remote-stub
+     * moment (partner's photo metadata synced, but the bytes haven't transferred yet - see
+     * Moment.photoDownloaded's doc) has nothing to show, and a card whose entire point is surfacing a
+     * photo memory shouldn't ever land on one it can't display. MomentsScreen already guards this same
+     * situation at render time (photoDownloaded + File(photoUri).isFile before treating a moment as
+     * renderable); filtering it out of the candidate pool here is the stronger fix - the card either
+     * shows a real memory or doesn't appear at all, never a broken-image placeholder where a photo was
+     * expected. The isFile check (not just the DB flag) additionally covers the rare case of the flag
+     * being true but the file having since vanished some other way. */
+    suspend fun pickRandomMomentIfNeeded(all: List<Moment>) {
+        if (randomMoment.value != null) return
+        // MINOR fix: File.isFile is blocking disk I/O, and this used to run directly on whatever
+        // dispatcher the caller's LaunchedEffect is on (Main) - moved off Main here so a large moment
+        // list (or repeated re-runs while nothing is downloaded yet, e.g. right after a restore) can't
+        // ever cause a stutter.
+        val withPhoto = withContext(Dispatchers.IO) { all.filter { it.photoDownloaded && File(it.photoUri).isFile } }
+        if (withPhoto.isNotEmpty()) randomMoment.value = withPhoto.random()
     }
 }
 

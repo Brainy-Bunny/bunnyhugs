@@ -22,29 +22,40 @@ import com.ssbmedia.twogether.data.db.MomentNote
 import com.ssbmedia.twogether.data.db.TimeCapsule
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.notif.MilestoneAlarmScheduler
+import com.ssbmedia.twogether.notif.Notifications
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.EOFException
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.zip.ZipEntry
+import java.util.zip.ZipException
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
 /**
- * Feature 4: exports/imports everything needed to fully restore the app's local state - all Room
- * tables, the pairing DataStore (including Feature 1's persisted plaintext code and Feature 3's "last
- * connection" snapshot), settings, badge-unlocks, and copies of the actual Moment photo files - as a
- * single self-contained zip. Deliberately built on plain java.util.zip + org.json (both already part of
- * the Android platform) rather than a new serialization/zip dependency.
+ * Feature 4: exports/imports everything needed to restore the app's local state - all Room tables,
+ * non-secret settings, badge-unlocks, and copies of the actual Moment photo files - as a single
+ * self-contained zip. Deliberately built on plain java.util.zip + org.json (both already part of the
+ * Android platform) rather than a new serialization/zip dependency.
+ *
+ * SECURITY, not stale: the pairing DataStore's live BLE credentials (pairSecretHash/pairPlainCode/
+ * lastSecretHash/lastPlainCode) and the PIN hash are deliberately NEVER written to or read from this zip
+ * - see buildManifest's and restoreBackup's own SECURITY comments. A restore therefore always leaves the
+ * phone unpaired with PIN lock off, even when restoring onto the exact phone that made the backup -
+ * re-pairing is a required manual step afterward, not an optional cleanup.
  *
  * Format (see [BACKUP_FORMAT_VERSION]):
  *   manifest.json       - one JSON object with pairing/settings/badgeUnlocks + every Room table
@@ -103,7 +114,17 @@ object BackupManager {
     const val BACKUP_FOLDER_NAME = "Twogether Backups"
     private val RELATIVE_DIR = Environment.DIRECTORY_DOWNLOADS + "/" + BACKUP_FOLDER_NAME
 
-    data class BackupResult(val success: Boolean, val uri: Uri? = null, val message: String)
+    /** [permanent] is only meaningful when [success] is false: true means retrying this exact restore is
+     * pointless, as opposed to false meaning the attempt could plausibly succeed on a retry (e.g.
+     * genuinely interrupted by process death mid-restore). restoreBackupDurable/resumePendingRestoreIfAny
+     * use this to decide whether to keep the pending-restore flag+cached file around for another attempt,
+     * or give up and clear it - without this, a permanently-bad backup file would otherwise get silently
+     * re-validated and re-fail on every single app launch forever. Two distinct producers set this true:
+     * most returns from restoreBackup() itself (the zip is corrupt/foreign/incompatible - determined
+     * during validation, BEFORE anything live is touched), and resumePendingRestoreIfAny's own give-up
+     * path once MAX_SILENT_RESTORE_RETRIES is reached (by definition AFTER up to that many live DB wipes
+     * already happened - "pointless to retry further", not "nothing live was touched"). */
+    data class BackupResult(val success: Boolean, val uri: Uri? = null, val message: String, val permanent: Boolean = false)
 
     private fun legacyBackupsDir(): File =
         File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), BACKUP_FOLDER_NAME)
@@ -241,14 +262,23 @@ object BackupManager {
         put("backupFormatVersion", BACKUP_FORMAT_VERSION)
         put("createdAt", System.currentTimeMillis())
 
+        // SECURITY: pairSecretHash/lastSecretHash and pinHash are DELIBERATELY never written here.
+        // pairSecretHash is byte-sliced directly into the live BLE handshake token (see
+        // BleConstants.deriveBytesFromHexHash) - anyone who obtains it can authenticate as either
+        // partner's phone on BLE indefinitely, no brute-forcing needed, since the hash IS the secret at
+        // that point, not just a stand-in for the 6-digit code. Because this backup zip gets written to
+        // a PUBLIC location (Downloads/Twogether Backups - see publishBackup), including it there would
+        // let the couple's most sensitive secret leave the two-phone boundary this whole app promises to
+        // respect, via any app/PC with access to Downloads. Restoring a backup onto a new phone now
+        // requires manually re-pairing afterward instead of silently reconnecting - a small deliberate
+        // trade-off for not leaving live BLE credentials sitting in a shared folder. pairPlainCode/
+        // lastPlainCode are excluded for the same reason (the plaintext code is what pairSecretHash is
+        // itself derived from). pinHash is excluded on the same principle - the app-lock PIN's hash has
+        // no business in a file outside the two phones either.
         put("pairing", JSONObject().apply {
-            put("pairSecretHash", pairing.pairSecretHash)
-            put("pairPlainCode", pairing.pairPlainCode)
             put("partnerName", pairing.partnerName)
             put("partnerEmoji", pairing.partnerEmoji)
             put("pairedAt", pairing.pairedAt)
-            put("lastSecretHash", lastConnection.secretHash)
-            put("lastPlainCode", lastConnection.plainCode)
             put("lastPartnerName", lastConnection.partnerName)
             put("lastPartnerEmoji", lastConnection.partnerEmoji)
             put("lastUnpairedAt", lastConnection.unpairedAt)
@@ -257,8 +287,12 @@ object BackupManager {
         put("settings", JSONObject().apply {
             put("defaultSnoozeMinutes", settings.defaultSnoozeMinutes)
             put("notificationsEnabled", settings.notificationsEnabled)
-            put("pinHash", settings.pinHash)
-            put("pinEnabled", settings.pinEnabled)
+            // MINOR fix: always false, never settings.pinEnabled - pinHash itself is deliberately never
+            // written above, so a manifest claiming pinEnabled=true with no hash to check against would
+            // be a "PIN lock on with nothing that can ever unlock it" trap for anything that reads this
+            // field without also independently forcing it false the way this build's own restoreBackup
+            // does (e.g. a downgraded/older build reading a backup made by this one).
+            put("pinEnabled", false)
             put("lastSyncAt", settings.lastSyncAt)
             put("deviceTieBreakByte", settings.deviceTieBreakByte)
             put("localDeviceId", settings.localDeviceId)
@@ -368,6 +402,160 @@ object BackupManager {
     // Restore
     // ---------------------------------------------------------------------------------------------
 
+    private const val PENDING_RESTORE_FILE_NAME = "pending_restore.zip"
+
+    /** See resumePendingRestoreIfAny's MAJOR fix doc - the total number of real, destructive
+     * restoreBackup() attempts one pending restore gets before it's given up on, counted from ONE shared
+     * counter across BOTH restoreBackupDurable's own initial attempt and every resumePendingRestoreIfAny
+     * silent auto-resume after it (see the MEDIUM fix, round 4 note in restoreBackupDurable - counting
+     * only the silent-resume attempts left the real total one higher than this constant promised).
+     * Deliberately small: each attempt already re-wipes and repopulates the live Room tables before it
+     * can fail again, so this bounds a real, if rare, destructive-retry-loop risk, not a cheap no-op that
+     * could safely retry indefinitely. */
+    private const val MAX_SILENT_RESTORE_RETRIES = 3
+
+    // MEDIUM fix: restoreBackup is explicitly NOT atomic across Room + DataStore (see restoreBackupDurable's
+    // own doc), so two calls interleaving would genuinely corrupt state into a hybrid of both backups -
+    // e.g. the silent app-start auto-resume (resumePendingRestoreIfAny) and a user picking a fresh backup
+    // via RestoreBackupButton in the same narrow window right after launch. Serializes every restore
+    // attempt through this mutex so a second caller waits for the first to fully finish rather than
+    // running concurrently against the same DB/DataStore.
+    private val restoreMutex = Mutex()
+
+    /**
+     * Wraps [restoreBackup] with durability across process death (the real-world version of "restore
+     * ended in the middle" - a low-memory kill or the user force-closing the app, not a graceful cancel).
+     * Copies [zipUri]'s bytes into app-private storage FIRST (a picked SAF content:// Uri's read grant
+     * isn't guaranteed to survive a process restart, and the original source - a Downloads file, a
+     * USB-mounted location, etc - might not even be reachable a second time), then durably marks a
+     * "restore pending" flag, BEFORE handing off to the existing [restoreBackup] logic unchanged.
+     *
+     * True atomicity across the whole restore (Room tables + DataStore + photo files) isn't achievable -
+     * Room and DataStore are two separate storage engines with no shared transaction between them, so
+     * there's no single commit that could roll everything back if interrupted partway. This is the
+     * practical alternative: make the restore trivially RE-RUNNABLE ([restoreBackup]'s Room path already
+     * clearAll()s + reinserts, and its DataStore restoreRaw() calls already overwrite wholesale, so
+     * running the exact same restore twice produces the same end state, not a doubled one) and durably
+     * remember that one is owed, so [resumePendingRestoreIfAny] can pick it back up on the next app start
+     * no matter how the process died, instead of leaving a half-restored phone with no recovery path.
+     */
+    suspend fun restoreBackupDurable(context: Context, zipUri: Uri): BackupResult = withContext(Dispatchers.IO) {
+        restoreMutex.withLock {
+            val cachedFile = File(context.filesDir, PENDING_RESTORE_FILE_NAME)
+            // MINOR fix, round 4: copies to a SEPARATE temp file first, only overwriting the real
+            // cachedFile once the copy fully succeeds - the previous version wrote straight into
+            // cachedFile, which TRUNCATES it in place. If a still-genuinely-pending restore's cached copy
+            // already lived at this same fixed path (e.g. restore A was interrupted, then before the next
+            // launch the user taps Restore again and picks file B, whose read fails halfway), that
+            // in-place truncation would silently destroy restore A's still-good cached zip, corrupting it
+            // into a truncated hybrid - which resumePendingRestoreIfAny would then dutifully wipe the live
+            // DB attempting to restore from.
+            val tempCopyFile = File(context.filesDir, "$PENDING_RESTORE_FILE_NAME.incoming")
+            try {
+                context.contentResolver.openInputStream(zipUri)?.use { input ->
+                    tempCopyFile.outputStream().use { output -> input.copyTo(output) }
+                } ?: return@withContext BackupResult(false, null, "Couldn't open that backup file.")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                tempCopyFile.delete()
+                return@withContext BackupResult(false, null, "Couldn't read that backup file: ${e.message ?: e.javaClass.simpleName}")
+            }
+            // MINOR fix, round 5: wrapped in the same try/catch shape as the copy above - the previous
+            // version left this bare, so a renameTo() failure (rare on same-volume filesDir, but not
+            // impossible) followed by the copyTo() fallback ALSO throwing (e.g. out of storage) would
+            // propagate uncaught out of this function, through RestoreBackupFlow's un-guarded call site,
+            // into a crash instead of the same graceful BackupResult(false, ...) every other failure path
+            // in this function produces.
+            try {
+                if (!tempCopyFile.renameTo(cachedFile)) {
+                    tempCopyFile.copyTo(cachedFile, overwrite = true)
+                    tempCopyFile.delete()
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                tempCopyFile.delete()
+                return@withContext BackupResult(false, null, "Couldn't read that backup file: ${e.message ?: e.javaClass.simpleName}")
+            }
+            ServiceLocator.settingsStore.setPendingRestorePath(cachedFile.absolutePath)
+            // MEDIUM fix, round 4: counts THIS call's own attempt against the same shared counter
+            // resumePendingRestoreIfAny increments on every silent auto-resume - without this, a real
+            // destructive restoreBackup() invocation happened here uncounted, so the total bound on
+            // destructive attempts across repeated process kills was actually MAX_SILENT_RESTORE_RETRIES
+            // + 1, not MAX_SILENT_RESTORE_RETRIES as documented/intended. setPendingRestorePath just reset
+            // the counter to 0 above, so this always increments to 1 - never itself hits the cap - but it
+            // means resumePendingRestoreIfAny's own later attempts correctly continue counting from 1, not
+            // from 0 as if this call had never happened.
+            ServiceLocator.settingsStore.incrementPendingRestoreAttempts()
+            val result = restoreBackup(context, Uri.fromFile(cachedFile))
+            // MEDIUM fix: a permanent failure (corrupt/foreign/incompatible zip - determined during
+            // validation, before anything live was touched) can never succeed by retrying, so clear the
+            // pending state now rather than leaving resumePendingRestoreIfAny to silently re-fail the
+            // exact same way on every future app launch forever, with the cached zip pinned in filesDir
+            // the whole time. A non-permanent failure (genuine interruption) still leaves both in place.
+            if (result.success || result.permanent) {
+                ServiceLocator.settingsStore.setPendingRestorePath(null)
+                cachedFile.delete()
+            }
+            result
+        }
+    }
+
+    /** Called once on every app start (TwogetherApp.onCreate) - if a previous [restoreBackupDurable] call
+     * was interrupted before it could clear the pending flag (or failed and hasn't been retried since),
+     * this resumes it from the same cached local file, repeating until it actually succeeds. A no-op
+     * (returns null immediately) when nothing is pending, which is the overwhelmingly common case on
+     * every normal app start. */
+    // MINOR fix: wrapped in withContext(Dispatchers.IO), matching restoreBackupDurable - without it,
+    // cachedFile.isFile/.delete() (and everything restoreBackup itself does) ran on whatever dispatcher
+    // TwogetherApp.onCreate's applicationScope.launch happens to use (Main), the exact class of bug this
+    // diff's own CancellationException/dispatcher fixes elsewhere were about avoiding.
+    suspend fun resumePendingRestoreIfAny(context: Context): BackupResult? = withContext(Dispatchers.IO) {
+        restoreMutex.withLock {
+            val pendingPath = ServiceLocator.settingsStore.current().pendingRestorePath ?: return@withLock null
+            val cachedFile = File(pendingPath)
+            if (!cachedFile.isFile) {
+                // The cached copy itself is gone (e.g. filesDir cleared some other way) - nothing left to
+                // resume from; clear the now-meaningless flag rather than leaving it stuck forever.
+                ServiceLocator.settingsStore.setPendingRestorePath(null)
+                return@withLock null
+            }
+
+            // MAJOR fix, round 3: incremented BEFORE attempting, not after restoreBackup() returns. The
+            // scenario this whole durable-resume mechanism exists for is process death DURING
+            // restoreBackup (a low-memory kill, the user force-closing the app) - a counter only bumped
+            // on a completed call never sees that case at all, since the process is gone before it could
+            // run. Each attempt is now durably recorded as "about to happen" before any destructive work
+            // starts, so even a kill mid-restoreBackup on every single subsequent launch still converges:
+            // this pending restore gets AT MOST MAX_SILENT_RESTORE_RETRIES actual attempts at the
+            // destructive DB wipe TOTAL - counting restoreBackupDurable's own first attempt (see its
+            // MEDIUM fix, round 4 note) plus every silent auto-resume attempt here - no matter how many
+            // get interrupted, not an unbounded number across repeated kills.
+            val attemptNumber = ServiceLocator.settingsStore.incrementPendingRestoreAttempts()
+            if (attemptNumber > MAX_SILENT_RESTORE_RETRIES) {
+                ServiceLocator.settingsStore.setPendingRestorePath(null)
+                cachedFile.delete()
+                // MINOR fix: without this, giving up left the user unpaired/PIN-less with a partially-
+                // restored phone and zero indication anything had even been attempted -
+                // TwogetherApp.onCreate discards this whole function's return value silently on every
+                // normal call.
+                Notifications.showRestoreGaveUpNotification(context)
+                return@withLock BackupResult(false, null, "Gave up resuming this restore after $MAX_SILENT_RESTORE_RETRIES attempts.", permanent = true)
+            }
+
+            val result = restoreBackup(context, Uri.fromFile(cachedFile))
+            // See restoreBackupDurable's matching comment - a permanent failure must clear the pending
+            // state too, not just a success, or it silently re-fails the same way forever. A non-permanent
+            // failure that hasn't hit the cap above leaves both in place, to be retried on the next launch.
+            if (result.success || result.permanent) {
+                ServiceLocator.settingsStore.setPendingRestorePath(null)
+                cachedFile.delete()
+            }
+            result
+        }
+    }
+
     /**
      * Validates and extracts [zipFile] into a temp directory FIRST, fully parsing the manifest into
      * typed rows before touching anything live - a corrupt/malformed/foreign zip fails here with a
@@ -401,7 +589,34 @@ object BackupManager {
                                 val safeName = File(name).name
                                 if (safeName.isNotBlank()) {
                                     val outFile = File(tempDir, safeName)
-                                    FileOutputStream(outFile).use { fos -> zis.copyTo(fos) }
+                                    try {
+                                        FileOutputStream(outFile).use { fos -> zis.copyTo(fos) }
+                                    } catch (e: CancellationException) {
+                                        throw e
+                                    } catch (e: ZipException) {
+                                        // MEDIUM fix, round 3: zis.copyTo(fos) reads from the ZIP stream
+                                        // as well as writing to local storage - a truncated/corrupt
+                                        // deflate stream in this entry throws HERE too, not just a
+                                        // genuine local-disk failure. Without this specific catch (ahead
+                                        // of the generic IOException one below), that would be
+                                        // misclassified as "device low on storage" AND non-permanent,
+                                        // letting a genuinely corrupt backup silently re-attempt up to
+                                        // MAX_SILENT_RESTORE_RETRIES times instead of failing cleanly
+                                        // once. Rethrow so the OUTER catch (which correctly marks zip-
+                                        // structure corruption permanent) handles it instead.
+                                        throw e
+                                    } catch (e: EOFException) {
+                                        throw e
+                                    } catch (e: IOException) {
+                                        // This write targets LOCAL cache storage, not the backup zip
+                                        // itself - a failure here (most realistically this device being
+                                        // low on storage) says nothing about whether the backup FILE is
+                                        // valid, and retrying once storage frees up could well succeed.
+                                        // Classified non-permanent, unlike a genuinely corrupt
+                                        // zip/manifest below - and given its own message, not the
+                                        // misleading "isn't readable as a Twogether backup" one.
+                                        return@withContext BackupResult(false, null, "Couldn't extract the backup - this device may be low on storage.")
+                                    }
                                     extractedPhotos[name] = outFile
                                 }
                             }
@@ -410,22 +625,24 @@ object BackupManager {
                         entry = zis.nextEntry
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                return@withContext BackupResult(false, null, "That file isn't readable as a Twogether backup: ${e.message ?: e.javaClass.simpleName}")
+                return@withContext BackupResult(false, null, "That file isn't readable as a Twogether backup: ${e.message ?: e.javaClass.simpleName}", permanent = true)
             }
 
-            val root = manifest ?: return@withContext BackupResult(false, null, "That file isn't a valid Twogether backup (no manifest found).")
+            val root = manifest ?: return@withContext BackupResult(false, null, "That file isn't a valid Twogether backup (no manifest found).", permanent = true)
 
             val requiredKeys = listOf("backupFormatVersion", "pairing", "settings", "badgeUnlocks", "sessions", "dateIdeas", "timeCapsules", "moments")
             for (key in requiredKeys) {
-                if (!root.has(key)) return@withContext BackupResult(false, null, "This backup file is corrupt or incomplete (missing '$key').")
+                if (!root.has(key)) return@withContext BackupResult(false, null, "This backup file is corrupt or incomplete (missing '$key').", permanent = true)
             }
             // momentNotes/milestones are intentionally NOT in requiredKeys above - a v1 backup (made
             // before this feature batch) simply won't have them, and that's fine; optJSONArray below
             // treats a missing array the same as an empty one rather than failing the whole restore.
             val version = root.optInt("backupFormatVersion", -1)
             if (version < 1 || version > BACKUP_FORMAT_VERSION) {
-                return@withContext BackupResult(false, null, "This backup was made by an incompatible version of Twogether.")
+                return@withContext BackupResult(false, null, "This backup was made by an incompatible version of Twogether.", permanent = true)
             }
 
             val parsed = try {
@@ -444,7 +661,7 @@ object BackupManager {
                     }
                 )
             } catch (e: Exception) {
-                return@withContext BackupResult(false, null, "This backup file is corrupt or incomplete (${e.message ?: e.javaClass.simpleName}).")
+                return@withContext BackupResult(false, null, "This backup file is corrupt or incomplete (${e.message ?: e.javaClass.simpleName}).", permanent = true)
             }
 
             // Everything parsed successfully - now actually apply it.
@@ -469,21 +686,42 @@ object BackupManager {
                 // was defaulted to DEFAULT_LIST_ID by parseDateIdeas' own fallback, so without a matching
                 // list_categories row the UI would have no card to show those ideas under at all. Synthesize
                 // the same default "Date Ideas" row AppDatabase.MIGRATION_7_8 seeds on a live upgrade.
-                if (parsed.listCategories.none { it.id == DEFAULT_LIST_ID }) {
-                    val now = System.currentTimeMillis()
+                //
+                // MAJOR fix: also covers a backup where DEFAULT_LIST_ID is PRESENT but tombstoned
+                // (deleted=true) - e.g. a backup taken on an older build, before ListCategoryRepository.
+                // delete()/mergeRemote() were hardened to refuse ever deleting/tombstoning this one list
+                // (see their own docs for why). Restoring such a row as-is here goes through the raw DAO,
+                // bypassing both of those guards entirely, and would resurrect the exact "orphan gets
+                // reassigned to a list that doesn't resolve -> unbounded reactive write loop" bug those
+                // guards exist to prevent. Force it active regardless of what the backup's own copy says,
+                // the same way mergeRemote() already refuses an incoming delete-tombstone for it.
+                val now = System.currentTimeMillis()
+                val restoredDefault = parsed.listCategories.firstOrNull { it.id == DEFAULT_LIST_ID }
+                if (restoredDefault == null) {
                     db.listCategoryDao().upsert(ListCategory(id = DEFAULT_LIST_ID, name = "Date Ideas", createdAt = now, updatedAt = now))
+                } else if (restoredDefault.deleted) {
+                    db.listCategoryDao().upsert(restoredDefault.copy(deleted = false, updatedAt = now))
                 }
             }
 
+            // SECURITY: secretHash/plainCode/lastSecretHash/lastPlainCode/pinHash are deliberately NEVER
+            // read from the backup JSON, even if present (an OLD backup made before this fix still has
+            // them) - restoring them would reintroduce a secret this app now refuses to ever let leave
+            // app-private storage. isPaired/exists are both derived from secretHash being non-blank (see
+            // PairingInfo/LastConnectionInfo), so leaving these null correctly routes a restored phone
+            // to the normal pairing screen instead of any broken partially-paired state. pinEnabled is
+            // forced false alongside the missing pinHash for the same reason PIN-lock-on-with-no-hash-
+            // to-check-against would otherwise be a locked-out-forever state - the couple re-enables PIN
+            // and sets a fresh one from Settings if they want it back, same as re-pairing.
             val p = parsed.pairingJson
             ServiceLocator.pairingStore.restoreRaw(
-                secretHash = p.optStringOrNull("pairSecretHash"),
-                plainCode = p.optStringOrNull("pairPlainCode"),
+                secretHash = null,
+                plainCode = null,
                 partnerName = p.optStringOrNull("partnerName"),
                 partnerEmoji = p.optStringOrNull("partnerEmoji"),
                 pairedAt = p.optLong("pairedAt", 0L),
-                lastSecretHash = p.optStringOrNull("lastSecretHash"),
-                lastPlainCode = p.optStringOrNull("lastPlainCode"),
+                lastSecretHash = null,
+                lastPlainCode = null,
                 lastPartnerName = p.optStringOrNull("lastPartnerName"),
                 lastPartnerEmoji = p.optStringOrNull("lastPartnerEmoji"),
                 lastUnpairedAt = p.optLong("lastUnpairedAt", 0L)
@@ -493,8 +731,8 @@ object BackupManager {
             ServiceLocator.settingsStore.restoreRaw(
                 defaultSnoozeMinutes = s.optInt("defaultSnoozeMinutes", 15),
                 notificationsEnabled = s.optBoolean("notificationsEnabled", true),
-                pinHash = s.optStringOrNull("pinHash"),
-                pinEnabled = s.optBoolean("pinEnabled", false),
+                pinHash = null,
+                pinEnabled = false,
                 lastSyncAt = s.optLong("lastSyncAt", 0L),
                 deviceTieBreakByte = if (s.isNull("deviceTieBreakByte")) null else s.optInt("deviceTieBreakByte"),
                 localDeviceId = s.optStringOrNull("localDeviceId")
@@ -521,6 +759,8 @@ object BackupManager {
                     "${parsed.dateIdeas.size} date idea(s), ${parsed.timeCapsules.size} capsule(s), " +
                     "${parsed.milestones.size} milestone(s)."
             )
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             BackupResult(false, null, "Restore failed: ${e.message ?: e.javaClass.simpleName}")
         } finally {

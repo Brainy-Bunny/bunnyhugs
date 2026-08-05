@@ -618,7 +618,7 @@ class ProximityForegroundService : LifecycleService() {
             if (manual) AppEvents.emitSyncCompleted(false)
             return
         }
-        val handshakeToken = BleConstants.deriveBytesFromHexHash(secretHash, BleConstants.HANDSHAKE_TOKEN_HEX_OFFSET, BleConstants.HANDSHAKE_TOKEN_BYTES)
+        val handshakeKey = BleConstants.deriveBytesFromHexHash(secretHash, BleConstants.HANDSHAKE_TOKEN_HEX_OFFSET, BleConstants.HANDSHAKE_TOKEN_BYTES)
 
         val onResult: (Boolean) -> Unit = { success ->
             lifecycleScope.launch {
@@ -639,7 +639,7 @@ class ProximityForegroundService : LifecycleService() {
             // failure/timeout text, which is misleading when the couple genuinely is together and passive
             // sync is in fact working.
             if (manual) AppEvents.emitSyncListening()
-            gattSync.startServer(handshakeToken, onResult)
+            gattSync.startServer(handshakeKey, onResult)
         } else {
             // MAJOR fix (D): only ever one CLIENT-role attempt in flight - see clientSyncAttemptInProgress's
             // doc above. The server role isn't guarded here: GattSyncManager.startServer is already
@@ -654,7 +654,7 @@ class ProximityForegroundService : LifecycleService() {
                 if (manual) AppEvents.emitSyncCompleted(false)
                 return
             }
-            gattSync.connectAsClient(device, handshakeToken) { success ->
+            gattSync.connectAsClient(device, handshakeKey) { success ->
                 synchronized(syncGuardLock) { clientSyncAttemptInProgress = false }
                 onResult(success)
             }

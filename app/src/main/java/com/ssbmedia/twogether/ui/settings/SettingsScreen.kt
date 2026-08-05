@@ -37,6 +37,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -98,7 +99,13 @@ class SettingsViewModel : ViewModel() {
     }
 
     fun setPin(pin: String) {
-        viewModelScope.launch {
+        // MINOR fix: launched on the app-scoped coroutine, NOT viewModelScope - same reasoning as
+        // unpair() below. PinUtil.hash() now does real, visible work (600k-round PBKDF2, up to ~1-3s on
+        // a mid-range phone); navigating out of Settings within that window used to cancel viewModelScope
+        // and silently drop the PIN save entirely (the dialog would close as if it succeeded, but
+        // pinHash/pinEnabled were never actually written). At the old 20k-round cost (~tens of ms) this
+        // was never realistically reachable.
+        ServiceLocator.applicationScope.launch {
             ServiceLocator.settingsStore.setPin(PinUtil.hash(pin))
             // AppLockManager.isLocked defaults to true and is otherwise only cleared by successfully
             // entering the PIN on PinLockScreen. Without this, turning PIN lock on for the first time
@@ -179,6 +186,10 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
     }
 
     var showPinDialog by remember { mutableStateOf(false) }
+    // Gates BOTH "Change PIN" and "turn PIN off" behind re-entering the CURRENT PIN first - closes the
+    // gap where anyone holding an already-unlocked phone could silently hijack or remove the app lock
+    // with zero friction, without needing to know the existing PIN at all. See PinVerifyPurpose's doc.
+    var pinVerifyPurpose by remember { mutableStateOf<PinVerifyPurpose?>(null) }
     var showUnpairConfirm by remember { mutableStateOf(false) }
     var showSnoozeDialog by remember { mutableStateOf(false) }
 
@@ -241,13 +252,18 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                     Switch(
                         checked = settings.pinEnabled,
                         onCheckedChange = { enabled ->
-                            if (enabled) showPinDialog = true else vm.clearPin()
+                            // Turning ON for the first time (or after clearPin() fully wiped the old
+                            // hash - see its own doc) has no existing PIN to verify against, so it goes
+                            // straight to setting a fresh one. Turning OFF is exactly as sensitive as
+                            // changing it - it removes protection entirely - so it goes through the same
+                            // current-PIN check below rather than being one frictionless tap.
+                            if (enabled) showPinDialog = true else pinVerifyPurpose = PinVerifyPurpose.DISABLE
                         }
                     )
                 }
                 if (settings.pinEnabled) {
                     SettingsRow(label = "Change PIN", subtitle = "Update your app lock code") {
-                        TextButton(onClick = { showPinDialog = true }) { Text("Change") }
+                        TextButton(onClick = { pinVerifyPurpose = PinVerifyPurpose.CHANGE }) { Text("Change") }
                     }
                 }
             }
@@ -305,7 +321,7 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                         }) { Text("Back up now") }
                     }
                 }
-                SettingsRow(label = "Restore from backup", subtitle = "Loads sessions, photos, and pairing from a saved backup file") {
+                SettingsRow(label = "Restore from backup", subtitle = "Loads sessions, photos, and settings from a saved backup file - you'll need to re-pair afterward") {
                     com.ssbmedia.twogether.ui.backup.RestoreBackupButton { onClick ->
                         TextButton(onClick = onClick) { Text("Restore") }
                     }
@@ -370,6 +386,20 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
 
     if (showPinDialog) {
         SetPinDialog(onDismiss = { showPinDialog = false }, onSave = { pin -> vm.setPin(pin); showPinDialog = false })
+    }
+
+    pinVerifyPurpose?.let { purpose ->
+        VerifyCurrentPinDialog(
+            currentPinHash = settings.pinHash,
+            onDismiss = { pinVerifyPurpose = null },
+            onVerified = {
+                pinVerifyPurpose = null
+                when (purpose) {
+                    PinVerifyPurpose.CHANGE -> showPinDialog = true
+                    PinVerifyPurpose.DISABLE -> vm.clearPin()
+                }
+            }
+        )
     }
 
     if (showUnpairConfirm) {
@@ -460,6 +490,98 @@ private fun SnoozeDefaultDialog(current: Int, onDismiss: () -> Unit, onSave: (In
             )
         },
         confirmButton = { TextButton(onClick = { onSave((text.toIntOrNull() ?: current).coerceIn(1, 720)) }) { Text("Save") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
+/** Which action a successful [VerifyCurrentPinDialog] should unlock - see its call site's doc for why
+ * both of these (not just changing) need the current PIN re-entered first. */
+private enum class PinVerifyPurpose { CHANGE, DISABLE }
+
+/** Requires the CURRENT PIN before allowing [PinVerifyPurpose.CHANGE]/[DISABLE] - closes the gap where
+ * anyone holding an already-unlocked phone could silently take over or remove the app lock without ever
+ * needing to know the existing PIN. [currentPinHash] is null only if PIN lock was somehow already off
+ * when this got triggered (shouldn't normally happen, both call sites are gated on settings.pinEnabled),
+ * treated as "can't verify, refuse" rather than silently succeeding. */
+@Composable
+private fun VerifyCurrentPinDialog(currentPinHash: String?, onDismiss: () -> Unit, onVerified: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    var pin by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    var isVerifying by remember { mutableStateOf(false) }
+
+    // MINOR fix: shares the SAME lockout state PinLockScreen's own unlock flow uses
+    // (AppLockManager.recordFailedPinAttempt/isPinLockedOut) - without this, this dialog was the one PIN
+    // gate in the app with unlimited guesses, even though it protects exactly the "someone else picked up
+    // an already-unlocked phone" scenario this whole feature exists for. A single shared counter across
+    // both screens is also the more correct threat model: it's still a brute-force attempt against the
+    // same PIN regardless of which screen it's typed into.
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    val lockedOut = AppLockManager.isPinLockedOut(now)
+    LaunchedEffect(lockedOut) {
+        while (AppLockManager.isPinLockedOut(System.currentTimeMillis())) {
+            kotlinx.coroutines.delay(1000)
+            now = System.currentTimeMillis()
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Enter your current PIN") },
+        text = {
+            Column {
+                Text("Confirm it's you before changing this.", style = MaterialTheme.typography.bodySmall)
+                OutlinedTextField(
+                    value = pin,
+                    onValueChange = { pin = it.filter { c -> c.isDigit() }.take(6); error = null },
+                    label = { Text("Current PIN") },
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    enabled = !lockedOut
+                )
+                val displayError = if (lockedOut) {
+                    "Too many wrong attempts - try again in ${((AppLockManager.pinLockedOutUntilMillis - now) / 1000L).coerceAtLeast(0L) + 1}s"
+                } else error
+                displayError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp)) }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    // MINOR fix: guards against a double-tap spawning a second concurrent 600k-round
+                    // PBKDF2 job (and, on a wrong PIN, recording two failed attempts for one user
+                    // intent) - at the old 20k-round cost this was fast enough not to matter, but a
+                    // verify can now visibly take over a second on a mid-range phone.
+                    if (isVerifying) return@TextButton
+                    isVerifying = true
+                    // BLOCKER fix: PinUtil.matches now suspends and internally moves the 600k-round
+                    // PBKDF2 work off Main - launching here (rather than calling it directly) is what
+                    // actually keeps this click handler from blocking the UI thread.
+                    scope.launch {
+                        // MINOR fix: try/finally - without it, an exception from PinUtil.matches (none
+                        // currently throws, but this is a coroutine calling into crypto APIs) would leave
+                        // isVerifying stuck true forever, permanently disabling this button.
+                        try {
+                            if (PinUtil.matches(pin, currentPinHash)) {
+                                // MINOR fix: resets the shared failed-attempt counter on success, same as
+                                // AppLockManager.unlock() does - otherwise wrong guesses typed into THIS
+                                // dialog would linger and could trigger an immediate lockout on the next
+                                // wrong PIN typed anywhere, including later on the main lock screen.
+                                AppLockManager.resetFailedPinAttempts()
+                                onVerified()
+                            } else {
+                                AppLockManager.recordFailedPinAttempt()
+                                error = "That's not the right PIN"
+                                pin = ""
+                            }
+                        } finally {
+                            isVerifying = false
+                        }
+                    }
+                },
+                enabled = !lockedOut && !isVerifying
+            ) { Text("Continue") }
+        },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
     )
 }

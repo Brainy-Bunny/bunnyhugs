@@ -11,13 +11,31 @@ object Hashing {
         return digest.joinToString("") { "%02x".format(it) }
     }
 
-    private const val PBKDF2_ITERATIONS = 20_000
+    private const val PBKDF2_ITERATIONS_CURRENT = 600_000
+    // The round count this app used before the strengthening below - kept only so verifyRandomSalt()/
+    // matchesPairingCode() can still verify a hash that was computed under it (any hash stored before
+    // this app version). Never used to compute a NEW hash.
+    private const val PBKDF2_ITERATIONS_LEGACY = 20_000
     private const val PBKDF2_KEY_BITS = 256
 
-    private fun pbkdf2Hex(input: String, saltBytes: ByteArray, iterations: Int = PBKDF2_ITERATIONS): String {
+    private fun pbkdf2Hex(input: String, saltBytes: ByteArray, iterations: Int = PBKDF2_ITERATIONS_CURRENT): String {
         val spec = PBEKeySpec(input.toCharArray(), saltBytes, iterations, PBKDF2_KEY_BITS)
         val key = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec)
         return key.encoded.joinToString("") { "%02x".format(it) }
+    }
+
+    /** TEST-ONLY - do not call from production code. `internal` visibility (needed so HashingTest, in a
+     * separate file, can reach it) makes this visible to the rest of this module too, not just tests -
+     * the TEST_ONLY_ prefix exists specifically so it can never look like a legitimate hashing call at a
+     * real call site or get autocompleted in place of hashWithRandomSalt() by mistake (which would
+     * silently persist a PIN at the weaker legacy iteration count). Builds a realistic "salted hash
+     * computed before the PBKDF2_ITERATIONS_CURRENT bump" fixture, so HashingTest can cover the
+     * MATCHED_OLDER-via-legacy-iterations branch of verifyRandomSalt() without needing pbkdf2Hex's
+     * iteration parameter exposed publicly. */
+    internal fun TEST_ONLY_hashWithRandomSaltAtLegacyIterations(input: String): String {
+        val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
+        val saltHex = salt.joinToString("") { "%02x".format(it) }
+        return "$saltHex:${pbkdf2Hex(input, salt, PBKDF2_ITERATIONS_LEGACY)}"
     }
 
     /**
@@ -34,34 +52,45 @@ object Hashing {
         return "$saltHex:${pbkdf2Hex(input, salt)}"
     }
 
+    /** Outcome of [verifyRandomSalt]: whether [input] matched [stored] at all, and if so, whether it
+     * matched via the CURRENT strongest format or an older/weaker one that should be self-migrated. */
+    enum class SaltedVerifyResult { NO_MATCH, MATCHED_CURRENT, MATCHED_OLDER }
+
     /**
-     * Verifies [input] against [stored], transparently accepting the OLD bare-SHA-256 format that
-     * predates this PBKDF2-with-random-salt strengthening (a stored value in the new format always
-     * contains a "salt:hash" separator; the old format never did). Without this fallback, any stored
-     * value still in the old format would be rejected unconditionally forever - matchesRandomSalt()
-     * used to `split(":")` and bail with `parts.size != 2`, meaning the correct PIN could never verify
-     * again after this hashing upgrade shipped, with no escape except uninstalling (destroying all
-     * local data - sessions/moments/capsules/date-ideas). Callers that get a match via the legacy
-     * branch should re-persist the value via hashWithRandomSalt() right away so the device
-     * self-migrates to the stronger format the next time it succeeds - see isLegacyFormat().
+     * Verifies [input] against [stored] in ONE pass (rather than two separate re-derivations, see the
+     * MINOR fix note below), transparently accepting TWO older formats that predate the current one: the
+     * bare-SHA-256 format from before random-salted PBKDF2 was added at all (no "salt:hash" separator),
+     * and a salted-but-PBKDF2_ITERATIONS_LEGACY-rounds hash from before the later iteration-count
+     * strengthening (same "salt:hash" shape as the current format, only distinguishable by actually
+     * re-deriving at both round counts). Without this fallback, any stored value still in an older format
+     * would be rejected unconditionally forever, meaning the correct PIN could never verify again after a
+     * hashing upgrade shipped, with no escape except uninstalling (destroying all local data -
+     * sessions/moments/capsules/date-ideas). Callers that get MATCHED_OLDER back should re-persist the
+     * value via hashWithRandomSalt() right away so the device self-migrates to the current format.
+     *
+     * MINOR fix: this used to be two separate functions (matchesRandomSalt() + needsRehash()), and a
+     * caller that needed both answers - as PinLockScreen's unlock flow does - ended up computing
+     * pbkdf2Hex(input, salt) at CURRENT iterations TWICE, once inside each function, since needsRehash()
+     * had no way to know what matches() had already found. At PBKDF2_ITERATIONS_CURRENT (600k rounds)
+     * that doubled real unlock latency on every single successful unlock, not just ones that actually
+     * needed migrating. Returning one result both callers can branch on fixes that for good.
      */
-    fun matchesRandomSalt(input: String, stored: String?): Boolean {
-        if (stored.isNullOrBlank()) return false
-        if (!stored.contains(":")) return sha256Hex(input) == stored
+    fun verifyRandomSalt(input: String, stored: String?): SaltedVerifyResult {
+        if (stored.isNullOrBlank()) return SaltedVerifyResult.NO_MATCH
+        if (!stored.contains(":")) {
+            return if (sha256Hex(input) == stored) SaltedVerifyResult.MATCHED_OLDER else SaltedVerifyResult.NO_MATCH
+        }
         val parts = stored.split(":", limit = 2)
-        if (parts.size != 2) return false
+        if (parts.size != 2) return SaltedVerifyResult.NO_MATCH
         val salt = try {
             ByteArray(parts[0].length / 2) { i -> parts[0].substring(i * 2, i * 2 + 2).toInt(16).toByte() }
         } catch (e: Exception) {
-            return false
+            return SaltedVerifyResult.NO_MATCH
         }
-        return pbkdf2Hex(input, salt) == parts[1]
+        if (pbkdf2Hex(input, salt) == parts[1]) return SaltedVerifyResult.MATCHED_CURRENT
+        if (pbkdf2Hex(input, salt, PBKDF2_ITERATIONS_LEGACY) == parts[1]) return SaltedVerifyResult.MATCHED_OLDER
+        return SaltedVerifyResult.NO_MATCH
     }
-
-    /** True iff [stored] looks like the pre-upgrade bare-SHA-256 format (no "salt:hash" separator)
-     * rather than the current hashWithRandomSalt() format - see matchesRandomSalt(). Callers use this
-     * right after a successful match to decide whether to re-persist in the new format. */
-    fun isLegacyFormat(stored: String?): Boolean = !stored.isNullOrBlank() && !stored.contains(":")
 
     // A fixed, app-embedded pepper (NOT secret - it's baked into the APK and extractable by anyone with
     // the APK) used only to add PBKDF2 iteration cost to the *shared pairing-code* hash. This
@@ -85,29 +114,38 @@ object Hashing {
         pbkdf2Hex(code, PAIRING_CODE_PEPPER.toByteArray(Charsets.UTF_8))
 
     /**
-     * Verifies a pairing code against a stored pairSecretHash, accepting BOTH the current strengthened
-     * (pepper+PBKDF2) hash and the old bare-SHA-256 hash that predates it. Unlike matchesRandomSalt()
-     * above, the two formats here can't be told apart by shape alone - strengthenedPairingCodeHex() is
-     * deterministic with no per-value salt, so an old sha256Hex(code) and a new
-     * strengthenedPairingCodeHex(code) are both just bare 64-char hex, indistinguishable without
-     * recomputing both and comparing. Used by the "Forgot PIN -> re-enter pairing code" recovery flow
-     * (PinLockScreen), which was otherwise permanently broken for any device that paired before the
-     * PBKDF2 upgrade - the same hashing fix that added hashWithRandomSalt() for the PIN also changed
-     * this pairing-code hash.
+     * Verifies a pairing code against a stored pairSecretHash, accepting the CURRENT strengthened
+     * (pepper+PBKDF2_ITERATIONS_CURRENT) hash, the previous strengthened (pepper+PBKDF2_ITERATIONS_LEGACY)
+     * hash from before the later iteration-count bump, and the original bare-SHA-256 hash that predates
+     * PBKDF2 entirely. None of these three formats can be told apart by shape alone -
+     * strengthenedPairingCodeHex() is deterministic with no per-value salt, so all three are just bare
+     * 64-char hex, indistinguishable without recomputing each and comparing. Used by the "Forgot PIN ->
+     * re-enter pairing code" recovery flow (PinLockScreen), which was otherwise permanently broken for
+     * any device that paired before a given PBKDF2 strengthening - the same hashing fix that added
+     * hashWithRandomSalt() for the PIN also changed this pairing-code hash.
      *
-     * IMPORTANT: deliberately NOT auto-migrated/re-persisted the way the PIN hash is on a legacy match.
-     * pairSecretHash is used directly (never re-derived) on BOTH partner phones to derive the BLE
-     * advertise/scan prefix and GATT handshake token (see
+     * IMPORTANT: deliberately NOT auto-migrated/re-persisted the way the PIN hash is on an older-format
+     * match. pairSecretHash is used directly (never re-derived) on BOTH partner phones to derive the BLE
+     * advertise/scan prefix and GATT handshake key (see
      * ProximityForegroundService.ensureBleRunning/startGattSyncIfNeeded) - both phones' independently
      * stored copies must stay byte-identical for proximity detection to keep working. Rewriting just
-     * this one device's copy to the new format the moment its owner uses "Forgot PIN" would silently
-     * diverge it from a partner phone that's still on the old format (the common case, since both
-     * partners almost always paired together under the same pre-upgrade build) - breaking BLE
-     * detection between them, a worse and much harder-to-diagnose regression than the recovery-flow
-     * bug this function fixes.
+     * this one device's copy to a newer format the moment its owner uses "Forgot PIN" would silently
+     * diverge it from a partner phone that's still on an older format (the common case, since both
+     * partners almost always paired together under the same build) - breaking BLE detection between
+     * them, a worse and much harder-to-diagnose regression than the recovery-flow bug this function fixes.
      */
     fun matchesPairingCode(code: String, stored: String?): Boolean {
         if (stored.isNullOrBlank()) return false
-        return strengthenedPairingCodeHex(code) == stored || sha256Hex(code) == stored
+        return strengthenedPairingCodeHex(code) == stored ||
+            pbkdf2Hex(code, PAIRING_CODE_PEPPER.toByteArray(Charsets.UTF_8), PBKDF2_ITERATIONS_LEGACY) == stored ||
+            sha256Hex(code) == stored
     }
+
+    /** TEST-ONLY - do not call from production code, see TEST_ONLY_hashWithRandomSaltAtLegacyIterations'
+     * doc for why this is `internal` rather than `private`. Builds the pepper+PBKDF2_ITERATIONS_LEGACY
+     * pairing-code hash a couple who paired before the iteration-count bump (but after the pepper was
+     * introduced) would have stored, so HashingTest can cover that middle branch of matchesPairingCode()
+     * - previously only its CURRENT and bare-SHA256 branches had coverage. */
+    internal fun TEST_ONLY_strengthenedPairingCodeHexAtLegacyIterations(code: String): String =
+        pbkdf2Hex(code, PAIRING_CODE_PEPPER.toByteArray(Charsets.UTF_8), PBKDF2_ITERATIONS_LEGACY)
 }

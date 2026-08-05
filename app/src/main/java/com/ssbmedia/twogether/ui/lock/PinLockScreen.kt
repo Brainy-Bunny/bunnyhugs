@@ -30,7 +30,9 @@ import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.lock.AppLockManager
 import com.ssbmedia.twogether.lock.PinUtil
 import com.ssbmedia.twogether.util.Hashing
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** Full-screen gate shown on cold start and whenever the app resumes from the background, if PIN lock is enabled. */
 @Composable
@@ -39,6 +41,10 @@ fun PinLockScreen() {
     var pin by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     var showForgot by remember { mutableStateOf(false) }
+    // MINOR fix: guards against a double-tap spawning a second concurrent 600k-round PBKDF2 job (and,
+    // on a wrong PIN, recording two failed attempts for one user intent) - see the matching fix in
+    // SettingsScreen's VerifyCurrentPinDialog for the same reasoning.
+    var isVerifying by remember { mutableStateOf(false) }
 
     // Basic throttle feedback - see AppLockManager.recordFailedPinAttempt's doc. Ticks once a second
     // only while actually locked out, purely so the countdown text stays live; harmless/no-op otherwise.
@@ -74,28 +80,40 @@ fun PinLockScreen() {
                 displayError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp)) }
                 Button(
                     onClick = {
+                        if (isVerifying) return@Button
+                        isVerifying = true
                         scope.launch {
-                            val storedHash = ServiceLocator.settingsStore.current().pinHash
-                            if (PinUtil.matches(pin, storedHash)) {
-                                if (PinUtil.isLegacyFormat(storedHash)) {
-                                    // Correct PIN, but verified via the old bare-SHA-256 fallback -
-                                    // self-migrate to the strengthened format now that it's proven
-                                    // correct, so this device never needs to touch this path again.
-                                    // Safe to do unconditionally (unlike pairSecretHash below): pinHash
-                                    // is purely local and never compared against another device.
-                                    ServiceLocator.settingsStore.setPin(PinUtil.hash(pin))
+                            // MINOR fix: try/finally - without it, an exception from PinUtil.verify (none
+                            // currently throws, but this is a coroutine calling into crypto APIs) would
+                            // leave isVerifying stuck true forever, permanently disabling this button.
+                            try {
+                                val storedHash = ServiceLocator.settingsStore.current().pinHash
+                                when (PinUtil.verify(pin, storedHash)) {
+                                    Hashing.SaltedVerifyResult.MATCHED_OLDER -> {
+                                        // Correct PIN, but verified via an older/weaker fallback (bare
+                                        // SHA-256, or a salted hash at a since-bumped iteration count) -
+                                        // self-migrate to the current strongest format now that it's proven
+                                        // correct, so this device never needs to touch this path again.
+                                        // Safe to do unconditionally (unlike pairSecretHash below): pinHash
+                                        // is purely local and never compared against another device.
+                                        ServiceLocator.settingsStore.setPin(PinUtil.hash(pin))
+                                        AppLockManager.unlock()
+                                    }
+                                    Hashing.SaltedVerifyResult.MATCHED_CURRENT -> AppLockManager.unlock()
+                                    Hashing.SaltedVerifyResult.NO_MATCH -> {
+                                        AppLockManager.recordFailedPinAttempt()
+                                        error = "Wrong PIN, try again"
+                                        pin = ""
+                                    }
                                 }
-                                AppLockManager.unlock()
-                            } else {
-                                AppLockManager.recordFailedPinAttempt()
-                                error = "Wrong PIN, try again"
-                                pin = ""
+                            } finally {
+                                isVerifying = false
                             }
                         }
                     },
                     modifier = Modifier.fillMaxWidth().padding(top = 20.dp),
                     shape = MaterialTheme.shapes.large,
-                    enabled = pin.length >= 4 && !lockedOut
+                    enabled = pin.length >= 4 && !lockedOut && !isVerifying
                 ) { Text("Unlock") }
                 TextButton(onClick = { showForgot = true }, modifier = Modifier.padding(top = 8.dp)) {
                     Text("Forgot PIN?")
@@ -112,6 +130,21 @@ private fun ForgotPinContent(onCancel: () -> Unit, onReset: () -> Unit) {
     val scope = rememberCoroutineScope()
     var code by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
+    // MINOR fix: this button also removes the PIN lock outright on a match, but unlike its two sibling
+    // gates (PinLockScreen's own unlock button, SettingsScreen's VerifyCurrentPinDialog) it had neither
+    // the shared AppLockManager throttle nor an in-flight guard. Not a regression (each guess still costs
+    // one real 600k-round PBKDF2 derivation either way), but there's no reason this one PIN-removal path
+    // should be the odd one out now that its siblings are hardened - see PinLockScreen's own matching code
+    // for the same reasoning.
+    var isVerifying by remember { mutableStateOf(false) }
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    val lockedOut = AppLockManager.isPinLockedOut(now)
+    LaunchedEffect(lockedOut) {
+        while (AppLockManager.isPinLockedOut(System.currentTimeMillis())) {
+            kotlinx.coroutines.delay(1000)
+            now = System.currentTimeMillis()
+        }
+    }
 
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
         Text("Reset your PIN", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
@@ -127,28 +160,44 @@ private fun ForgotPinContent(onCancel: () -> Unit, onReset: () -> Unit) {
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
             modifier = Modifier.fillMaxWidth(),
             shape = MaterialTheme.shapes.large,
-            isError = error != null
+            isError = error != null,
+            enabled = !lockedOut
         )
-        error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp)) }
+        val displayError = if (lockedOut) {
+            "Too many wrong attempts - try again in ${((AppLockManager.pinLockedOutUntilMillis - now) / 1000L).coerceAtLeast(0L) + 1}s"
+        } else error
+        displayError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp)) }
         Button(
             onClick = {
+                if (isVerifying) return@Button
+                isVerifying = true
                 scope.launch {
-                    val pairing = ServiceLocator.pairingStore.current()
-                    // Accepts both the current strengthened hash and the old bare-SHA-256 hash a
-                    // device paired before the PBKDF2 upgrade would still have stored - see
-                    // Hashing.matchesPairingCode for why this is deliberately NOT auto-migrated the
-                    // way the PIN hash is.
-                    if (Hashing.matchesPairingCode(code, pairing.pairSecretHash)) {
-                        ServiceLocator.settingsStore.clearPin()
-                        onReset()
-                    } else {
-                        error = "That code doesn't match"
+                    try {
+                        val pairing = ServiceLocator.pairingStore.current()
+                        // Accepts both the current strengthened hash and the old bare-SHA-256 hash a
+                        // device paired before the PBKDF2 upgrade would still have stored - see
+                        // Hashing.matchesPairingCode for why this is deliberately NOT auto-migrated the
+                        // way the PIN hash is. BLOCKER fix: off Main - see PinUtil.hash's doc, same
+                        // 600k-round PBKDF2 cost applies here.
+                        val codeMatches = withContext(Dispatchers.Default) {
+                            Hashing.matchesPairingCode(code, pairing.pairSecretHash)
+                        }
+                        if (codeMatches) {
+                            AppLockManager.resetFailedPinAttempts()
+                            ServiceLocator.settingsStore.clearPin()
+                            onReset()
+                        } else {
+                            AppLockManager.recordFailedPinAttempt()
+                            error = "That code doesn't match"
+                        }
+                    } finally {
+                        isVerifying = false
                     }
                 }
             },
             modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
             shape = MaterialTheme.shapes.large,
-            enabled = code.length == 6
+            enabled = code.length == 6 && !lockedOut && !isVerifying
         ) { Text("Reset PIN") }
         TextButton(onClick = onCancel, modifier = Modifier.padding(top = 8.dp)) { Text("Back") }
     }

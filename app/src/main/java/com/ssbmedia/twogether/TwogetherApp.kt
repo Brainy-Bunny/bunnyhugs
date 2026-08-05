@@ -2,6 +2,7 @@ package com.ssbmedia.twogether
 
 import android.app.Application
 import androidx.lifecycle.ProcessLifecycleOwner
+import com.ssbmedia.twogether.data.backup.BackupManager
 import com.ssbmedia.twogether.data.backup.BackupWorker
 import com.ssbmedia.twogether.data.update.UpdateChecker
 import com.ssbmedia.twogether.data.update.UpdateWorker
@@ -48,6 +49,12 @@ class TwogetherApp : Application() {
         ServiceLocator.applicationScope.launch {
             val milestones = ServiceLocator.milestoneRepository.getAll().filter { !it.deleted }
             MilestoneAlarmScheduler.scheduleAll(this@TwogetherApp, milestones)
+        }
+        // Resumes a backup restore that got interrupted before completing (process death mid-restore) -
+        // see BackupManager.restoreBackupDurable/resumePendingRestoreIfAny's docs. A no-op on every
+        // normal app start where nothing is pending, which is the overwhelming majority of the time.
+        ServiceLocator.applicationScope.launch {
+            BackupManager.resumePendingRestoreIfAny(this@TwogetherApp)
         }
     }
 }

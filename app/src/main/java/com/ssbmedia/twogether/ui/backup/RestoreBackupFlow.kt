@@ -69,7 +69,9 @@ fun RestoreBackupButton(trigger: @Composable (onClick: () -> Unit) -> Unit) {
             text = {
                 Text(
                     "This will REPLACE everything currently on this phone — sessions, photos, date ideas, " +
-                        "time capsules, settings, and your pairing — with what's saved in \"$displayName\". " +
+                        "time capsules, and settings — with what's saved in \"$displayName\". " +
+                        "Your pairing and PIN lock are NOT restored (for security, they're never saved in a " +
+                        "backup) — you'll need to pair with your partner again afterward. " +
                         "This can't be undone. The app will restart when it's done."
                 )
             },
@@ -78,7 +80,10 @@ fun RestoreBackupButton(trigger: @Composable (onClick: () -> Unit) -> Unit) {
                     restoreCandidate = null
                     isRestoring = true
                     ServiceLocator.applicationScope.launch {
-                        val result = BackupManager.restoreBackup(context.applicationContext, uri)
+                        // Durable across process death, not just UI teardown - see restoreBackupDurable's
+                        // doc. If the process dies before this returns, TwogetherApp.onCreate's own
+                        // pending-restore check picks it back up on next launch automatically.
+                        val result = BackupManager.restoreBackupDurable(context.applicationContext, uri)
                         isRestoring = false
                         restoreResult = result
                     }
