@@ -4,6 +4,7 @@ import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -27,6 +28,7 @@ import androidx.core.content.ContextCompat
 import com.ssbmedia.twogether.ble.BlePermissions
 import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.data.datastore.PairingInfo
+import com.ssbmedia.twogether.data.datastore.ThemeMode
 import com.ssbmedia.twogether.lock.AppLockManager
 import com.ssbmedia.twogether.notif.Notifications
 import com.ssbmedia.twogether.service.ProximityForegroundService
@@ -49,7 +51,26 @@ class MainActivity : ComponentActivity() {
         intent?.getStringExtra(Notifications.EXTRA_OPEN_MILESTONE_ID)?.let { milestoneTrigger.value = it }
 
         setContent {
-            TwogetherTheme {
+            // Hoisted ABOVE TwogetherTheme (rather than loaded inside its content, like pairingInfo
+            // still is below) because TwogetherTheme's own darkTheme parameter has to be decided BEFORE
+            // its content composes - it can't reactively read a value that only becomes available once
+            // its own children start running. Reused inside the content below too, so this isn't a
+            // second/duplicate settings collection.
+            var settings by remember { mutableStateOf<AppSettings?>(null) }
+            LaunchedEffect(Unit) {
+                ServiceLocator.settingsStore.settings.collect { settings = it }
+            }
+            // While settings hasn't loaded yet (settings == null, a brief one-or-two-frame window on
+            // first launch), falls back to isSystemInDarkTheme() - i.e. exactly today's existing
+            // behavior before this ThemeMode override existed - so the common case (a user who's never
+            // touched this new setting, which is everyone until they explicitly change it) sees no
+            // different first-frame behavior at all.
+            val effectiveDarkTheme = when (settings?.themeMode ?: ThemeMode.SYSTEM) {
+                ThemeMode.SYSTEM -> isSystemInDarkTheme()
+                ThemeMode.LIGHT -> false
+                ThemeMode.DARK -> true
+            }
+            TwogetherTheme(darkTheme = effectiveDarkTheme) {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     // collectAsState(initial = ...) would render its default (unpaired, pinEnabled=false)
                     // for a frame or two before the real persisted DataStore value arrives - and since
@@ -59,15 +80,11 @@ class MainActivity : ComponentActivity() {
                     // actually loaded the real value yet" explicitly for both, and render nothing (private
                     // content included) until both are known.
                     var pairingInfo by remember { mutableStateOf<PairingInfo?>(null) }
-                    var settings by remember { mutableStateOf<AppSettings?>(null) }
                     val trigger by cameraTrigger
                     val milestoneId by milestoneTrigger
 
                     LaunchedEffect(Unit) {
                         ServiceLocator.pairingStore.info.collect { pairingInfo = it }
-                    }
-                    LaunchedEffect(Unit) {
-                        ServiceLocator.settingsStore.settings.collect { settings = it }
                     }
 
                     LaunchedEffect(pairingInfo?.isPaired) {

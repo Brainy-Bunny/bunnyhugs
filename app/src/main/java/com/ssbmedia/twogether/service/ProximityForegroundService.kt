@@ -90,6 +90,7 @@ class ProximityForegroundService : LifecycleService() {
         gattSync = GattSyncManager(
             this,
             ServiceLocator.dateIdeaRepository,
+            ServiceLocator.listCategoryRepository,
             ServiceLocator.sessionRepository,
             ServiceLocator.momentRepository,
             ServiceLocator.momentNoteRepository,
@@ -215,7 +216,7 @@ class ProximityForegroundService : LifecycleService() {
             // after this restart look like it had barely any gap at all (measured from the restart
             // moment instead of the real, possibly much earlier, apart moment) - silently skipping the
             // reunion celebration in handleBecameTogether()'s isReunion check even though the couple had
-            // genuinely been apart for well over the 30-minute threshold.
+            // genuinely been apart for well over the 1-hour threshold.
             val estimatedApartSince = if (persisted.lastSeenAt > 0L) {
                 (persisted.lastSeenAt + stateMachine.absenceTimeoutMillis).coerceAtMost(now)
             } else {
@@ -342,6 +343,10 @@ class ProximityForegroundService : LifecycleService() {
             // inflate forever with nobody watching. lastSeenAt/absenceTimeoutMillis are the service's
             // own in-memory stateMachine values (the same ones its own write-path clamping already
             // uses in handleBecameApart/selfHealOrphanedSession), not the possibly-stale persisted copy.
+            // Time Capsules use TRUE total hours (manual backfill included, same as every other stat in
+            // this app) together with an auto-adjusting per-capsule threshold, so manual backfill can
+            // never accelerate an unlock - see TimeCapsuleRepository.unlockEligible's doc for the full
+            // anti-cheat reasoning (manual hours cancel out of the actual unlock condition entirely).
             val sessions = ServiceLocator.sessionRepository.getAll()
             val hours = StatsCalculator.compute(
                 sessions,
@@ -349,7 +354,13 @@ class ProximityForegroundService : LifecycleService() {
                 lastSeenAt = stateMachine.lastSeenAt,
                 absenceTimeoutMillis = stateMachine.absenceTimeoutMillis
             ).totalHoursAllTime
-            ServiceLocator.timeCapsuleRepository.unlockEligible(hours.toFloat())
+            val manualCredit = StatsCalculator.manualHoursCredit(
+                sessions,
+                now = now,
+                lastSeenAt = stateMachine.lastSeenAt,
+                absenceTimeoutMillis = stateMachine.absenceTimeoutMillis
+            )
+            ServiceLocator.timeCapsuleRepository.unlockEligible(hours.toFloat(), manualCredit)
         }
 
         // Catch-all periodic sync while continuously together: the transition-based trigger (on the
@@ -463,7 +474,8 @@ class ProximityForegroundService : LifecycleService() {
     private suspend fun handleBecameTogether(now: Long, device: BluetoothDevice, tieBreak: Byte) {
         val persisted = ServiceLocator.proximityStateStore.current()
         val gapMillis = if (persisted.lastApartSince > 0) now - persisted.lastApartSince else Long.MAX_VALUE
-        val isReunion = persisted.lastApartSince > 0 && gapMillis >= REUNION_GAP_MILLIS
+        val isReunion = persisted.lastApartSince > 0 && gapMillis >= StatsCalculator.REUNION_GAP_MILLIS &&
+            StatsCalculator.isSameCalendarDay(persisted.lastApartSince, now)
 
         val sessionId = ServiceLocator.sessionRepository.startSession(now)
         continuousTogetherSinceMillis = now
@@ -490,7 +502,14 @@ class ProximityForegroundService : LifecycleService() {
 
     private suspend fun handleBecameApart(now: Long) {
         val openSession = ServiceLocator.sessionRepository.getOpenSession()
-        if (openSession != null) {
+        // lastApartSince must match the session's own endedAt (the ESTIMATED real apart instant), not
+        // the raw wall-clock `now` this tick happened to run at - otherwise reunion counting drifts: the
+        // live celebration (ProximityForegroundService, keyed off lastApartSince) and the historical
+        // Stats.reunionCount (StatsCalculator, keyed off the DB session's endedAt) can end up straddling
+        // different calendar days for the exact same real-world apart event, since `now` always lags the
+        // clamped instant by however long the ticker took to notice the absence timeout - occasionally
+        // enough to cross local midnight. Mirrors restoreState()'s estimatedApartSince for the same reason.
+        val apartSince = if (openSession != null) {
             // Clamp instead of always stamping "now": if the service was asleep/dead for a stretch
             // while genuinely together (process death, reboot) and only now catches up to the absence
             // timeout on restart, using "now" would credit the entire downtime gap as together-time.
@@ -501,8 +520,11 @@ class ProximityForegroundService : LifecycleService() {
                 now = now,
                 lastSeenAt = stateMachine.lastSeenAt,
                 absenceTimeoutMillis = stateMachine.absenceTimeoutMillis
-            )
-            ServiceLocator.sessionRepository.endSession(openSession, clampedEnd.coerceAtLeast(openSession.startedAt))
+            ).coerceAtLeast(openSession.startedAt)
+            ServiceLocator.sessionRepository.endSession(openSession, clampedEnd)
+            clampedEnd
+        } else {
+            now
         }
         continuousTogetherSinceMillis = 0L
         ServiceLocator.proximityStateStore.update {
@@ -512,7 +534,7 @@ class ProximityForegroundService : LifecycleService() {
                 currentSessionId = -1L,
                 reminderFiredForSession = false,
                 snoozeUntil = 0L,
-                lastApartSince = now
+                lastApartSince = apartSince
             )
         }
         Notifications.cancelPhotoReminder(this)
@@ -744,6 +766,5 @@ class ProximityForegroundService : LifecycleService() {
     companion object {
         private const val TAG = "ProximityService"
         private const val FIFTEEN_MINUTES_MILLIS = 15 * 60 * 1000L
-        private const val REUNION_GAP_MILLIS = 30 * 60 * 1000L
     }
 }

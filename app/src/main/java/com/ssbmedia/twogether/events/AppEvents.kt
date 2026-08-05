@@ -33,7 +33,7 @@ object AppEvents {
 
     /** service -> UI: a manual "Sync now" tap resolved to this device holding the passive GATT SERVER
      * role, which can never proactively pull a sync on demand - only the partner's client connecting
-     * can complete one. Without this, DateIdeasScreen has no way to distinguish "genuinely broken" from
+     * can complete one. Without this, OurListsScreen has no way to distinguish "genuinely broken" from
      * "working correctly but passive", and always falls through to its generic timeout/failure message
      * even when the couple is together and passive sync is in fact working. */
     private val _syncListening = MutableSharedFlow<Unit>(extraBufferCapacity = 1)

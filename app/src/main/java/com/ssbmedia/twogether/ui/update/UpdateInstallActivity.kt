@@ -9,6 +9,10 @@ import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.core.content.FileProvider
+import androidx.lifecycle.lifecycleScope
+import com.ssbmedia.twogether.data.backup.BackupManager
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 
 /**
@@ -25,7 +29,9 @@ import java.io.File
  * granted".
  *
  * Has no UI of its own (Theme.Twogether.Dialog is transparent/translucent - same trick SnoozeActivity
- * already uses) - it always finishes immediately after either launching Settings or the installer.
+ * already uses) - it finishes immediately after launching Settings (permission-missing path), or after
+ * a brief pre-update safety-net backup (see the Toast + withTimeoutOrNull below) once it launches the
+ * installer.
  */
 class UpdateInstallActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -45,8 +51,21 @@ class UpdateInstallActivity : ComponentActivity() {
             return
         }
 
-        launchInstaller(apkFile)
-        finish()
+        // Safety net: a backup taken right before an update installs guards against the specific
+        // failure mode an update can introduce that a routine weekly backup might miss for up to 7
+        // days - a bad DB migration or a broken new build corrupting/losing data the very first time
+        // it runs. This does NOT protect against the install itself losing data (a normal app update
+        // preserves internal storage/app data automatically; this is the same createBackup() the
+        // weekly job and the manual "Back up now" button already use, so it's just a well-timed extra
+        // run, not a new mechanism). Bounded by a timeout so a slow backup (a large photo library)
+        // can never block the user from installing an update they're actively trying to install -
+        // proceeding to the installer either way once the backup settles or times out.
+        Toast.makeText(this, "Backing up before update…", Toast.LENGTH_SHORT).show()
+        lifecycleScope.launch {
+            withTimeoutOrNull(PRE_UPDATE_BACKUP_TIMEOUT_MILLIS) { BackupManager.createBackup(this@UpdateInstallActivity) }
+            launchInstaller(apkFile)
+            finish()
+        }
     }
 
     /** Sends the user to the exact "Install unknown apps" settings screen for Twogether, rather than
@@ -94,5 +113,6 @@ class UpdateInstallActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_APK_PATH = "apk_path"
+        private const val PRE_UPDATE_BACKUP_TIMEOUT_MILLIS = 15_000L
     }
 }

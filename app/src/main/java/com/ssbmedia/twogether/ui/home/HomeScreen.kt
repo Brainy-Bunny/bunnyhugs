@@ -73,6 +73,7 @@ import com.ssbmedia.twogether.data.db.Moment
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.service.ProximityForegroundService
+import com.ssbmedia.twogether.stats.OnThisDayInfo
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.PulsingHeart
 import com.ssbmedia.twogether.ui.components.QuickLinkChip
@@ -207,6 +208,28 @@ fun HomeScreen(
         }
     }
 
+    // Notifications are a SEPARATE runtime prompt from BLE on API 33+ (RequestMultiplePermissions above
+    // bundles both into one request, but a user can still grant BLE and deny just this one - or the OS
+    // pre-splits them into two dialogs on some devices). Without this independent check, that specific
+    // outcome was previously invisible: hasBlePermission alone would be true, no banner would ever show
+    // again, and the user would never learn why the ongoing "Together for Xh" notification (and the
+    // photo-reminder/reunion/milestone notifications - see Notifications.kt's hasNotificationPermission
+    // gate on every post() call) silently never appears. Re-checked on resume for the same reason as the
+    // BLE banner above (coming back from the system Settings permission page).
+    var hasNotificationPermission by remember { mutableStateOf(BlePermissions.hasNotificationPermission(context)) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                hasNotificationPermission = BlePermissions.hasNotificationPermission(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        hasNotificationPermission = BlePermissions.hasNotificationPermission(context)
+    }
+
     // On API < 31, having ACCESS_FINE_LOCATION granted isn't enough on its own for BLE scanning to
     // actually deliver results - the system Location Services toggle also has to be on. Without this
     // check, that combination silently makes startScan() "succeed" but never see anything, with no
@@ -254,6 +277,14 @@ fun HomeScreen(
     // never silently "grow" forever just because something read it).
     val stats = remember(sessions, now, proximityState.lastSeenAt) {
         StatsCalculator.compute(sessions, now, lastSeenAt = proximityState.lastSeenAt)
+    }
+
+    // Same "on this exact calendar date, in a past year" lookup used by the Calendar screen's per-day
+    // data - a NEW time-based callback, distinct from MemoryThrowbackCard's photo-based one below.
+    // Keyed the same way `stats` above already is (sessions/now/lastSeenAt), so it only recomputes on
+    // this screen's existing 30s ticker cadence rather than every recomposition.
+    val onThisDayInfo: OnThisDayInfo? = remember(sessions, now, proximityState.lastSeenAt) {
+        StatsCalculator.onThisDayPreviousYear(sessions, now, lastSeenAt = proximityState.lastSeenAt)
     }
 
     // Defensive UI-level staleness check, independent of whether the foreground service is even
@@ -324,6 +355,20 @@ fun HomeScreen(
                         }
                     )
                 }
+            } else if (!hasNotificationPermission) {
+                // Same "only once the more fundamental blocker is clear" reasoning as the Location
+                // Services banner above - shown only once BLE is granted and Location Services (if
+                // relevant) is on, since a missing notification permission is real but secondary: the
+                // service still tracks together-time correctly without it, it just can't SHOW you that
+                // it's doing so (no ongoing notification, no photo-reminder/reunion/milestone alerts).
+                item {
+                    NotificationPermissionWarningCard(
+                        onGrantClick = {
+                            val perm = BlePermissions.notificationPermission()
+                            if (perm != null) notificationPermissionLauncher.launch(perm)
+                        }
+                    )
+                }
             }
             item {
                 UsStatusCard(isTogether = effectivelyTogether, openSession = openSession, now = now, partnerName = pairingInfo.partnerName, partnerEmoji = pairingInfo.partnerEmoji)
@@ -367,6 +412,11 @@ fun HomeScreen(
                     MemoryThrowbackCard(moment = randomMoment!!, now = now)
                 }
             }
+            if (onThisDayInfo != null) {
+                item {
+                    OnThisDayCard(info = onThisDayInfo)
+                }
+            }
             item {
                 SectionHeader("Quick links")
             }
@@ -390,7 +440,7 @@ fun HomeScreen(
                 ) {
                     listOf(
                         QuickLinkDef(QuickLinkIds.CALENDAR, "📅", "Calendar", onNavigateCalendar),
-                        QuickLinkDef(QuickLinkIds.DATE_IDEAS, "💌", "Date Ideas", onNavigateDateIdeas),
+                        QuickLinkDef(QuickLinkIds.DATE_IDEAS, "💌", "Our Lists", onNavigateDateIdeas),
                         QuickLinkDef(QuickLinkIds.MOMENTS, "📸", "Moments", onNavigateMoments),
                         QuickLinkDef(QuickLinkIds.STATS, "📊", "Stats", onNavigateStats),
                         QuickLinkDef(QuickLinkIds.TIME_CAPSULES, "⏳", "Time Capsules", onNavigateCapsules),
@@ -616,6 +666,31 @@ private fun BlePermissionWarningCard(onGrantClick: () -> Unit) {
 }
 
 @Composable
+private fun NotificationPermissionWarningCard(onGrantClick: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.large,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                "Notification permission needed",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onErrorContainer
+            )
+            Text(
+                "You're still being tracked together, but without this you won't see the ongoing status, photo reminders, or reunion/milestone alerts.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+                modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
+            )
+            Button(onClick = onGrantClick) { Text("Grant access") }
+        }
+    }
+}
+
+@Composable
 private fun LocationServicesWarningCard(onOpenSettingsClick: () -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -700,6 +775,32 @@ private fun MemoryThrowbackCard(moment: Moment, now: Long) {
                 Text("📸 A memory from ${timeAgo(moment.takenAt, now)}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 Text("A little throwback for you two 💛", style = MaterialTheme.typography.bodySmall)
             }
+        }
+    }
+}
+
+/** "On this same calendar date in a previous year, you two spent N hours together" - a time-stats
+ * callback, distinct from [MemoryThrowbackCard]'s random-photo throwback above it (this one's purely
+ * about together-TIME, not photos, and can show up even for a couple with zero saved Moments). Copies
+ * [MemoryThrowbackCard]'s Card shape/color for visual consistency; no image slot since there's no photo
+ * involved here. */
+@Composable
+private fun OnThisDayCard(info: OnThisDayInfo) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.large,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                "🕰️ On this day in ${info.year}",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            Text(
+                "You spent ${"%.1f".format(info.hours)}h together 💛",
+                style = MaterialTheme.typography.bodySmall
+            )
         }
     }
 }

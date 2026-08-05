@@ -61,10 +61,11 @@ class CapsulesViewModel : ViewModel() {
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ProximityPersistedState())
 
     init {
-        // The unlock check used to only run inside the foreground service's periodic tick, so a
-        // manually-backfilled session that pushes cumulative hours over a capsule's threshold wouldn't
-        // unlock it until the service happened to tick next (or at all, if it wasn't running). Run it
-        // opportunistically here too, any time this screen's session or proximity data loads or changes.
+        // The unlock check used to only run inside the foreground service's periodic 60s tick, so newly-
+        // qualifying hours wouldn't unlock a capsule until the service happened to tick next (or at all,
+        // if it wasn't running). Run it opportunistically here too, any time this screen's session or
+        // proximity data loads or changes. See TimeCapsuleRepository.unlockEligible's doc for the
+        // auto-adjusting-threshold anti-cheat this feeds into.
         viewModelScope.launch {
             combine(sessions, proximityState) { list, state -> list to state }.collect { (list, state) ->
                 // state.lastSeenAt <= 0L means proximityState's cold DataStore-backed flow hasn't
@@ -76,14 +77,18 @@ class CapsulesViewModel : ViewModel() {
                 // persisted value has loaded rather than unlock off a possibly-inflated open session.
                 if (list.isEmpty() || state.lastSeenAt <= 0L) return@collect
                 val hours = StatsCalculator.compute(list, lastSeenAt = state.lastSeenAt).totalHoursAllTime.toFloat()
-                ServiceLocator.timeCapsuleRepository.unlockEligible(hours)
+                val manualCredit = StatsCalculator.manualHoursCredit(list, lastSeenAt = state.lastSeenAt)
+                ServiceLocator.timeCapsuleRepository.unlockEligible(hours, manualCredit)
             }
         }
     }
 
     fun add(text: String, unlockHours: Float) {
         if (text.isBlank() || unlockHours <= 0f) return
-        viewModelScope.launch { ServiceLocator.timeCapsuleRepository.add(text.trim(), unlockHours) }
+        viewModelScope.launch {
+            val manualCredit = StatsCalculator.manualHoursCredit(sessions.value, lastSeenAt = proximityState.value.lastSeenAt)
+            ServiceLocator.timeCapsuleRepository.add(text.trim(), unlockHours, manualCredit)
+        }
     }
 }
 
@@ -93,8 +98,14 @@ fun CapsulesScreen(onBack: () -> Unit) {
     val capsules by vm.capsules.collectAsState()
     val sessions by vm.sessions.collectAsState()
     val proximityState by vm.proximityState.collectAsState()
+    // TRUE total hours (manual backfill included, same number every other screen shows) - see
+    // TimeCapsuleRepository.unlockEligible's doc for how each capsule's own effective threshold (below)
+    // is what keeps this un-gameable, not filtering what counts toward the total.
     val stats = remember(sessions, proximityState.lastSeenAt) {
         StatsCalculator.compute(sessions, lastSeenAt = proximityState.lastSeenAt)
+    }
+    val manualCredit = remember(sessions, proximityState.lastSeenAt) {
+        StatsCalculator.manualHoursCredit(sessions, lastSeenAt = proximityState.lastSeenAt)
     }
     var showAddDialog by remember { mutableStateOf(false) }
 
@@ -135,13 +146,34 @@ fun CapsulesScreen(onBack: () -> Unit) {
                                 Text("💌 Unlocked", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
                                 Text(capsule.text, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.padding(top = 4.dp))
                             } else {
-                                val remaining = (capsule.unlockAtHours - stats.totalHoursAllTime.toFloat()).coerceAtLeast(0f)
+                                // Auto-adjusted threshold - see TimeCapsuleRepository.unlockEligible's doc.
+                                // Grows/shrinks by exactly however much manual-hours credit has changed
+                                // since this capsule was created, so it always takes the same amount of
+                                // genuine together-time to unlock regardless of backfill activity.
+                                val effectiveThreshold = capsule.unlockAtHours + (manualCredit - capsule.manualHoursAtCreation)
+                                val remaining = (effectiveThreshold - stats.totalHoursAllTime.toFloat()).coerceAtLeast(0f)
+                                val delta = effectiveThreshold - capsule.unlockAtHours
                                 Text("🔒 Locked", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
                                 Text(
-                                    "Unlocks at ${capsule.unlockAtHours.trimZeros()} hours together — ${remaining.trimZeros()} to go",
+                                    "Unlocks at ${effectiveThreshold.trimZeros()} hours together — ${remaining.trimZeros()} to go",
                                     style = MaterialTheme.typography.bodyMedium,
                                     modifier = Modifier.padding(top = 4.dp)
                                 )
+                                if (delta > 0.01f) {
+                                    Text(
+                                        "Includes an extra ${delta.trimZeros()}h from backfilled time, so it can't be unlocked early.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(top = 2.dp)
+                                    )
+                                } else if (delta < -0.01f) {
+                                    Text(
+                                        "Lowered by ${(-delta).trimZeros()}h since some backfilled time was removed.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(top = 2.dp)
+                                    )
+                                }
                             }
                         }
                     }

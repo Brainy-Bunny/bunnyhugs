@@ -8,9 +8,11 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -21,6 +23,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -35,6 +38,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.time.Instant
 import java.time.LocalDate
+import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeParseException
@@ -89,7 +93,7 @@ fun GalleryImportHost(
             suggestedDate = suggestedDate,
             isSaving = isSaving,
             onDismiss = { if (!isSaving) pendingUri = null },
-            onConfirm = { date ->
+            onConfirm = { date, togetherRange ->
                 isSaving = true
                 scope.launch {
                     val savedFile = withContext(Dispatchers.IO) { copyPickedImageToMomentsDir(context, uri) }
@@ -97,9 +101,22 @@ fun GalleryImportHost(
                         val takenAt = date.atTime(12, 0).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
                         // sessionId is deliberately always null here - see this file's top-of-file doc.
                         ServiceLocator.momentRepository.add(savedFile.absolutePath, null, takenAt)
+                        // Optional "we were together" companion entry (owner-requested addition): a
+                        // backfilled photo alone was deliberately never enough on its own to create
+                        // together-time (a photo isn't proof the whole day was spent together - see
+                        // CalendarScreen's separate hasPhoto/hasTogetherTime day markers), so this stays
+                        // an explicit opt-in rather than something inferred automatically from the photo
+                        // existing. addManualSession is the SAME function CalendarScreen's own backfill
+                        // dialog uses - isManual=true, counts toward stats/streaks like any other
+                        // manual entry, excluded from Time Capsule eligibility by the same anti-cheat
+                        // rule as every other manual session, syncs to the partner the same way.
+                        if (togetherRange != null) {
+                            ServiceLocator.sessionRepository.addManualSession(togetherRange.first, togetherRange.second)
+                        }
                         // Same reasoning as CameraScreen's onImageSaved and CalendarScreen's
-                        // addManualSession - don't make a freshly-backfilled photo wait for the next
-                        // reconnect/15-minute catch-all if we're already together right now.
+                        // addManualSession - don't make a freshly-backfilled photo (and any companion
+                        // together-time entry) wait for the next reconnect/15-minute catch-all if we're
+                        // already together right now.
                         if (ServiceLocator.proximityStateStore.current().isTogether) {
                             AppEvents.requestManualSync()
                         }
@@ -163,29 +180,52 @@ private fun extensionFor(resolver: ContentResolver, uri: Uri): String {
 }
 
 /** Date-assignment step of the backfill flow - same YYYY-MM-DD text field + validation style as
- * CalendarScreen's AddManualSessionDialog (future dates rejected, invalid text rejected). No duration
- * field: a photo doesn't have one, just a single date. */
+ * CalendarScreen's AddManualSessionDialog (future dates rejected, invalid text rejected).
+ *
+ * Also offers an OPT-IN "we were together" companion entry (owner-requested addition): checking it
+ * reveals a from/to time-of-day range (both implicitly on the photo's own date - a photo is tied to one
+ * specific day, so there's no separate date-range picker here, unlike CalendarScreen's general backfill
+ * dialog), and [onConfirm]'s second parameter carries the resulting (startedAt, endedAt) millis pair for
+ * the caller to hand to SessionRepository.addManualSession - or null if left unchecked, matching the
+ * PRE-EXISTING default behavior where a backfilled photo alone never implied any together-time (see
+ * CalendarScreen's separate hasPhoto/hasTogetherTime day markers - a photo isn't proof of a whole day
+ * spent together, which is why this stays an explicit choice rather than being inferred automatically). */
 @Composable
 private fun BackfillPhotoDateDialog(
     suggestedDate: LocalDate?,
     isSaving: Boolean,
     onDismiss: () -> Unit,
-    onConfirm: (LocalDate) -> Unit
+    onConfirm: (LocalDate, Pair<Long, Long>?) -> Unit
 ) {
     val zone = remember { ZoneId.systemDefault() }
     val today = remember { LocalDate.now(zone) }
     var dateText by remember(suggestedDate) {
         mutableStateOf((suggestedDate ?: today).format(DateTimeFormatter.ISO_LOCAL_DATE))
     }
+    var wasTogether by remember { mutableStateOf(false) }
+    var fromText by remember { mutableStateOf("") }
+    var toText by remember { mutableStateOf("") }
 
     val parsedDate = remember(dateText) {
         try { LocalDate.parse(dateText, DateTimeFormatter.ISO_LOCAL_DATE) } catch (e: DateTimeParseException) { null }
     }
-    val error: String? = when {
+    val timeFormatter = remember { DateTimeFormatter.ofPattern("H:mm") }
+    val parsedFrom = remember(fromText) { runCatching { LocalTime.parse(fromText, timeFormatter) }.getOrNull() }
+    val parsedTo = remember(toText) { runCatching { LocalTime.parse(toText, timeFormatter) }.getOrNull() }
+
+    val dateError: String? = when {
         parsedDate == null -> "Enter a valid date as YYYY-MM-DD"
         parsedDate.isAfter(today) -> "Date can't be in the future"
         else -> null
     }
+    // Only evaluated/shown when wasTogether is checked - a blank/invalid time range must never block
+    // saving the photo itself, since the together-time part is optional.
+    val togetherError: String? = if (!wasTogether) null else when {
+        parsedFrom == null || parsedTo == null -> "Enter both times as H:MM (24-hour)"
+        !parsedTo.isAfter(parsedFrom) -> "\"To\" must be after \"From\""
+        else -> null
+    }
+    val error = dateError ?: togetherError
 
     AlertDialog(
         onDismissRequest = { if (!isSaving) onDismiss() },
@@ -208,7 +248,7 @@ private fun BackfillPhotoDateDialog(
                     enabled = !isSaving,
                     modifier = Modifier.fillMaxWidth()
                 )
-                error?.let {
+                dateError?.let {
                     Text(
                         it,
                         color = MaterialTheme.colorScheme.error,
@@ -216,12 +256,60 @@ private fun BackfillPhotoDateDialog(
                         modifier = Modifier.padding(top = 8.dp)
                     )
                 }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Checkbox(checked = wasTogether, onCheckedChange = { wasTogether = it }, enabled = !isSaving)
+                    Text("We were together that day", style = MaterialTheme.typography.bodyMedium)
+                }
+
+                if (wasTogether) {
+                    Text(
+                        "From when to when? We'll work out the hours.",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 4.dp, bottom = 8.dp)
+                    )
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        OutlinedTextField(
+                            value = fromText,
+                            onValueChange = { fromText = it.trim() },
+                            label = { Text("From (H:MM)") },
+                            enabled = !isSaving,
+                            modifier = Modifier.weight(1f)
+                        )
+                        OutlinedTextField(
+                            value = toText,
+                            onValueChange = { toText = it.trim() },
+                            label = { Text("To (H:MM)") },
+                            enabled = !isSaving,
+                            modifier = Modifier.weight(1f).padding(start = 8.dp)
+                        )
+                    }
+                    togetherError?.let {
+                        Text(
+                            it,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(top = 8.dp)
+                        )
+                    }
+                }
             }
         },
         confirmButton = {
             TextButton(
                 enabled = error == null && !isSaving,
-                onClick = { parsedDate?.let(onConfirm) }
+                onClick = {
+                    val date = parsedDate ?: return@TextButton
+                    val togetherRange = if (wasTogether && parsedFrom != null && parsedTo != null) {
+                        val startedAt = date.atTime(parsedFrom).atZone(zone).toInstant().toEpochMilli()
+                        val endedAt = date.atTime(parsedTo).atZone(zone).toInstant().toEpochMilli()
+                        startedAt to endedAt
+                    } else null
+                    onConfirm(date, togetherRange)
+                }
             ) { Text(if (isSaving) "Saving…" else "Save") }
         },
         dismissButton = { TextButton(enabled = !isSaving, onClick = onDismiss) { Text("Cancel") } }

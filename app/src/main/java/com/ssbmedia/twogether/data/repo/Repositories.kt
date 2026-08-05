@@ -1,8 +1,12 @@
 package com.ssbmedia.twogether.data.repo
 
 import android.content.Context
+import androidx.room.withTransaction
+import com.ssbmedia.twogether.data.db.AppDatabase
 import com.ssbmedia.twogether.data.db.DateIdea
 import com.ssbmedia.twogether.data.db.DateIdeaDao
+import com.ssbmedia.twogether.data.db.ListCategory
+import com.ssbmedia.twogether.data.db.ListCategoryDao
 import com.ssbmedia.twogether.data.db.Milestone
 import com.ssbmedia.twogether.data.db.MilestoneDao
 import com.ssbmedia.twogether.data.db.Moment
@@ -18,15 +22,25 @@ import java.io.File
 import java.util.UUID
 
 class SessionRepository(private val dao: TogetherSessionDao) {
-    fun observeAll(): Flow<List<TogetherSession>> = dao.observeAll()
+    /** Excludes soft-deleted (tombstoned) rows - backed by [TogetherSessionDao.observeActive]. Every
+     * existing caller (HomeScreen, StatsScreen, CalendarScreen, BadgesScreen, CapsulesScreen,
+     * ProximityForegroundService, GattSyncManager) genuinely wants "sessions the user actually sees", so
+     * this filters transparently for all of them with no call-site changes needed. The one place that
+     * needs tombstones too (the sync payload builder) uses [getAllIncludingDeleted] instead. */
+    fun observeAll(): Flow<List<TogetherSession>> = dao.observeActive()
     fun observeOpenSession(): Flow<TogetherSession?> = dao.observeOpenSession()
-    suspend fun getAll(): List<TogetherSession> = dao.getAll()
+    suspend fun getAll(): List<TogetherSession> = dao.getActive()
     suspend fun getOpenSession(): TogetherSession? = dao.getOpenSession()
 
-    suspend fun startSession(startedAt: Long): Long = dao.insert(TogetherSession(startedAt = startedAt))
+    /** The raw/complete table, tombstones included - only for GattSyncManager.buildPayload, which must
+     * send deleted manual sessions too so the deletion itself propagates to the partner's phone. */
+    suspend fun getAllIncludingDeleted(): List<TogetherSession> = dao.getAll()
+
+    suspend fun startSession(startedAt: Long): Long =
+        dao.insert(TogetherSession(startedAt = startedAt, updatedAt = System.currentTimeMillis()))
 
     suspend fun endSession(session: TogetherSession, endedAt: Long) {
-        dao.update(session.copy(endedAt = endedAt))
+        dao.update(session.copy(endedAt = endedAt, updatedAt = System.currentTimeMillis()))
     }
 
     /** Backfills a completed together-session by hand (e.g. time spent together before install, or a
@@ -40,7 +54,25 @@ class SessionRepository(private val dao: TogetherSessionDao) {
      * (e.g. a same-day entry that clips down to exactly zero right at local midnight). */
     suspend fun addManualSession(startedAt: Long, endedAt: Long): Long? {
         if (endedAt <= startedAt) return null
-        return dao.insert(TogetherSession(startedAt = startedAt, endedAt = endedAt, isManual = true))
+        return dao.insert(
+            TogetherSession(
+                startedAt = startedAt,
+                endedAt = endedAt,
+                isManual = true,
+                updatedAt = System.currentTimeMillis()
+            )
+        )
+    }
+
+    /** Soft-deletes a manually-backfilled session that was entered wrong - a no-op for a genuine
+     * BLE-detected session, which must remain an untouchable historical record; only ever reachable from
+     * the Calendar screen's delete affordance, which itself is only ever shown for isManual sessions, but
+     * this guard is the real enforcement point regardless of what any future UI code does. The row stays in
+     * the table (marked deleted) rather than being hard-deleted, purely so the deletion itself can
+     * propagate to the partner's phone on the next sync - see mergeRemoteSessions' tombstone-apply branch. */
+    suspend fun softDeleteManual(session: TogetherSession) {
+        if (!session.isManual) return
+        dao.update(session.copy(deleted = true, updatedAt = System.currentTimeMillis()))
     }
 
     /**
@@ -56,11 +88,28 @@ class SessionRepository(private val dao: TogetherSessionDao) {
      * histories, never one side's data replacing the other's. Any real-world overlap this creates
      * (both phones independently logged the same BLE detection) is left in the DB as-is and correctly
      * de-duplicated at read time by StatsCalculator's existing interval-merge - see its doc.
+     *
+     * The ONE exception to "never overwritten": if a remote row we already know locally carries a
+     * tombstone (r.deleted) and our local copy isn't already tombstoned, we apply it - this is how a
+     * manual-entry deletion propagates to the partner's phone. The gate is `local.isManual`, never
+     * `r.isManual` - we trust ONLY our own local record of whether a session is manual, never the
+     * remote's claim about it. A BLE-detected session's deleted flag must never be settable by any
+     * incoming payload, even a buggy or malicious one that lies about isManual for a syncId we already
+     * know locally as a real BLE detection; gating on the remote's claim would let exactly that attack
+     * through. There is no other kind of conflict to resolve for a closed session - startedAt/endedAt/
+     * isManual/syncId are all set once at creation and never mutated again (see endSession), so a
+     * tombstone-apply is the only mutation an already-known syncId can ever receive here.
      */
     suspend fun mergeRemoteSessions(remote: List<TogetherSession>) {
-        val localSyncIds = dao.getAll().mapNotNull { it.syncId.takeIf { id -> id.isNotBlank() } }.toSet()
-        val toInsert = remote.filter { it.endedAt != null && it.syncId.isNotBlank() && it.syncId !in localSyncIds }
-        toInsert.forEach { dao.insert(it.copy(id = 0)) }
+        val localBySyncId = dao.getAll().filter { it.syncId.isNotBlank() }.associateBy { it.syncId }
+        remote.filter { it.endedAt != null && it.syncId.isNotBlank() }.forEach { r ->
+            val local = localBySyncId[r.syncId]
+            if (local == null) {
+                dao.insert(r.copy(id = 0))
+            } else if (local.isManual && r.deleted && !local.deleted) {
+                dao.update(local.copy(deleted = true, updatedAt = maxOf(local.updatedAt, r.updatedAt)))
+            }
+        }
     }
 }
 
@@ -68,12 +117,12 @@ class DateIdeaRepository(private val dao: DateIdeaDao) {
     fun observeActive(): Flow<List<DateIdea>> = dao.observeActive()
     suspend fun getAll(): List<DateIdea> = dao.getAll()
 
-    suspend fun add(text: String, category: String?) {
+    suspend fun add(text: String, listId: String) {
         dao.upsert(
             DateIdea(
                 id = UUID.randomUUID().toString(),
                 text = text,
-                category = category,
+                listId = listId,
                 done = false,
                 updatedAt = System.currentTimeMillis(),
                 deleted = false
@@ -103,30 +152,71 @@ class DateIdeaRepository(private val dao: DateIdeaDao) {
 class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
     fun observeAll(): Flow<List<TimeCapsule>> = dao.observeAll()
 
-    suspend fun add(text: String, unlockAtHours: Float) {
-        dao.insert(TimeCapsule(text = text, unlockAtHours = unlockAtHours, createdAt = System.currentTimeMillis()))
+    /** [manualHoursAtCreation] is the couple's CURRENT manual-hours credit (StatsCalculator.
+     * manualHoursCredit) at the moment this capsule is created - see TimeCapsule's own doc for why this
+     * snapshot is what lets the anti-cheat math in [unlockEligible] work. */
+    suspend fun add(text: String, unlockAtHours: Float, manualHoursAtCreation: Float) {
+        dao.insert(
+            TimeCapsule(
+                text = text,
+                unlockAtHours = unlockAtHours,
+                createdAt = System.currentTimeMillis(),
+                manualHoursAtCreation = manualHoursAtCreation
+            )
+        )
     }
 
-    /** Unlocks any capsules whose threshold has been crossed by the given cumulative together-hours. */
-    suspend fun unlockEligible(cumulativeHours: Float) {
+    /**
+     * Unlocks any capsule whose EFFECTIVE threshold has been crossed by [totalHours] (the couple's real
+     * total together-hours, manual backfill included exactly like every other stat in this app).
+     * [currentManualHoursCredit] is the couple's CURRENT manual-hours credit (StatsCalculator.
+     * manualHoursCredit, computed the same way for both call sites of this function).
+     *
+     * ANTI-CHEAT: each capsule's effective threshold is `unlockAtHours + (currentManualHoursCredit -
+     * manualHoursAtCreation)` - it grows or shrinks by exactly however much manual-hours credit has
+     * changed since the capsule was created. Substituting `totalHours = realHours + currentManualHoursCredit`
+     * into the unlock condition `totalHours >= effectiveThreshold` and simplifying, currentManualHoursCredit
+     * cancels out completely: the condition reduces to `realHours >= unlockAtHours - manualHoursAtCreation`,
+     * a fixed bar set once at creation time that NO subsequent manual backfill activity - adding it,
+     * deleting it, at any point before or after - can ever move. This replaces an earlier version of this
+     * anti-cheat that simply excluded manual hours from counting at all; that worked too, but silently
+     * changed what "hours to go" meant compared to every other screen in the app (which always shows
+     * TRUE total hours), which read as a confusing regression to anyone who'd used manual backfill
+     * before. This version keeps totalHours as the one true number shown everywhere, and instead moves
+     * the goalpost by the same amount as the backfill - transparent, and provably ungameable either way.
+     */
+    suspend fun unlockEligible(totalHours: Float, currentManualHoursCredit: Float) {
         val locked = dao.getLocked()
         val now = System.currentTimeMillis()
-        locked.filter { it.unlockAtHours <= cumulativeHours }
-            .forEach { dao.update(it.copy(unlockedAt = now)) }
+        locked.forEach { capsule ->
+            val effectiveThreshold = capsule.unlockAtHours + (currentManualHoursCredit - capsule.manualHoursAtCreation)
+            if (effectiveThreshold <= totalHours) {
+                dao.update(capsule.copy(unlockedAt = now))
+            }
+        }
     }
 }
 
 class MomentRepository(private val dao: MomentDao, private val context: Context) {
-    fun observeAll(): Flow<List<Moment>> = dao.observeAll()
-    suspend fun getAll(): List<Moment> = dao.getAll()
+    /** Excludes soft-deleted (tombstoned) rows - backed by [MomentDao.observeActive]. Every existing
+     * caller (MomentsScreen, CalendarScreen's photo-day-marking, GattSyncManager's photo-transfer phase)
+     * genuinely wants "moments the user still has", so this filters transparently for all of them with
+     * no call-site changes needed. The one place that needs tombstones too (the sync payload builder)
+     * uses [getAllIncludingDeleted] instead. */
+    fun observeAll(): Flow<List<Moment>> = dao.observeActive()
+    suspend fun getAll(): List<Moment> = dao.getActive()
     suspend fun getBySyncId(syncId: String): Moment? = dao.getBySyncId(syncId)
+
+    /** The raw/complete table, tombstones included - only for GattSyncManager.buildPayload, which must
+     * send deleted moments too so the deletion itself propagates to the partner's phone. */
+    suspend fun getAllIncludingDeleted(): List<Moment> = dao.getAll()
 
     /** [takenAt] defaults to "now" for a live camera capture (CameraScreen); a gallery backfill
      * (GalleryImportFlow) passes the date the user picked instead, so the resulting Moment groups under
      * that PAST day everywhere takenAt is read (MomentsScreen's day grouping, CalendarScreen's
      * daysWithPhotos), never under today. */
     suspend fun add(photoUri: String, sessionId: Long?, takenAt: Long = System.currentTimeMillis()): Long =
-        dao.insert(Moment(photoUri = photoUri, takenAt = takenAt, sessionId = sessionId))
+        dao.insert(Moment(photoUri = photoUri, takenAt = takenAt, sessionId = sessionId, updatedAt = System.currentTimeMillis()))
 
     /** Feature 2: called once GattSyncManager has fully received a photo's bytes, written them to a temp
      * file, and successfully renamed that into place at the Moment's real photoUri - see
@@ -134,6 +224,26 @@ class MomentRepository(private val dao: MomentDao, private val context: Context)
      * MomentsScreen re-renders the real image with no further plumbing needed. */
     suspend fun markPhotoDownloaded(syncId: String) {
         dao.updatePhotoDownloaded(syncId, true)
+    }
+
+    /** Soft-deletes a Moment - unlike a manual session, ANY moment can be deleted regardless of isRemote,
+     * since every moment is content one of the two people created, not an automatically-collected record
+     * (see Moment.deleted's doc). Also deletes the local photo FILE if we actually hold one
+     * (photoDownloaded), to free disk space and stop it being offered to the partner during a future
+     * photo-transfer phase - see computeToSend in GattSyncManager, which already reads through
+     * observeAll()/getAll() above so a tombstoned moment is naturally excluded from both directions of
+     * the photo-bytes exchange without any extra filtering needed there. Deletes via [moment]'s OWN
+     * already-locally-verified photoUri (never a path freshly parsed from an incoming wire payload) -
+     * same "never trust wire data as a filesystem destination" rule mergeRemoteStubs' doc explains for
+     * why photoUri is always syncId-derived in the first place. The file delete is wrapped in
+     * [runCatching] so a filesystem hiccup (already-missing file, permission edge case) never blocks the
+     * DB tombstone write, which is the part that actually matters for sync/UI correctness - a leftover
+     * orphaned file in a rare failure case is a minor cost, a stuck "can't delete" UI is not acceptable. */
+    suspend fun softDelete(moment: Moment) {
+        if (moment.photoDownloaded) {
+            runCatching { File(moment.photoUri).delete() }
+        }
+        dao.update(moment.copy(deleted = true, updatedAt = System.currentTimeMillis()))
     }
 
     /**
@@ -159,17 +269,36 @@ class MomentRepository(private val dao: MomentDao, private val context: Context)
      * partner's incoming bytes with zero attacker involved - and (b) let a malicious authenticated peer
      * (anyone who knows the pairing handshake token) point photoUri at an arbitrary app-writable path
      * (e.g. the Room DB file) for savePhotoBytes to later overwrite.
+     *
+     * TOMBSTONE-APPLY (moment delete): for a syncId we already know locally, a remote row that carries a
+     * tombstone (r.deleted) we haven't already applied is the one mutation an existing row can receive
+     * here - this is how deleting a moment on one phone propagates to the other. UNLIKE
+     * SessionRepository.mergeRemoteSessions' tombstone-apply branch, there is NO local.isManual-equivalent
+     * gate here: any moment, remote or local, can be tombstoned by an incoming payload, which is
+     * intentional - deletion is allowed for any moment by design (see Moment.deleted's doc), so trusting
+     * the remote's deleted claim for an already-known syncId is correct rather than a hole to close. If we
+     * hold real photo bytes for the now-tombstoned row, delete the local file too (same reasoning as
+     * softDelete above), using OUR OWN local row's already-safe photoUri, never r.photoUri (untrusted
+     * wire data).
      */
     suspend fun mergeRemoteStubs(remote: List<Moment>) {
-        val localSyncIds = dao.getAll().mapNotNull { it.syncId.takeIf { id -> id.isNotBlank() } }.toSet()
-        val toInsert = remote.filter { it.syncId.isNotBlank() && it.syncId !in localSyncIds }
-        toInsert.forEach {
-            // The wire's photoUri string is used for NOTHING but a best-effort file-extension hint here -
-            // extensionFromHint() only ever extracts and validates a short suffix against a hardcoded
-            // allowlist, so even a maliciously-crafted string (path traversal, absolute path, etc.) can
-            // never influence the actual destination directory - see localPhotoFile()/sanitizeExtension().
-            val safePath = localPhotoFile(context, it.syncId, extensionFromHint(it.photoUri)).absolutePath
-            dao.insert(it.copy(id = 0, sessionId = null, isRemote = true, photoUri = safePath))
+        val localBySyncId = dao.getAll().filter { it.syncId.isNotBlank() }.associateBy { it.syncId }
+        remote.filter { it.syncId.isNotBlank() }.forEach { r ->
+            val local = localBySyncId[r.syncId]
+            if (local == null) {
+                // The wire's photoUri string is used for NOTHING but a best-effort file-extension hint
+                // here - extensionFromHint() only ever extracts and validates a short suffix against a
+                // hardcoded allowlist, so even a maliciously-crafted string (path traversal, absolute
+                // path, etc.) can never influence the actual destination directory - see
+                // localPhotoFile()/sanitizeExtension().
+                val safePath = localPhotoFile(context, r.syncId, extensionFromHint(r.photoUri)).absolutePath
+                dao.insert(r.copy(id = 0, sessionId = null, isRemote = true, photoUri = safePath))
+            } else if (r.deleted && !local.deleted) {
+                if (local.photoDownloaded) {
+                    runCatching { File(local.photoUri).delete() }
+                }
+                dao.update(local.copy(deleted = true, updatedAt = maxOf(local.updatedAt, r.updatedAt)))
+            }
         }
     }
 
@@ -268,6 +397,67 @@ class MilestoneRepository(private val dao: MilestoneDao) {
     /** Union+tombstone merge by id + updatedAt, same LWW shape as DateIdeaRepository.mergeRemote - these
      * are simple, rarely-edited additions, so plain last-write-wins is appropriate (see task spec). */
     suspend fun mergeRemote(remote: List<Milestone>) {
+        val local = dao.getAll().associateBy { it.id }
+        val toUpsert = remote.filter { r ->
+            val l = local[r.id]
+            l == null || r.updatedAt > l.updatedAt
+        }
+        if (toUpsert.isNotEmpty()) dao.upsertAll(toUpsert)
+    }
+}
+
+/**
+ * "Our Lists": built exactly like [MilestoneRepository] - same shape, same LWW-by-(id, updatedAt) merge.
+ * Takes a [DateIdeaRepository] (rather than a raw DateIdeaDao) so [delete]'s cascade can reuse
+ * DateIdeaRepository's own already-working softDelete path (each affected idea gets a correct
+ * deleted=true/updatedAt=now write that syncs via DateIdea's existing tombstone sync) instead of writing
+ * new raw SQL - matching how other repositories that need cross-table awareness in this file are
+ * constructed (e.g. MomentRepository takes a Context to compute photo paths, not a raw file API).
+ */
+class ListCategoryRepository(
+    private val dao: ListCategoryDao,
+    private val dateIdeaRepository: DateIdeaRepository,
+    private val database: AppDatabase
+) {
+    fun observeActive(): Flow<List<ListCategory>> = dao.observeActive()
+    suspend fun getAll(): List<ListCategory> = dao.getAll()
+
+    suspend fun add(name: String): ListCategory {
+        val now = System.currentTimeMillis()
+        val category = ListCategory(
+            id = UUID.randomUUID().toString(),
+            name = name,
+            createdAt = now,
+            updatedAt = now
+        )
+        dao.upsert(category)
+        return category
+    }
+
+    /** Soft-deletes the list itself AND cascades to every currently-active idea it owns - deleting a list
+     * takes its items with it, the same way deleting a note deletes its lines. The cascade goes through
+     * DateIdeaRepository.softDelete (the SAME per-idea soft-delete path the UI's own delete-one-idea
+     * button already uses) rather than a raw bulk UPDATE, so each cascaded idea gets its own correct
+     * deleted=true/updatedAt=now row and propagates to the partner's phone via DateIdea's ALREADY-WORKING
+     * tombstone sync (GattSyncManager.serializeDateIdeas/DateIdeaRepository.mergeRemote) - no new sync
+     * mechanism is needed for the cascade itself, only ListCategory's own entity needs new sync wiring.
+     * Wrapped in one DB transaction so a process kill partway through (e.g. a low-memory kill, not even
+     * a crash) can't land between the category's own tombstone write and the per-idea cascade writes -
+     * without this, an interrupted cascade could leave an idea still active in the DB but permanently
+     * invisible in the UI (which only ever groups ideas under an active list card), with no way to
+     * reach it again to delete or restore it. */
+    suspend fun delete(category: ListCategory) {
+        database.withTransaction {
+            dao.upsert(category.copy(deleted = true, updatedAt = System.currentTimeMillis()))
+            dateIdeaRepository.getAll()
+                .filter { it.listId == category.id && !it.deleted }
+                .forEach { dateIdeaRepository.softDelete(it) }
+        }
+    }
+
+    /** Union+tombstone merge by id + updatedAt, same LWW shape as MilestoneRepository.mergeRemote - these
+     * are simple, rarely-edited rows, so plain last-write-wins is appropriate. */
+    suspend fun mergeRemote(remote: List<ListCategory>) {
         val local = dao.getAll().associateBy { it.id }
         val toUpsert = remote.filter { r ->
             val l = local[r.id]

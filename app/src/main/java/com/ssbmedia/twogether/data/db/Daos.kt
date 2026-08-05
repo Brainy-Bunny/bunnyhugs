@@ -15,11 +15,22 @@ interface TogetherSessionDao {
     @Update
     suspend fun update(session: TogetherSession)
 
+    /** Raw/unfiltered - includes soft-deleted (tombstoned) rows. Used directly by BackupManager (so
+     * backups round-trip tombstones) and by SessionRepository.mergeRemoteSessions (which needs to see
+     * already-tombstoned local rows to match syncIds regardless of deletion state). Everywhere else that
+     * wants "sessions the user actually sees" should go through SessionRepository.observeAll(), which is
+     * backed by [observeActive] below instead. */
     @Query("SELECT * FROM together_sessions ORDER BY startedAt DESC")
     fun observeAll(): Flow<List<TogetherSession>>
 
     @Query("SELECT * FROM together_sessions ORDER BY startedAt DESC")
     suspend fun getAll(): List<TogetherSession>
+
+    @Query("SELECT * FROM together_sessions WHERE deleted = 0 ORDER BY startedAt DESC")
+    fun observeActive(): Flow<List<TogetherSession>>
+
+    @Query("SELECT * FROM together_sessions WHERE deleted = 0 ORDER BY startedAt DESC")
+    suspend fun getActive(): List<TogetherSession>
 
     @Query("SELECT * FROM together_sessions WHERE endedAt IS NULL ORDER BY startedAt DESC LIMIT 1")
     suspend fun getOpenSession(): TogetherSession?
@@ -81,11 +92,26 @@ interface MomentDao {
     @Insert
     suspend fun insert(moment: Moment): Long
 
+    @Update
+    suspend fun update(moment: Moment)
+
+    /** Raw/unfiltered - includes soft-deleted (tombstoned) rows. Used directly by BackupManager (so
+     * backups round-trip tombstones), by GattSyncManager's payload builder (which must send deleted
+     * moments too so the deletion itself propagates to the partner's phone), and by
+     * MomentRepository.mergeRemoteStubs (which needs to see already-tombstoned local rows to match
+     * syncIds regardless of deletion state). Everywhere else that wants "moments the user actually sees"
+     * should go through MomentRepository.observeAll(), which is backed by [observeActive] below instead. */
     @Query("SELECT * FROM moments ORDER BY takenAt DESC")
     fun observeAll(): Flow<List<Moment>>
 
     @Query("SELECT * FROM moments ORDER BY takenAt DESC")
     suspend fun getAll(): List<Moment>
+
+    @Query("SELECT * FROM moments WHERE deleted = 0 ORDER BY takenAt DESC")
+    fun observeActive(): Flow<List<Moment>>
+
+    @Query("SELECT * FROM moments WHERE deleted = 0 ORDER BY takenAt DESC")
+    suspend fun getActive(): List<Moment>
 
     @Query("SELECT * FROM moments WHERE syncId = :syncId LIMIT 1")
     suspend fun getBySyncId(syncId: String): Moment?
@@ -142,5 +168,25 @@ interface MilestoneDao {
     /** Wipes every row - used only by Feature 4's backup restore, which always fully repopulates this
      * table immediately afterward inside the same DB transaction. */
     @Query("DELETE FROM milestones")
+    suspend fun clearAll()
+}
+
+@Dao
+interface ListCategoryDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(category: ListCategory)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAll(categories: List<ListCategory>)
+
+    @Query("SELECT * FROM list_categories WHERE deleted = 0 ORDER BY createdAt ASC")
+    fun observeActive(): Flow<List<ListCategory>>
+
+    @Query("SELECT * FROM list_categories")
+    suspend fun getAll(): List<ListCategory>
+
+    /** Wipes every row - used only by Feature 4's backup restore, which always fully repopulates this
+     * table immediately afterward inside the same DB transaction. */
+    @Query("DELETE FROM list_categories")
     suspend fun clearAll()
 }

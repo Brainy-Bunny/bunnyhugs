@@ -23,6 +23,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -90,6 +91,20 @@ class CalendarViewModel : ViewModel() {
             }
         }
     }
+
+    /** Deletes a manually-backfilled session entered wrong - SessionRepository.softDeleteManual itself
+     * no-ops for a genuine BLE-detected session, but the delete affordance below only ever shows for
+     * isManual rows anyway. Same "don't make it wait for the next reconnect" reasoning as
+     * addManualSession above - if we're already together, request a sync right now so the deletion
+     * propagates to the partner's phone immediately. */
+    fun deleteManualSession(session: TogetherSession) {
+        viewModelScope.launch {
+            ServiceLocator.sessionRepository.softDeleteManual(session)
+            if (ServiceLocator.proximityStateStore.current().isTogether) {
+                AppEvents.requestManualSync()
+            }
+        }
+    }
 }
 
 /**
@@ -130,6 +145,9 @@ fun CalendarScreen(
     var yearMonth by remember { mutableStateOf(YearMonth.from(highlightRange?.first ?: jumpToDate ?: LocalDate.now(zone))) }
     var selectedDay by remember { mutableStateOf(jumpToDate) }
     var showAddDialog by remember { mutableStateOf(false) }
+    // Only ever set for an isManual session (see the delete IconButton below, which is only rendered
+    // for those rows) - a genuine BLE-detected session has no way to reach this state at all.
+    var sessionPendingDelete by remember { mutableStateOf<TogetherSession?>(null) }
 
     // lastSeenAt clamps an open session's live duration so a stale/orphaned open session can't inflate
     // day totals - see StatsCalculator.effectiveOpenSessionCutoff's doc.
@@ -289,11 +307,31 @@ fun CalendarScreen(
                             val start = Instant.ofEpochMilli(s.startedAt).atZone(zone).toLocalTime()
                             val end = s.endedAt?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalTime() }
                             val manualTag = if (s.isManual) " (added manually)" else ""
-                            Text(
-                                "• ${start.format(DateTimeFormatter.ofPattern("h:mm a"))} – ${end?.format(DateTimeFormatter.ofPattern("h:mm a")) ?: "now"}$manualTag",
-                                style = MaterialTheme.typography.bodySmall,
-                                modifier = Modifier.padding(top = 4.dp)
-                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "• ${start.format(DateTimeFormatter.ofPattern("h:mm a"))} – ${end?.format(DateTimeFormatter.ofPattern("h:mm a")) ?: "now"}$manualTag",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                // Delete is only ever offered for a manually-backfilled entry - a genuine
+                                // BLE-detected session is the app's real historical record and must stay
+                                // untouchable, so no delete icon is even rendered for it.
+                                if (s.isManual) {
+                                    IconButton(
+                                        onClick = { sessionPendingDelete = s },
+                                        modifier = Modifier.size(32.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Delete,
+                                            contentDescription = "Delete this entry",
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -309,6 +347,18 @@ fun CalendarScreen(
                 vm.addManualSession(startedAt, endedAt)
                 showAddDialog = false
             }
+        )
+    }
+
+    sessionPendingDelete?.let { session ->
+        AlertDialog(
+            onDismissRequest = { sessionPendingDelete = null },
+            title = { Text("Delete this entry?") },
+            text = { Text("This can't be undone, and will be removed for both of you once you next sync.") },
+            confirmButton = {
+                TextButton(onClick = { vm.deleteManualSession(session); sessionPendingDelete = null }) { Text("Delete") }
+            },
+            dismissButton = { TextButton(onClick = { sessionPendingDelete = null }) { Text("Cancel") } }
         )
     }
 }

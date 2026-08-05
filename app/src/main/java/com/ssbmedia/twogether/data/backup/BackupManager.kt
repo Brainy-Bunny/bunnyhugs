@@ -13,14 +13,18 @@ import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.data.datastore.LastConnectionInfo
 import com.ssbmedia.twogether.data.datastore.PairingInfo
+import com.ssbmedia.twogether.data.db.DEFAULT_LIST_ID
 import com.ssbmedia.twogether.data.db.DateIdea
+import com.ssbmedia.twogether.data.db.ListCategory
 import com.ssbmedia.twogether.data.db.Milestone
 import com.ssbmedia.twogether.data.db.Moment
 import com.ssbmedia.twogether.data.db.MomentNote
 import com.ssbmedia.twogether.data.db.TimeCapsule
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.notif.MilestoneAlarmScheduler
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -44,7 +48,8 @@ import java.util.zip.ZipOutputStream
  *
  * Format (see [BACKUP_FORMAT_VERSION]):
  *   manifest.json       - one JSON object with pairing/settings/badgeUnlocks + every Room table
- *                          (sessions, dateIdeas, timeCapsules, moments, momentNotes, milestones)
+ *                          (sessions, dateIdeas, timeCapsules, moments, momentNotes, milestones,
+ *                          listCategories)
  *   photos/<id>_<name>  - one entry per Moment whose photo file still exists on disk locally (a
  *                          remote-stub Moment - see Moment.isRemote's doc - never has one)
  *
@@ -80,7 +85,20 @@ object BackupManager {
      * it the exact same way AppDatabase.MIGRATION_3_4 backfills existing rows on a live upgrade
      * (`!isRemote` - a non-remote row in an old backup necessarily has its own real photo bytes since
      * v1/v2 never had remote-stub rows without them; a remote-stub row correctly starts false, letting
-     * the very next together-session's photo-transfer phase go fetch it for real). */
+     * the very next together-session's photo-transfer phase go fetch it for real).
+     * Since v3, no format-version bump (tombstone sync additions): sessions[].updatedAt/deleted (manual-
+     * session delete) and moments[].updatedAt/deleted (moment delete) were both added without bumping
+     * BACKUP_FORMAT_VERSION - it isn't actually read anywhere to branch parsing behavior, so a bump would
+     * be cosmetic only. Both restore cleanly from an older backup via plain optLong/optBoolean defaults
+     * (see parseSessions/parseMoments below), the same backward-compat shape as syncId's own default a
+     * few lines below.
+     * Also since v3, no format-version bump ("Our Lists"): added the listCategories[] section and changed
+     * dateIdeas[].category -> dateIdeas[].listId. Same reasoning - restoreBackup() already treats every
+     * momentNotes/milestones-shaped array as optional (root.optJSONArray, missing == empty), and
+     * parseDateIdeas below defaults a missing listId to [DEFAULT_LIST_ID] the same way parseSessions
+     * defaults a missing syncId - so a pre-"Our Lists" backup restores every one of its date ideas
+     * straight into the default "Date Ideas" list, and restoreBackup()'s own fallback (see its doc)
+     * synthesizes that list's row if the backup predates listCategories entirely. */
     private const val BACKUP_FORMAT_VERSION = 3
     const val BACKUP_FOLDER_NAME = "Twogether Backups"
     private val RELATIVE_DIR = Environment.DIRECTORY_DOWNLOADS + "/" + BACKUP_FOLDER_NAME
@@ -138,13 +156,14 @@ object BackupManager {
             val moments = db.momentDao().getAll()
             val momentNotes = db.momentNoteDao().getAll()
             val milestones = db.milestoneDao().getAll()
+            val listCategories = db.listCategoryDao().getAll()
             val pairing = ServiceLocator.pairingStore.current()
             val lastConnection = ServiceLocator.pairingStore.currentLastConnection()
             val settings = ServiceLocator.settingsStore.current()
             val badgeUnlocks = ServiceLocator.badgeUnlocksStore.current()
 
             val manifest = buildManifest(
-                sessions, dateIdeas, timeCapsules, moments, momentNotes, milestones,
+                sessions, dateIdeas, timeCapsules, moments, momentNotes, milestones, listCategories,
                 pairing, lastConnection, settings, badgeUnlocks
             )
 
@@ -158,6 +177,14 @@ object BackupManager {
                 zos.closeEntry()
 
                 moments.forEach { moment ->
+                    // Plain synchronous Java I/O below has no suspension point of its own, so a caller
+                    // racing this whole function against a timeout (see UpdateInstallActivity's
+                    // pre-update safety-net backup) would otherwise never have its cancellation actually
+                    // take effect until this entire loop finished - Kotlin cancellation is cooperative,
+                    // only checked at a suspension point or an explicit check like this one. One check
+                    // per photo is enough granularity to make that timeout genuinely bounded without
+                    // adding meaningful overhead to the normal (uncancelled) weekly/manual backup path.
+                    ensureActive()
                     val photoFile = File(moment.photoUri)
                     if (photoFile.isFile) {
                         zos.putNextEntry(ZipEntry(photoZipEntryName(moment)))
@@ -179,6 +206,17 @@ object BackupManager {
 
             ServiceLocator.settingsStore.setLastBackupResult(now, true)
             BackupResult(true, publishedUri, "Backup saved to Downloads/$BACKUP_FOLDER_NAME (${sizeBytes / 1024} KB, ${moments.size} photo(s)).")
+        } catch (e: CancellationException) {
+            // MUST rethrow, never swallow - a blanket catch(e: Exception) below would otherwise also
+            // catch this (CancellationException IS an Exception) and let this coroutine "complete
+            // normally" with a BackupResult despite its Job having been cancelled (e.g. by
+            // UpdateInstallActivity's pre-update backup timeout via ensureActive() in the photo-copy
+            // loop above, or the caller's own scope going away mid-backup) - which breaks structured
+            // concurrency's cancellation propagation for whoever's awaiting this call. Deliberately NOT
+            // recording this as a failed backup via setLastBackupResult either - a cancellation isn't a
+            // real failure the way an IO error is, so the previous successful backup's timestamp is
+            // left as the more accurate "last backup" record.
+            throw e
         } catch (e: Exception) {
             ServiceLocator.settingsStore.setLastBackupResult(now, false)
             BackupResult(false, null, "Backup failed: ${e.message ?: e.javaClass.simpleName}")
@@ -194,6 +232,7 @@ object BackupManager {
         moments: List<Moment>,
         momentNotes: List<MomentNote>,
         milestones: List<Milestone>,
+        listCategories: List<ListCategory>,
         pairing: PairingInfo,
         lastConnection: LastConnectionInfo,
         settings: AppSettings,
@@ -237,6 +276,8 @@ object BackupManager {
                     put("endedAt", s.endedAt)
                     put("isManual", s.isManual)
                     put("syncId", s.syncId)
+                    put("updatedAt", s.updatedAt)
+                    put("deleted", s.deleted)
                 })
             }
         })
@@ -246,7 +287,7 @@ object BackupManager {
                 put(JSONObject().apply {
                     put("id", d.id)
                     put("text", d.text)
-                    put("category", d.category)
+                    put("listId", d.listId)
                     put("done", d.done)
                     put("updatedAt", d.updatedAt)
                     put("deleted", d.deleted)
@@ -277,6 +318,8 @@ object BackupManager {
                     put("syncId", m.syncId)
                     put("isRemote", m.isRemote)
                     put("photoDownloaded", m.photoDownloaded)
+                    put("updatedAt", m.updatedAt)
+                    put("deleted", m.deleted)
                 })
             }
         })
@@ -304,6 +347,18 @@ object BackupManager {
                     put("createdAt", m.createdAt)
                     put("updatedAt", m.updatedAt)
                     put("deleted", m.deleted)
+                })
+            }
+        })
+
+        put("listCategories", JSONArray().apply {
+            listCategories.forEach { c ->
+                put(JSONObject().apply {
+                    put("id", c.id)
+                    put("name", c.name)
+                    put("createdAt", c.createdAt)
+                    put("updatedAt", c.updatedAt)
+                    put("deleted", c.deleted)
                 })
             }
         })
@@ -381,6 +436,7 @@ object BackupManager {
                     moments = parseMoments(root.getJSONArray("moments")),
                     momentNotes = parseMomentNotes(root.optJSONArray("momentNotes")),
                     milestones = parseMilestones(root.optJSONArray("milestones")),
+                    listCategories = parseListCategories(root.optJSONArray("listCategories")),
                     pairingJson = root.getJSONObject("pairing"),
                     settingsJson = root.getJSONObject("settings"),
                     badgeUnlocks = root.getJSONObject("badgeUnlocks").let { obj ->
@@ -406,6 +462,17 @@ object BackupManager {
                 if (parsed.momentNotes.isNotEmpty()) db.momentNoteDao().upsertAll(parsed.momentNotes)
                 db.milestoneDao().clearAll()
                 if (parsed.milestones.isNotEmpty()) db.milestoneDao().upsertAll(parsed.milestones)
+                db.listCategoryDao().clearAll()
+                if (parsed.listCategories.isNotEmpty()) db.listCategoryDao().upsertAll(parsed.listCategories)
+                // Fallback for a backup made before "Our Lists" existed (no listCategories section at
+                // all, or one that's simply empty for some other reason): every restored DateIdea above
+                // was defaulted to DEFAULT_LIST_ID by parseDateIdeas' own fallback, so without a matching
+                // list_categories row the UI would have no card to show those ideas under at all. Synthesize
+                // the same default "Date Ideas" row AppDatabase.MIGRATION_7_8 seeds on a live upgrade.
+                if (parsed.listCategories.none { it.id == DEFAULT_LIST_ID }) {
+                    val now = System.currentTimeMillis()
+                    db.listCategoryDao().upsert(ListCategory(id = DEFAULT_LIST_ID, name = "Date Ideas", createdAt = now, updatedAt = now))
+                }
             }
 
             val p = parsed.pairingJson
@@ -468,6 +535,7 @@ object BackupManager {
         val moments: List<MomentWithZipHint>,
         val momentNotes: List<MomentNote>,
         val milestones: List<Milestone>,
+        val listCategories: List<ListCategory>,
         val pairingJson: JSONObject,
         val settingsJson: JSONObject,
         val badgeUnlocks: Map<String, Long>
@@ -490,7 +558,12 @@ object BackupManager {
             startedAt = o.getLong("startedAt"),
             endedAt = if (o.isNull("endedAt")) null else o.getLong("endedAt"),
             isManual = o.optBoolean("isManual", false),
-            syncId = syncId
+            syncId = syncId,
+            // v1/v2 backups (made before this feature existed) have no updatedAt/deleted keys - default
+            // to "never tombstoned", same defensive optLong/optBoolean pattern as syncId's backward-compat
+            // handling just above.
+            updatedAt = o.optLong("updatedAt", 0L),
+            deleted = o.optBoolean("deleted", false)
         )
     }
 
@@ -499,7 +572,10 @@ object BackupManager {
         DateIdea(
             id = o.getString("id"),
             text = o.getString("text"),
-            category = o.optStringOrNull("category"),
+            // A pre-"Our Lists" backup has no listId key at all (it had category instead, now dropped) -
+            // default to the default list, same defensive-fallback reasoning as GattSyncManager's own
+            // deserializeDateIdeas optString default.
+            listId = o.optStringOrNull("listId") ?: DEFAULT_LIST_ID,
             done = o.optBoolean("done", false),
             updatedAt = o.getLong("updatedAt"),
             deleted = o.optBoolean("deleted", false)
@@ -530,7 +606,12 @@ object BackupManager {
             isRemote = isRemote,
             // Feature 2: a v1/v2 backup (made before photoDownloaded existed) defaults exactly like
             // AppDatabase.MIGRATION_3_4's live-upgrade backfill - see BACKUP_FORMAT_VERSION's doc above.
-            photoDownloaded = o.optBoolean("photoDownloaded", !isRemote)
+            photoDownloaded = o.optBoolean("photoDownloaded", !isRemote),
+            // A pre-tombstone-sync backup has no updatedAt/deleted keys - default to "never tombstoned",
+            // same defensive optLong/optBoolean pattern as syncId's/photoDownloaded's backward-compat
+            // handling above.
+            updatedAt = o.optLong("updatedAt", 0L),
+            deleted = o.optBoolean("deleted", false)
         )
         MomentWithZipHint(moment, o.optStringOrNull("photoZipEntry"))
     }
@@ -559,6 +640,20 @@ object BackupManager {
                 month = o.getInt("month"),
                 day = o.getInt("day"),
                 year = if (o.isNull("year")) null else o.optInt("year"),
+                createdAt = o.getLong("createdAt"),
+                updatedAt = o.getLong("updatedAt"),
+                deleted = o.optBoolean("deleted", false)
+            )
+        }
+    }
+
+    private fun parseListCategories(arr: JSONArray?): List<ListCategory> {
+        if (arr == null) return emptyList()
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            ListCategory(
+                id = o.getString("id"),
+                name = o.getString("name"),
                 createdAt = o.getLong("createdAt"),
                 updatedAt = o.getLong("updatedAt"),
                 deleted = o.optBoolean("deleted", false)

@@ -19,8 +19,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
@@ -70,6 +72,20 @@ import java.time.format.FormatStyle
 class MomentsViewModel : ViewModel() {
     val moments = ServiceLocator.momentRepository.observeAll()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    /** Deletes a Moment - unlike a manual session, this needs no isManual-style guard first: ANY moment
+     * can be deleted by either partner (see Moment.deleted's doc), so MomentFullScreen's delete button
+     * calls straight through. Same "don't make it wait for the next reconnect" reasoning as Calendar's
+     * deleteManualSession - if we're already together, request a sync right now so the deletion
+     * propagates to the partner's phone immediately. */
+    fun deleteMoment(moment: Moment) {
+        viewModelScope.launch {
+            ServiceLocator.momentRepository.softDelete(moment)
+            if (ServiceLocator.proximityStateStore.current().isTogether) {
+                AppEvents.requestManualSync()
+            }
+        }
+    }
 }
 
 @Composable
@@ -168,7 +184,15 @@ fun MomentsScreen(onBack: () -> Unit, onNavigateCamera: () -> Unit) {
         }
 
         selected?.let { moment ->
-            MomentFullScreen(moment = moment, isTransferring = moment.syncId in transferring, onDismiss = { selected = null })
+            MomentFullScreen(
+                moment = moment,
+                isTransferring = moment.syncId in transferring,
+                onDismiss = { selected = null },
+                // Once deleted, `moment` is a stale snapshot that no longer reflects the (now-filtered)
+                // Flow - closing the detail view here sidesteps ever rendering a deleted moment's
+                // fullscreen view after the fact, rather than needing extra reactivity to notice it's gone.
+                onDelete = { vm.deleteMoment(moment); selected = null }
+            )
         }
     }
     }
@@ -213,13 +237,14 @@ private fun MomentThumbnail(moment: Moment, isTransferring: Boolean, onClick: ()
 }
 
 @Composable
-private fun MomentFullScreen(moment: Moment, isTransferring: Boolean, onDismiss: () -> Unit) {
+private fun MomentFullScreen(moment: Moment, isTransferring: Boolean, onDismiss: () -> Unit, onDelete: () -> Unit) {
     val zone = remember { ZoneId.systemDefault() }
     val dateLabel = remember(moment.takenAt) {
         Instant.ofEpochMilli(moment.takenAt).atZone(zone).toLocalDateTime()
             .format(DateTimeFormatter.ofLocalizedDateTime(FormatStyle.MEDIUM, FormatStyle.SHORT))
     }
     val hasLocalPhoto = remember(moment.photoUri, moment.photoDownloaded) { moment.photoDownloaded && File(moment.photoUri).isFile }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
 
     Box(
         modifier = Modifier
@@ -270,10 +295,49 @@ private fun MomentFullScreen(moment: Moment, isTransferring: Boolean, onDismiss:
                 style = MaterialTheme.typography.bodyMedium
             )
 
+            // Delete affordance: ANY moment can be deleted regardless of isRemote - unlike a manual
+            // session, there's no isManual-equivalent gate to check first (see Moment.deleted's doc), so
+            // this is always shown. White/alpha-tinted to read on the dark full-bleed photo background,
+            // matching the icon/text tinting already used elsewhere in this composable (e.g. the
+            // remote-stub placeholder above) rather than this screen's default (light) Material theming.
+            Row(
+                modifier = Modifier
+                    .padding(top = 14.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .clickable(onClick = { showDeleteConfirm = true })
+                    .padding(horizontal = 4.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Delete,
+                    contentDescription = null,
+                    tint = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.8f),
+                    modifier = Modifier.size(18.dp)
+                )
+                Text(
+                    "Delete photo",
+                    color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.8f),
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(start = 6.dp)
+                )
+            }
+
             MomentNotesSection(momentSyncId = moment.syncId)
 
             androidx.compose.foundation.layout.Spacer(modifier = Modifier.padding(bottom = 32.dp))
         }
+    }
+
+    if (showDeleteConfirm) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            title = { Text("Delete this photo?") },
+            text = { Text("This can't be undone, and will be removed for both of you once you next sync.") },
+            confirmButton = {
+                TextButton(onClick = { showDeleteConfirm = false; onDelete() }) { Text("Delete") }
+            },
+            dismissButton = { TextButton(onClick = { showDeleteConfirm = false }) { Text("Cancel") } }
+        )
     }
 }
 

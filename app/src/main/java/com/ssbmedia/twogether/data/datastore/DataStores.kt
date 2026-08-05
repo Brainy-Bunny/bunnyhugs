@@ -180,6 +180,12 @@ class PairingStore(private val context: Context) {
     }
 }
 
+/** Manual override for light/dark appearance, independent of the OS setting. SYSTEM (the default) keeps
+ * today's existing behavior (TwogetherTheme's own isSystemInDarkTheme() default) - LIGHT/DARK force one
+ * regardless of the device's own setting. Persisted by name (stringPreferencesKey), not ordinal, so
+ * reordering this enum later can never silently reinterpret an already-saved choice as a different mode. */
+enum class ThemeMode { SYSTEM, LIGHT, DARK }
+
 data class AppSettings(
     val defaultSnoozeMinutes: Int = 15,
     val notificationsEnabled: Boolean = true,
@@ -210,7 +216,10 @@ data class AppSettings(
      * (see QuickLinkIds in HomeScreen.kt) in the user's preferred order. Null means "never reordered" -
      * HomeScreen falls back to its DEFAULT_QUICK_LINK_ORDER in that case, so a fresh install (or an
      * install that predates this feature) keeps showing the original hardcoded order unchanged. */
-    val quickLinksOrder: String? = null
+    val quickLinksOrder: String? = null,
+    /** See [ThemeMode]'s own doc. Deliberately per-device (like quickLinksOrder above), not synced
+     * between partners - each person's phone can independently follow-system/force-light/force-dark. */
+    val themeMode: ThemeMode = ThemeMode.SYSTEM
 )
 
 class SettingsStore(private val context: Context) {
@@ -227,6 +236,7 @@ class SettingsStore(private val context: Context) {
         val AUTO_UPDATE_ENABLED = booleanPreferencesKey("auto_update_check_enabled")
         val LAST_UPDATE_CHECK_AT = longPreferencesKey("last_update_check_at")
         val QUICK_LINKS_ORDER = stringPreferencesKey("quick_links_order")
+        val THEME_MODE = stringPreferencesKey("theme_mode")
     }
 
     val settings: Flow<AppSettings> = context.settingsDs.data.map { p ->
@@ -242,7 +252,10 @@ class SettingsStore(private val context: Context) {
             localDeviceId = p[Keys.LOCAL_DEVICE_ID],
             autoUpdateCheckEnabled = p[Keys.AUTO_UPDATE_ENABLED] ?: true,
             lastUpdateCheckAt = p[Keys.LAST_UPDATE_CHECK_AT] ?: 0L,
-            quickLinksOrder = p[Keys.QUICK_LINKS_ORDER]
+            quickLinksOrder = p[Keys.QUICK_LINKS_ORDER],
+            // Defensive against a value from a future app version this build doesn't recognize (an
+            // enum name Room/DataStore can't map back) - falls back to SYSTEM rather than crashing.
+            themeMode = p[Keys.THEME_MODE]?.let { raw -> runCatching { ThemeMode.valueOf(raw) }.getOrNull() } ?: ThemeMode.SYSTEM
         )
     }
 
@@ -331,6 +344,10 @@ class SettingsStore(private val context: Context) {
      * handed. */
     suspend fun setQuickLinksOrder(orderedIds: List<String>) {
         context.settingsDs.edit { it[Keys.QUICK_LINKS_ORDER] = orderedIds.joinToString(",") }
+    }
+
+    suspend fun setThemeMode(mode: ThemeMode) {
+        context.settingsDs.edit { it[Keys.THEME_MODE] = mode.name }
     }
 
     /** Records the outcome of the most recent backup attempt (manual "Back up now" or the weekly
@@ -457,7 +474,7 @@ class ProximityStateStore(private val context: Context) {
  * can show "locked vs unlocked with unlock date" instead of just "Unlocked" with no date - BadgeCatalog
  * itself is a pure function of the current stats snapshot and has no notion of "when" a badge first
  * crossed its threshold, so that has to be recorded the first time it's observed. One dynamic
- * longPreferencesKey per badge id, rather than a fixed key set, since BadgeCatalog.all can grow. */
+ * longPreferencesKey per badge id, rather than a fixed key set, since BadgeCatalog.badgesFor(stats) can grow. */
 class BadgeUnlocksStore(private val context: Context) {
     val unlockedAtByBadgeId: Flow<Map<String, Long>> = context.badgeUnlocksDs.data.map { prefs ->
         prefs.asMap().entries.associate { (key, value) -> key.name to (value as Long) }

@@ -171,6 +171,7 @@ fun StatsScreen(
                         modifier = Modifier.weight(1f),
                         onClick = onOpenFavoriteDayDetail
                     )
+                    StatCard(emoji = "📆", label = "Perfect weeks", value = "${stats.perfectWeekCount}", modifier = Modifier.weight(1f))
                 }
             }
             item {

@@ -21,6 +21,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -52,6 +53,7 @@ import com.ssbmedia.twogether.ble.ProximityStateMachine
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.data.backup.BackupManager
 import com.ssbmedia.twogether.data.datastore.AppSettings
+import com.ssbmedia.twogether.data.datastore.ThemeMode
 import com.ssbmedia.twogether.data.update.UpdateChecker
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.lock.AppLockManager
@@ -74,6 +76,10 @@ class SettingsViewModel : ViewModel() {
 
     fun setNotificationsEnabled(enabled: Boolean) {
         viewModelScope.launch { ServiceLocator.settingsStore.setNotificationsEnabled(enabled) }
+    }
+
+    fun setThemeMode(mode: ThemeMode) {
+        viewModelScope.launch { ServiceLocator.settingsStore.setThemeMode(mode) }
     }
 
     fun setAutoUpdateCheckEnabled(enabled: Boolean) {
@@ -194,6 +200,33 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
             modifier = Modifier.fillMaxWidth().padding(padding).verticalScroll(rememberScrollState()).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            SettingsSection(title = "Appearance") {
+                Text(
+                    "Theme",
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.padding(top = 10.dp)
+                )
+                Text(
+                    "Follows your phone by default",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    ThemeModeChip(label = "System", selected = settings.themeMode == ThemeMode.SYSTEM, modifier = Modifier.weight(1f)) {
+                        vm.setThemeMode(ThemeMode.SYSTEM)
+                    }
+                    ThemeModeChip(label = "Light", selected = settings.themeMode == ThemeMode.LIGHT, modifier = Modifier.weight(1f)) {
+                        vm.setThemeMode(ThemeMode.LIGHT)
+                    }
+                    ThemeModeChip(label = "Dark", selected = settings.themeMode == ThemeMode.DARK, modifier = Modifier.weight(1f)) {
+                        vm.setThemeMode(ThemeMode.DARK)
+                    }
+                }
+            }
+
             SettingsSection(title = "Notifications") {
                 SettingsRow(label = "Notifications enabled", subtitle = "15-minute photo nudges and updates") {
                     Switch(checked = settings.notificationsEnabled, onCheckedChange = { vm.setNotificationsEnabled(it) })
@@ -400,6 +433,16 @@ private fun SettingsRow(label: String, subtitle: String, trailing: @Composable (
         }
         trailing()
     }
+}
+
+@Composable
+private fun ThemeModeChip(label: String, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        label = { Text(label) },
+        modifier = modifier
+    )
 }
 
 @Composable

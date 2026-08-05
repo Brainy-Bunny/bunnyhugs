@@ -21,7 +21,7 @@ import com.ssbmedia.twogether.ui.battery.BatteryOptimizationGate
 import com.ssbmedia.twogether.ui.calendar.CalendarScreen
 import com.ssbmedia.twogether.ui.camera.CameraScreen
 import com.ssbmedia.twogether.ui.capsules.CapsulesScreen
-import com.ssbmedia.twogether.ui.dateideas.DateIdeasScreen
+import com.ssbmedia.twogether.ui.dateideas.OurListsScreen
 import com.ssbmedia.twogether.ui.home.HomeScreen
 import com.ssbmedia.twogether.ui.milestones.MilestonesScreen
 import com.ssbmedia.twogether.ui.moments.MomentsScreen
@@ -37,7 +37,7 @@ private data class BottomItem(val screen: Screen, val emoji: String, val label: 
 private val bottomItems = listOf(
     BottomItem(Screen.Home, "🏠", "Home"),
     BottomItem(Screen.Calendar, "📅", "Calendar"),
-    BottomItem(Screen.DateIdeas, "💌", "Ideas"),
+    BottomItem(Screen.DateIdeas, "💌", "Our Lists"),
     BottomItem(Screen.Moments, "📸", "Moments"),
     BottomItem(Screen.Stats, "📊", "Stats")
 )
@@ -153,7 +153,7 @@ fun TwogetherNavHost(cameraTrigger: Int, onUnpaired: () -> Unit, openMilestoneId
                     highlightEndEpochDay = args?.getLong("highlightEndEpochDay")?.takeIf { it >= 0 }
                 )
             }
-            composable(Screen.DateIdeas.route) { DateIdeasScreen(onBack = { navController.popBackStack() }) }
+            composable(Screen.DateIdeas.route) { OurListsScreen(onBack = { navController.popBackStack() }) }
             composable(Screen.Moments.route) {
                 MomentsScreen(
                     onBack = { navController.popBackStack() },

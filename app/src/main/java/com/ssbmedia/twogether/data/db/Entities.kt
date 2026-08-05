@@ -17,15 +17,49 @@ data class TogetherSession(
      * same [id] by coincidence. [syncId] is generated once (at insert, or backfilled by
      * AppDatabase.MIGRATION_2_3 for rows that predate sync) and never changes, so
      * SessionRepository.mergeRemoteSessions can tell "already have this" from "genuinely new" reliably. */
-    val syncId: String = UUID.randomUUID().toString()
+    val syncId: String = UUID.randomUUID().toString(),
+    val updatedAt: Long = 0L,
+    /** Tombstone, mirroring DateIdea/MomentNote's pattern - only ever set for [isManual] rows, so a
+     * backfilled entry entered wrong can be deleted and have that deletion propagate to the partner's
+     * phone on the next sync. A genuine BLE-detected session must never have this set by any code path -
+     * see SessionRepository.softDeleteManual and mergeRemoteSessions for the enforcement. */
+    val deleted: Boolean = false
 )
+
+/** Fixed (not randomly generated) so every device's independent DB migration creates a list with the
+ * SAME id - if each phone generated its own random UUID here, the two partners' phones would end up
+ * with two different "Date Ideas" lists that could never merge into one via sync (which merges by
+ * stable id), producing a visible duplicate the first time they synced after this update. */
+const val DEFAULT_LIST_ID = "a0000000-0000-4000-8000-000000000001"
 
 @Entity(tableName = "date_ideas")
 data class DateIdea(
     @PrimaryKey val id: String,
     val text: String,
-    val category: String? = null,
+    /** The owning [ListCategory.id] this idea belongs to - lets "Our Lists" scope ideas per-list instead
+     * of one flat global checklist. Defaults to [DEFAULT_LIST_ID] (the migration-seeded "Date Ideas"
+     * list) so any code path that constructs a DateIdea without explicitly picking a list still lands
+     * somewhere real rather than referencing a nonexistent ListCategory row. */
+    val listId: String = DEFAULT_LIST_ID,
     val done: Boolean = false,
+    val updatedAt: Long,
+    val deleted: Boolean = false
+)
+
+/**
+ * "Our Lists": a named, couple-shared checklist (e.g. "Date Ideas", "Movie Watchlist") that owns zero or
+ * more [DateIdea] rows via [DateIdea.listId]. Built exactly like [Milestone] on purpose - same
+ * @PrimaryKey val id: String sync identity, same LWW-tombstone-by-(id, updatedAt) merge shape (see
+ * ListCategoryRepository.mergeRemote) - these are simple, rarely-edited rows with no need for Milestone's
+ * more elaborate union-merge cousins (SessionRepository/MomentRepository). One row of this table (id ==
+ * [DEFAULT_LIST_ID]) is special: it's created by AppDatabase.MIGRATION_7_8 on every existing install so
+ * every pre-existing DateIdea (previously one flat global list) lands somewhere real after the upgrade.
+ */
+@Entity(tableName = "list_categories")
+data class ListCategory(
+    @PrimaryKey val id: String,
+    val name: String,
+    val createdAt: Long,
     val updatedAt: Long,
     val deleted: Boolean = false
 )
@@ -36,7 +70,16 @@ data class TimeCapsule(
     val text: String,
     val unlockAtHours: Float,
     val createdAt: Long,
-    val unlockedAt: Long? = null
+    val unlockedAt: Long? = null,
+    /** Anti-cheat snapshot: how much of the couple's total hours were already attributable to manual
+     * (hand-entered) backfill at the moment this capsule was created - see
+     * TimeCapsuleRepository.unlockEligible's doc for the full reasoning. Everything from here on is
+     * measured relative to this frozen value, so adding or deleting manual backfill after creation
+     * always moves this capsule's effective threshold by the exact same amount as the couple's total
+     * hours moves - the two changes cancel out, so backfill activity (past or future) can never change
+     * how many genuine BLE-detected hours are actually required to unlock. Defaults to 0 for capsules
+     * that predate this field (AppDatabase.MIGRATION_6_7 backfills a real value for those instead). */
+    val manualHoursAtCreation: Float = 0f
 )
 
 @Entity(tableName = "moments")
@@ -74,7 +117,17 @@ data class Moment(
      * isRemote, so a remote-stub moment correctly starts showing the real image the moment its transfer
      * completes without needing isRemote itself to ever change.
      */
-    val photoDownloaded: Boolean = !isRemote
+    val photoDownloaded: Boolean = !isRemote,
+    val updatedAt: Long = 0L,
+    /** Tombstone, mirroring DateIdea/MomentNote/TogetherSession's pattern - so a deleted photo can
+     * propagate that deletion to the partner's phone on the next sync. UNLIKE TogetherSession.deleted,
+     * there is no isManual-equivalent restriction here: ANY moment, whether captured locally or arrived
+     * as a remote stub ([isRemote]), can be soft-deleted by either partner - every moment was deliberately
+     * created by a person on one of the two phones, not an automatically-collected "untouchable
+     * historical record" the way a BLE-detected session is. See MomentRepository.softDelete and
+     * mergeRemoteStubs for where this is set (with no equivalent gate to SessionRepository's isManual
+     * check - that's intentional, not an oversight). */
+    val deleted: Boolean = false
 )
 
 /**

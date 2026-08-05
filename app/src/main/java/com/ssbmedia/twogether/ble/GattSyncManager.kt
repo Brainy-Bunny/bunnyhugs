@@ -13,12 +13,15 @@ import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.util.Log
 import com.ssbmedia.twogether.data.datastore.SettingsStore
+import com.ssbmedia.twogether.data.db.DEFAULT_LIST_ID
 import com.ssbmedia.twogether.data.db.DateIdea
+import com.ssbmedia.twogether.data.db.ListCategory
 import com.ssbmedia.twogether.data.db.Milestone
 import com.ssbmedia.twogether.data.db.Moment
 import com.ssbmedia.twogether.data.db.MomentNote
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.data.repo.DateIdeaRepository
+import com.ssbmedia.twogether.data.repo.ListCategoryRepository
 import com.ssbmedia.twogether.data.repo.MilestoneRepository
 import com.ssbmedia.twogether.data.repo.MomentNoteRepository
 import com.ssbmedia.twogether.data.repo.MomentRepository
@@ -84,6 +87,7 @@ import java.io.File
 class GattSyncManager(
     private val context: Context,
     private val dateIdeaRepository: DateIdeaRepository,
+    private val listCategoryRepository: ListCategoryRepository,
     private val sessionRepository: SessionRepository,
     private val momentRepository: MomentRepository,
     private val momentNoteRepository: MomentNoteRepository,
@@ -96,15 +100,25 @@ class GattSyncManager(
     // ---- shared chunk protocol helpers ----
 
     /** Gathers everything this device has to offer into one combined JSON payload:
-     *  - dateIdeas: the full local list (unchanged from before - DateIdeaRepository.mergeRemote is
-     *    already a full last-write-wins merge, so sending the whole list every time is correct and cheap).
+     *  - dateIdeas: the full local list, now carrying listId (which ListCategory it belongs to) instead
+     *    of the old unused category field - DateIdeaRepository.mergeRemote is already a full
+     *    last-write-wins merge, so sending the whole list every time is correct and cheap.
+     *  - listCategories: "Our Lists" - the full local list of named lists (same full-list LWW-merge shape
+     *    as dateIdeas/milestones - ListCategoryRepository.mergeRemote is already a full last-write-wins
+     *    merge, so sending the whole list every time is correct and cheap here too).
      *  - sessions: CLOSED sessions only (endedAt != null). Feature A deliberately never sends an open
      *    session - an in-progress session copied onto the partner's device as "still open" would let two
      *    devices each show a different "currently open" row; each device's own open session closes
-     *    naturally through its own normal proximity logic instead.
+     *    naturally through its own normal proximity logic instead. Each closed session also now carries
+     *    updatedAt/deleted, so a manually-backfilled session deleted on this device (SessionRepository.
+     *    softDeleteManual) has its tombstone propagate to the partner on the next sync - this is why the
+     *    full table (including already-deleted rows), not just the active ones, is read here.
      *  - moments: metadata + Feature 2's hasPhoto flag (== Moment.photoDownloaded on THIS device) so the
      *    partner can both reference/annotate a moment it doesn't have the photo bytes for, AND know
-     *    whether it's worth requesting the bytes from us this session.
+     *    whether it's worth requesting the bytes from us this session. Each moment also now carries
+     *    updatedAt/deleted, so a moment deleted on this device (MomentRepository.softDelete) has its
+     *    tombstone propagate to the partner on the next sync - this is why the full table (including
+     *    already-deleted rows), not just the active ones, is read here.
      *  - notes: only THIS device's own notes (authorDeviceId == our id) - the receiving side treats
      *    every row here as "the partner's", never re-merges its own notes back onto itself.
      *  - milestones: the full local list (same full-list LWW-merge shape as dateIdeas).
@@ -113,8 +127,9 @@ class GattSyncManager(
         val deviceId = settingsStore.getOrCreateLocalDeviceId()
         val obj = JSONObject()
         obj.put("dateIdeas", serializeDateIdeas(dateIdeaRepository.getAll()))
-        obj.put("sessions", serializeSessions(sessionRepository.getAll().filter { it.endedAt != null }))
-        obj.put("moments", serializeMoments(momentRepository.getAll()))
+        obj.put("listCategories", serializeListCategories(listCategoryRepository.getAll()))
+        obj.put("sessions", serializeSessions(sessionRepository.getAllIncludingDeleted().filter { it.endedAt != null }))
+        obj.put("moments", serializeMoments(momentRepository.getAllIncludingDeleted()))
         obj.put("notes", serializeNotes(momentNoteRepository.getAllForAuthor(deviceId)))
         obj.put("milestones", serializeMilestones(milestoneRepository.getAll()))
         return obj.toString().toByteArray(Charsets.UTF_8)
@@ -128,6 +143,7 @@ class GattSyncManager(
         val deviceId = settingsStore.getOrCreateLocalDeviceId()
         val root = JSONObject(String(bytes, Charsets.UTF_8))
         dateIdeaRepository.mergeRemote(deserializeDateIdeas(root.optJSONArray("dateIdeas")))
+        listCategoryRepository.mergeRemote(deserializeListCategories(root.optJSONArray("listCategories")))
         sessionRepository.mergeRemoteSessions(deserializeSessions(root.optJSONArray("sessions")))
         val momentsArr = root.optJSONArray("moments")
         momentRepository.mergeRemoteStubs(deserializeMoments(momentsArr))
@@ -142,7 +158,7 @@ class GattSyncManager(
             arr.put(JSONObject().apply {
                 put("id", idea.id)
                 put("text", idea.text)
-                put("category", idea.category ?: JSONObject.NULL)
+                put("listId", idea.listId)
                 put("done", idea.done)
                 put("updatedAt", idea.updatedAt)
                 put("deleted", idea.deleted)
@@ -158,10 +174,41 @@ class GattSyncManager(
             DateIdea(
                 id = o.getString("id"),
                 text = o.getString("text"),
-                category = if (o.isNull("category")) null else o.getString("category"),
+                // Defensive fallback (not getString): a payload from a not-yet-updated partner device, or
+                // any other edge case where the key is somehow missing, degrades safely into the default
+                // list rather than throwing and aborting the whole merge.
+                listId = o.optString("listId", DEFAULT_LIST_ID),
                 done = o.getBoolean("done"),
                 updatedAt = o.getLong("updatedAt"),
                 deleted = o.getBoolean("deleted")
+            )
+        }
+    }
+
+    private fun serializeListCategories(categories: List<ListCategory>): JSONArray {
+        val arr = JSONArray()
+        for (c in categories) {
+            arr.put(JSONObject().apply {
+                put("id", c.id)
+                put("name", c.name)
+                put("createdAt", c.createdAt)
+                put("updatedAt", c.updatedAt)
+                put("deleted", c.deleted)
+            })
+        }
+        return arr
+    }
+
+    private fun deserializeListCategories(arr: JSONArray?): List<ListCategory> {
+        if (arr == null) return emptyList()
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            ListCategory(
+                id = o.getString("id"),
+                name = o.getString("name"),
+                createdAt = o.getLong("createdAt"),
+                updatedAt = o.getLong("updatedAt"),
+                deleted = o.optBoolean("deleted", false)
             )
         }
     }
@@ -174,6 +221,8 @@ class GattSyncManager(
                 put("startedAt", s.startedAt)
                 put("endedAt", s.endedAt ?: JSONObject.NULL)
                 put("isManual", s.isManual)
+                put("updatedAt", s.updatedAt)
+                put("deleted", s.deleted)
             })
         }
         return arr
@@ -189,7 +238,9 @@ class GattSyncManager(
                 startedAt = o.getLong("startedAt"),
                 endedAt = o.getLong("endedAt"),
                 isManual = o.optBoolean("isManual", false),
-                syncId = syncId
+                syncId = syncId,
+                updatedAt = o.optLong("updatedAt", 0L),
+                deleted = o.optBoolean("deleted", false)
             )
         }
     }
@@ -204,6 +255,8 @@ class GattSyncManager(
                 // Feature 2: lets the receiver know whether WE actually hold the photo bytes, so it can
                 // decide whether to request them from us this session - see this class's top-of-file doc.
                 put("hasPhoto", m.photoDownloaded)
+                put("updatedAt", m.updatedAt)
+                put("deleted", m.deleted)
             })
         }
         return arr
@@ -225,7 +278,9 @@ class GattSyncManager(
                 photoUri = o.optString("photoUri", ""),
                 takenAt = o.getLong("takenAt"),
                 syncId = syncId,
-                isRemote = true
+                isRemote = true,
+                updatedAt = o.optLong("updatedAt", 0L),
+                deleted = o.optBoolean("deleted", false)
             )
         }
     }
@@ -411,6 +466,12 @@ class GattSyncManager(
         // a duplicate delivery) - otherwise a stray marker could linger forever.
         AppEvents.setMomentsTransferring(AppEvents.momentsTransferring.value - syncId)
         if (moment.photoDownloaded) return
+        // Moment delete: getBySyncId is the raw/unfiltered lookup (it has to be - see MomentDao's doc),
+        // so it's still possible to land here for a moment we ourselves soft-deleted locally after
+        // requesting its bytes but before this delivery arrived. Writing the bytes now would just leave
+        // an orphaned file on disk (softDelete's own file-delete already ran, and won't run again for an
+        // already-tombstoned row), so skip it - the moment is gone from this device's perspective either way.
+        if (moment.deleted) return
         val destFile = File(moment.photoUri)
 
         // BLOCKER fix, defense-in-depth layer: moment.photoUri is ALWAYS derived from syncId now (never
@@ -451,6 +512,15 @@ class GattSyncManager(
                 }
             }
             momentRepository.markPhotoDownloaded(syncId)
+            // Re-check after the write: a concurrent softDelete/mergeRemoteStubs tombstone-apply could
+            // have landed between our `moment.deleted` guard above and this write completing. If it did,
+            // its own file-delete branch would have skipped (photoDownloaded was still false at that
+            // instant, so it saw nothing to clean up) - meaning the file we just wrote would otherwise
+            // become a permanently-orphaned disk-space leak, since a delete can never fire twice for an
+            // already-tombstoned row. Clean it up ourselves instead of leaving it behind.
+            if (momentRepository.getBySyncId(syncId)?.deleted == true) {
+                withContext(Dispatchers.IO) { destFile.delete() }
+            }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to save received photo for moment $syncId", e)
             withContext(Dispatchers.IO) { tempFile.delete() }
@@ -527,7 +597,7 @@ class GattSyncManager(
             // between. Leaving this call unresolved lets it settle honestly: either a real exchange
             // completes shortly (the partner connects as client and activeServerOnSyncDone - already
             // repointed to this call's callback above - fires with a genuine result), or
-            // DateIdeasScreen's own timeout resolves the UI to "Couldn't sync - make sure you're
+            // OurListsScreen's own timeout resolves the UI to "Couldn't sync - make sure you're
             // together" after a few seconds. Either outcome is honest; silently claiming success never was.
             return
         }
@@ -694,7 +764,7 @@ class GattSyncManager(
             if (server == null) {
                 // openGattServer can return null (adapter off, registration refused by the stack, etc)
                 // without throwing. Previously nothing handled this case, so the caller only ever found
-                // out via DateIdeasScreen's own ~8s UI timeout instead of an immediate, accurate failure.
+                // out via OurListsScreen's own ~8s UI timeout instead of an immediate, accurate failure.
                 Log.w(TAG, "openGattServer returned null - failing immediately instead of leaving the caller to time out")
                 onSyncDone(false)
                 return
@@ -770,6 +840,13 @@ class GattSyncManager(
         val framesToSend = mutableListOf<ByteArray>()
         for (id in wantIds.take(MAX_PHOTOS_PER_DIRECTION_PER_SESSION)) {
             val moment = momentRepository.getBySyncId(id) ?: continue
+            // Moment delete: getBySyncId is the raw/unfiltered lookup, so a moment the partner requested
+            // moments ago (before we deleted it) could still show up here - decline to serve it rather
+            // than handing back bytes for something that, from this device's perspective, no longer
+            // exists. The client-side computeToRequestIds already excludes deleted moments going forward
+            // via the now-filtered getAll(); this just covers a request already in flight when the
+            // delete happened.
+            if (moment.deleted) continue
             if (!moment.photoDownloaded) continue
             val file = File(moment.photoUri)
             if (!file.isFile) continue

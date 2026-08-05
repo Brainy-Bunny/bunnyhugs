@@ -8,8 +8,10 @@ a shared space for date ideas, memories, and streaks.
 
 ## Install (both phones)
 
-1. Copy `Twogether.apk` to each phone (email it to yourself, AirDrop-equivalent,
-   USB, Google Drive — anything).
+1. Copy the current `Twogether-<version>.apk` (e.g. `Twogether-2.0.apk`) to each
+   phone (email it to yourself, AirDrop-equivalent, USB, Google Drive — anything).
+   The version in the filename always matches the latest build in this folder;
+   after that, the in-app auto-updater keeps both phones current automatically.
 2. On each phone: tap the APK file → allow "install from this source" if asked
    → Install.
 3. Open the app on both phones and grant the Bluetooth + notification

@@ -38,6 +38,10 @@ data class DateRange(val start: LocalDate, val end: LocalDate)
  * month. */
 data class MonthlyBreakdown(val yearMonth: YearMonth, val daysMet: Int, val hours: Double)
 
+/** Together-time on today's exact calendar date (same month+day) in a previous year - e.g. "on this
+ * day in 2025, you spent 3.2 hours together." Used by Home's "on this day" callback card. */
+data class OnThisDayInfo(val year: Int, val hours: Double)
+
 data class TogetherStats(
     val totalHoursAllTime: Double,
     val totalHoursThisWeek: Double,
@@ -48,6 +52,11 @@ data class TogetherStats(
     val longestWeeklyStreak: Int,
     val longestSessionMinutes: Long,
     val reunionCount: Int,
+    /** Count of ISO weeks where ALL 7 days were qualifying days (see [buildDailyMinuteMap]) - stricter
+     * than the daily/weekly streak stats above, which only need a consecutive RUN of days/weeks: a
+     * perfect week demands literally every single day of that week have together-time, not just enough
+     * consecutive days to form a streak. */
+    val perfectWeekCount: Int,
     val favoriteDayOfWeek: DayOfWeek?,
     /** Total distinct calendar days with any together-time at all (BLE-detected or manually backfilled).
      * Same qualifying-day set the Calendar screen highlights - computed once here off the same
@@ -80,7 +89,6 @@ data class TogetherStats(
     val longestApart: GapInfo?
 )
 
-private const val REUNION_GAP_MILLIS = 30 * 60 * 1000L
 
 /** Arbitrary fixed date used only as a field-template base in computeWeeklyStreaks' previousWeekKey -
  * see its doc for why this must NOT be LocalDate.now(). Any date works; this one is a plain, safely
@@ -88,6 +96,13 @@ private const val REUNION_GAP_MILLIS = 30 * 60 * 1000L
 private val FIXED_WEEK_ANCHOR: LocalDate = LocalDate.of(2000, 1, 3)
 
 object StatsCalculator {
+
+    /** The apart-gap threshold a reunion must clear (on top of the same-calendar-day requirement - see
+     * [isSameCalendarDay]/[countReunions]). Public (not the old file-private constant) so
+     * ProximityForegroundService's live celebration check can read the SAME value instead of keeping its
+     * own independent copy in sync by hand on every future threshold change - the two already had to be
+     * edited together once (30min -> 1hr) with no compiler help catching a mismatch if one were missed. */
+    const val REUNION_GAP_MILLIS = 60 * 60 * 1000L
 
     /**
      * The effective end timestamp to credit an open (endedAt == null) session up to. Mirrors the SAME
@@ -151,7 +166,7 @@ object StatsCalculator {
             return TogetherStats(
                 totalHoursAllTime = 0.0, totalHoursThisWeek = 0.0, totalHoursThisMonth = 0.0,
                 currentDailyStreak = 0, longestDailyStreak = 0, currentWeeklyStreak = 0, longestWeeklyStreak = 0,
-                longestSessionMinutes = 0, reunionCount = 0, favoriteDayOfWeek = null, totalDaysTogether = 0,
+                longestSessionMinutes = 0, reunionCount = 0, perfectWeekCount = 0, favoriteDayOfWeek = null, totalDaysTogether = 0,
                 mostMetMonth = null, mostHoursMonth = null, longestSingleDay = null, togetherSince = togetherSince,
                 monthTrend = Trend.FLAT, avgDaysBetweenMeetups = null, longestApart = null
             )
@@ -194,9 +209,18 @@ object StatsCalculator {
         val currentWeekKey = weekKeyOf(today)
         val (currentWeeklyStreak, longestWeeklyStreak) = computeWeeklyStreaks(qualifyingWeeks, currentWeekKey)
 
+        // Stricter than the weekly streak above: a week only counts here if EVERY one of its 7 days is
+        // a qualifying day, not merely that the week itself has some together-time. weekKeyToMonday is
+        // the same Monday-anchoring longestWeeklyStreakRange already uses, so this can't drift from how
+        // a week's real calendar dates are resolved elsewhere.
+        val perfectWeekCount = qualifyingWeeks.count { weekKey ->
+            val monday = weekKeyToMonday(weekKey)
+            (0..6).all { monday.plusDays(it.toLong()) in qualifyingDays }
+        }
+
         val longestSessionMinutes = merged.maxOf { it.end - it.start } / 60_000L
 
-        val reunionCount = countReunions(merged)
+        val reunionCount = countReunions(merged, zone)
 
         val favoriteDayOfWeek = minutesPerDay.entries
             .groupBy { it.key.dayOfWeek }
@@ -245,6 +269,7 @@ object StatsCalculator {
             longestWeeklyStreak = longestWeeklyStreak,
             longestSessionMinutes = longestSessionMinutes,
             reunionCount = reunionCount,
+            perfectWeekCount = perfectWeekCount,
             favoriteDayOfWeek = favoriteDayOfWeek,
             totalDaysTogether = qualifyingDays.size,
             mostMetMonth = mostMetMonth,
@@ -255,6 +280,27 @@ object StatsCalculator {
             avgDaysBetweenMeetups = avgDaysBetweenMeetups,
             longestApart = longestApart
         )
+    }
+
+    /** How many of the couple's cumulative together-hours are attributable to manually-backfilled
+     * (isManual) sessions rather than genuine BLE detections - i.e. totalHoursAllTime(everything) minus
+     * totalHoursAllTime(BLE-detected only). Computed as a difference of two already-interval-merged
+     * totals (not a raw sum of manual sessions' own durations) so a manual entry that happens to overlap
+     * a real BLE-detected session covering the same moment is correctly NOT double-credited - both
+     * totals already dedupe overlap the same way, so only the genuinely "extra" manual contribution
+     * survives the subtraction. Used exclusively by Time Capsules' auto-adjusting anti-cheat threshold -
+     * see TimeCapsuleRepository.unlockEligible's doc for why this exact quantity is what keeps manual
+     * backfill from ever being able to accelerate an unlock. */
+    fun manualHoursCredit(
+        sessions: List<TogetherSession>,
+        now: Long = System.currentTimeMillis(),
+        zone: ZoneId = ZoneId.systemDefault(),
+        lastSeenAt: Long = 0L,
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+    ): Float {
+        val all = compute(sessions, now, zone, lastSeenAt, absenceTimeoutMillis).totalHoursAllTime
+        val verifiedOnly = compute(sessions.filter { !it.isManual }, now, zone, lastSeenAt, absenceTimeoutMillis).totalHoursAllTime
+        return (all - verifiedOnly).toFloat()
     }
 
     private data class Interval(val start: Long, val end: Long)
@@ -320,6 +366,25 @@ object StatsCalculator {
             }
         }
         return map
+    }
+
+    /** Finds the most recent PAST year in which today's month+day had any together-time, using the same
+     * per-day minute map the Calendar screen and [compute] both already use - see [buildDailyMinuteMap].
+     * Returns null if there's no matching day in any earlier year (including the common case of a couple
+     * who's simply not used the app long enough yet). */
+    fun onThisDayPreviousYear(
+        sessions: List<TogetherSession>,
+        now: Long = System.currentTimeMillis(),
+        zone: ZoneId = ZoneId.systemDefault(),
+        lastSeenAt: Long = 0L,
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+    ): OnThisDayInfo? {
+        val today = LocalDateTime.ofInstant(Instant.ofEpochMilli(now), zone).toLocalDate()
+        val map = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis)
+        return map.entries
+            .filter { it.key.year < today.year && it.key.monthValue == today.monthValue && it.key.dayOfMonth == today.dayOfMonth && it.value > 0L }
+            .maxByOrNull { it.key.year }
+            ?.let { OnThisDayInfo(it.key.year, it.value / 60.0) }
     }
 
     private fun computeDailyStreaks(qualifyingDays: Set<LocalDate>, today: LocalDate): Pair<Int, Int> {
@@ -400,14 +465,28 @@ object StatsCalculator {
         return current to longest
     }
 
-    private fun countReunions(mergedSorted: List<Interval>): Int {
+    /** A reunion is an apart-gap of at least [REUNION_GAP_MILLIS] where the apart-start (previous
+     * session's end) and the reunion itself (next session's start) fall on the SAME calendar day -
+     * e.g. apart for a 2-hour lunch break, back together that afternoon. An overnight gap (goodnight ->
+     * next morning), even though it's well over the threshold, spans two different calendar dates and
+     * deliberately does NOT count - see [isSameCalendarDay]. Meeting multiple times in one day (morning
+     * + afternoon + evening, each separated by a real gap) counts a reunion for each such gap. */
+    private fun countReunions(mergedSorted: List<Interval>, zone: ZoneId): Int {
         var count = 0
         for (i in 1 until mergedSorted.size) {
             val gap = mergedSorted[i].start - mergedSorted[i - 1].end
-            if (gap >= REUNION_GAP_MILLIS) count++
+            if (gap >= REUNION_GAP_MILLIS && isSameCalendarDay(mergedSorted[i - 1].end, mergedSorted[i].start, zone)) count++
         }
         return count
     }
+
+    /** Whether two instants fall on the same local calendar date in [zone]. Shared with
+     * ProximityForegroundService's live reunion-celebration check so the historical stat
+     * ([TogetherStats.reunionCount]) and the real-time vibration/overlay can never disagree about what
+     * counts as a reunion. */
+    fun isSameCalendarDay(a: Long, b: Long, zone: ZoneId = ZoneId.systemDefault()): Boolean =
+        LocalDateTime.ofInstant(Instant.ofEpochMilli(a), zone).toLocalDate() ==
+            LocalDateTime.ofInstant(Instant.ofEpochMilli(b), zone).toLocalDate()
 
     /** Turns a sorted list of distinct together-days (the same qualifying-day concept used for
      * [totalDaysTogether]/streaks - see [buildDailyMinuteMap]) into the gap list between each
