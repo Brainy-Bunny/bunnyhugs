@@ -368,8 +368,16 @@ class GattSyncManager(
             Milestone(
                 id = o.getString("id"),
                 label = o.getString("label"),
-                month = o.getInt("month"),
-                day = o.getInt("day"),
+                // BLOCKER fix: month/day here are WIRE DATA from the paired peer, unvalidated. An
+                // independent testing round found that an out-of-range month (e.g. 0 or 13) reaches
+                // MilestoneAlarmScheduler's YearMonth.of(year, month) uncaught, which - since it's called
+                // from TwogetherApp.onCreate on app start to re-arm every milestone's alarm - crashes the
+                // app on EVERY subsequent cold start with no in-app recovery path (only `pm clear`, which
+                // wipes all data, escapes it). Clamped to a always-constructible range here, at the one
+                // point this untrusted data enters the local DB from a peer device - see
+                // BackupManager.parseMilestones' matching fix for the same issue via a crafted backup file.
+                month = o.getInt("month").coerceIn(1, 12),
+                day = o.getInt("day").coerceIn(1, 31),
                 year = if (o.isNull("year")) null else o.getInt("year"),
                 createdAt = o.getLong("createdAt"),
                 updatedAt = o.getLong("updatedAt"),

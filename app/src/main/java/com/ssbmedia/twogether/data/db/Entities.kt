@@ -93,15 +93,18 @@ data class Moment(
     val syncId: String = UUID.randomUUID().toString(),
     /**
      * True when this Moment row arrived via GATT sync from the partner's phone rather than being taken
-     * on this device. DELIBERATE SCOPE LIMITATION (flagged in the batch report): only the moment's
-     * metadata (syncId/takenAt/existence) is synced, never the actual photo bytes - transferring a
-     * multi-megabyte JPEG over this text-chunk BLE protocol (~180 byte chunks, write+ack per chunk)
-     * would take minutes per photo, which is impractical. A remote-stub row's [photoUri] points to a
-     * path that only exists on the ORIGINAL device, so it never resolves to a real file here. This still
-     * lets the partner see that the moment exists (grouped correctly by date, included in the milestone
-     * retrospective) and write their own note on it (Feature D's core ask) even without the pixels - the
-     * UI must check local file existence before trying to render it as an image and show a clear
-     * "photo is on {partner}'s phone" placeholder instead of a broken image.
+     * on this device. ORIGINAL SCOPE LIMITATION, now superseded by Feature 2 (see [photoDownloaded]'s own
+     * doc, right below): at first, only the moment's metadata (syncId/takenAt/existence) was synced,
+     * never the actual photo bytes - a downscaled copy (see ImageDownscaler) IS now transferred over this
+     * text-chunk BLE protocol via a dedicated photo-transfer phase once both phones are together, into a
+     * deterministic syncId-derived LOCAL path (see MomentRepository.localPhotoFile) that DOES resolve to
+     * a real file here once that transfer completes - [photoUri] is never the original device's own path.
+     * [isRemote] itself still only ever means "did the metadata arrive via sync" (see [photoDownloaded]
+     * for "do the actual bytes exist locally yet") - a remote-stub row still lets the partner see that
+     * the moment exists (grouped correctly by date, included in the milestone retrospective) and write
+     * their own note on it (Feature D's core ask) even before the transfer completes; the UI checks
+     * [photoDownloaded] (not this flag) before rendering it as an image, showing a clear "photo is on
+     * {partner}'s phone" placeholder in the meantime.
      */
     val isRemote: Boolean = false,
     /**

@@ -1,9 +1,8 @@
 package com.ssbmedia.twogether.ui.backup
 
+import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.size
@@ -23,6 +22,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.data.backup.BackupManager
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /** See RestoreBackupButton's own doc for why this state deliberately does NOT live in a composable-local
@@ -54,6 +54,34 @@ private object RestoreFlowState {
 private const val RESTORE_CANDIDATE_EXPIRY_MILLIS = 3 * 60_000L
 
 /**
+ * BUG fix: an independent testing round found the ORIGINAL "picked file lost on PIN relock" bug (see
+ * RestoreBackupButton's own doc, fix (1)) was never actually fixed by moving state into
+ * [RestoreFlowState] - that singleton only protects a candidate that has already been SET. The picker's
+ * `rememberLauncherForActivityResult` registration itself lived on whichever composable called it
+ * (SettingsScreen/PairingScreen's RestoreBackupButton) - and that composable gets DISPOSED by a PIN
+ * relock (ProcessLifecycleOwner.onStop fires the instant the SAF picker takes foreground, immediately
+ * re-arming AppLockManager, immediately swapping MainActivity to PinLockScreen) reliably BEFORE the
+ * system picker activity ever returns its result. So the callback that would have set
+ * RestoreFlowState.restoreCandidate never ran at all - not a state-loss bug, a registration-loss bug.
+ *
+ * The real fix has to move the launcher itself somewhere that survives that swap: MainActivity, which
+ * lives for the whole Activity lifecycle regardless of which screen it's currently composing (see
+ * MainActivity's own wiring of [launchPicker]). This object is just the trigger channel between that
+ * Activity-level launcher and RestoreBackupButton, however deep in composition (and on whichever of the
+ * two hosting screens) it currently is.
+ */
+object RestorePickerHost {
+    internal var launchPicker: (() -> Unit)? = null
+}
+
+/** Called from MainActivity's Activity-level SAF picker launcher once a file is actually picked - see
+ * [RestorePickerHost]'s doc for why the launcher itself lives there, not in RestoreBackupButton. */
+fun onRestoreFilePicked(context: Context, uri: Uri) {
+    RestoreFlowState.restoreCandidate = uri to queryDisplayName(context, uri)
+    RestoreFlowState.candidatePickedAtMillis = System.currentTimeMillis()
+}
+
+/**
  * Self-contained "Restore from backup" trigger + its whole dialog flow (pick file -> confirm
  * overwrite -> progress -> result/restart), shared between SettingsScreen (reachable while paired) and
  * PairingScreen's onboarding landing (reachable while UNPAIRED, e.g. right after a factory reset /
@@ -79,37 +107,51 @@ private const val RESTORE_CANDIDATE_EXPIRY_MILLIS = 3 * 60_000L
  *
  * BUG fix: this whole flow's state (picked-file confirmation, in-progress, result) lives in
  * [RestoreFlowState], NOT a plain `remember{}` here - see that object's own doc for why a
- * composable-local `remember` isn't enough. Two real, live-reproduced bugs came from this: (1) the SAF
- * picker below briefly backgrounds the whole app, which re-arms PIN lock if it's enabled, swapping
- * MainActivity to PinLockScreen BEFORE the user ever saw the "Restore this backup?" confirm dialog -
- * unlocking then dropped them on Home with the picked file silently forgotten. (2) A SUCCESSFUL restore
- * clears pairing, which (exactly as this file's own comment above already predicted for the restore
- * OPERATION itself) flips MainActivity to PairingScreen - but that same flip was ALSO disposing the
- * composable meant to show the "Restore complete / Restart now" dialog right as the result arrived,
- * so a successful restore could silently finish with no confirmation and no restart ever triggered.
+ * composable-local `remember` isn't enough. Three real, live-reproduced bugs came from this general
+ * class of problem: (1) the SAF picker briefly backgrounds the whole app, which re-arms PIN lock if it's
+ * enabled, swapping MainActivity to PinLockScreen BEFORE the user ever saw the "Restore this backup?"
+ * confirm dialog - unlocking then dropped them on Home with the picked file silently forgotten. Moving
+ * the CANDIDATE STATE into a singleton alone did NOT actually fix this (an independent testing round
+ * caught that regression) - the picker's own launcher registration was still disposed before it could
+ * return a result; see [RestorePickerHost]'s doc for the real fix, which moves the launcher itself up to
+ * MainActivity. (2) A SUCCESSFUL restore clears pairing, which (exactly as this file's own comment above
+ * already predicted for the restore OPERATION itself) flips MainActivity to PairingScreen - but that
+ * same flip was ALSO disposing the composable meant to show the "Restore complete / Restart now" dialog
+ * right as the result arrived, so a successful restore could silently finish with no confirmation and no
+ * restart ever triggered. Fixed by [RestoreFlowState] surviving that flip AND (separately) by
+ * PairingViewModel resetting to LANDING on every fresh entry, so the flip always lands somewhere that
+ * hosts this same button - see PairingScreen's own fix doc.
  */
 @Composable
 fun RestoreBackupButton(trigger: @Composable (onClick: () -> Unit) -> Unit) {
     val context = LocalContext.current
 
-    val pickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) {
-            RestoreFlowState.restoreCandidate = uri to queryDisplayName(context, uri)
-            RestoreFlowState.candidatePickedAtMillis = System.currentTimeMillis()
-        }
-    }
+    // BUG fix: no longer owns a rememberLauncherForActivityResult here at all - see RestorePickerHost's
+    // doc for why that registration living on this (disposable) composable was the actual bug.
+    trigger { RestorePickerHost.launchPicker?.invoke() }
 
-    trigger { pickerLauncher.launch(arrayOf("*/*")) }
-
-    // BUG fix: see RESTORE_CANDIDATE_EXPIRY_MILLIS' own doc - discards a stale unconfirmed candidate
-    // before it can ambush the user, checked every time this composable (re)enters composition (i.e.
-    // every time the user navigates to a screen that hosts this button).
-    LaunchedEffect(Unit) {
-        val pickedAt = RestoreFlowState.candidatePickedAtMillis
-        if (RestoreFlowState.restoreCandidate != null && pickedAt != 0L &&
-            System.currentTimeMillis() - pickedAt > RESTORE_CANDIDATE_EXPIRY_MILLIS
-        ) {
+    // BUG fix: an independent testing round found the entry-only LaunchedEffect(Unit) version of this
+    // check never actually fired in the default configuration (PIN lock off) - backgrounding the app
+    // doesn't dispose/recompose this composable at all when PIN is off, so "checked once on entry" never
+    // ran again after the screen was first opened, and the modal confirm dialog just sat there
+    // indefinitely instead of expiring. Keyed on the candidate itself (not Unit) and using delay()
+    // instead: fires once when a candidate first appears (covering "already stale by the time this
+    // screen composes" too, e.g. arriving here long after a relock-then-unlock elsewhere), then
+    // suspends for exactly the remaining window and clears it - no polling, and no dependency on this
+    // composable being disposed/recomposed for the check to ever run again. (Compose's own frame clock
+    // naturally pauses this delay while the app is backgrounded, which is fine: the clear only needs to
+    // land before the user could ever SEE the stale dialog again, i.e. once the app is foregrounded.)
+    LaunchedEffect(RestoreFlowState.restoreCandidate) {
+        val candidate = RestoreFlowState.restoreCandidate ?: return@LaunchedEffect
+        val remaining = RESTORE_CANDIDATE_EXPIRY_MILLIS - (System.currentTimeMillis() - RestoreFlowState.candidatePickedAtMillis)
+        if (remaining <= 0) {
             RestoreFlowState.restoreCandidate = null
+        } else {
+            delay(remaining)
+            // Only clear if this is still the SAME candidate - guards against a new pick replacing it
+            // while this coroutine was suspended (that pick's own LaunchedEffect instance owns clearing
+            // its own expiry; this one must not clobber a newer, still-fresh candidate).
+            if (RestoreFlowState.restoreCandidate == candidate) RestoreFlowState.restoreCandidate = null
         }
     }
 

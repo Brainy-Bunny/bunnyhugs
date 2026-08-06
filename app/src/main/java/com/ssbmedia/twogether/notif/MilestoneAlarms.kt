@@ -91,9 +91,19 @@ object MilestoneAlarmScheduler {
         return date.atTime(NOTIFY_HOUR, 0).atZone(zone).toInstant().toEpochMilli()
     }
 
+    /** BLOCKER fix, defense-in-depth: month/day are validated at every known ingestion point now
+     * (BackupManager.parseMilestones, GattSyncManager.deserializeMilestones - see their own docs), but
+     * this is the one function that actually calls YearMonth.of/LocalDate.of, and it's called from
+     * TwogetherApp.onCreate on every single app start to re-arm every milestone's alarm - an uncaught
+     * DateTimeException here (month outside 1-12, or day outside 1-31 - LocalDate.of throws on day=0
+     * too, minOf(day, maxDay) alone never guarded that) used to crash the app on EVERY subsequent cold
+     * start with no in-app recovery path. Clamping here too means a future ingestion path this app
+     * doesn't yet have (or a regression in an existing one) degrades to "the reminder lands on the
+     * nearest valid day" instead of "the app never opens again." */
     private fun safeDate(year: Int, month: Int, day: Int): LocalDate {
-        val maxDay = YearMonth.of(year, month).lengthOfMonth()
-        return LocalDate.of(year, month, minOf(day, maxDay))
+        val safeMonth = month.coerceIn(1, 12)
+        val maxDay = YearMonth.of(year, safeMonth).lengthOfMonth()
+        return LocalDate.of(year, safeMonth, day.coerceIn(1, maxDay))
     }
 
     internal fun rescheduleForNextYear(context: Context, milestoneId: String, label: String, month: Int, day: Int) {

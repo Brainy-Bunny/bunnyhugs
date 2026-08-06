@@ -744,6 +744,14 @@ object BackupManager {
                 lastPartnerEmoji = p.optStringOrNull("lastPartnerEmoji"),
                 lastUnpairedAt = p.optLong("lastUnpairedAt", 0L)
             )
+            // SECURITY fix: see PairingSessionGeneration's own doc - an independent testing round found
+            // a retained PairingViewModel (still alive since an earlier, already-completed pairing flow
+            // in this same process) could resurface with its stale mid-flow step/pendingCode the moment
+            // MainActivity swaps back to PairingScreen after this restore clears pairing above - letting
+            // the user land on a dead-end step and silently re-pair with the pre-restore secret via
+            // "Skip for now", directly violating the "a restore ALWAYS leaves the phone unpaired"
+            // guarantee this whole function's SECURITY comments document.
+            com.ssbmedia.twogether.ui.onboarding.PairingSessionGeneration.value++
 
             val s = parsed.settingsJson
             ServiceLocator.settingsStore.restoreRaw(
@@ -962,8 +970,18 @@ object BackupManager {
             Milestone(
                 id = o.getString("id"),
                 label = o.getString("label"),
-                month = o.getInt("month"),
-                day = o.getInt("day"),
+                // BLOCKER fix: month/day here are UNTRUSTED data from the backup zip's manifest.json,
+                // same trust boundary as photoUri/syncId above. An independent testing round found that
+                // an out-of-range month (e.g. 0 or 13) reaches MilestoneAlarmScheduler's
+                // YearMonth.of(year, month) uncaught, which - since it's called on every app start to
+                // re-arm every milestone's alarm - crashes the app on EVERY subsequent cold start with no
+                // in-app recovery path (only `pm clear`, which wipes all data, escapes it). A crafted
+                // backup with a single bad milestone permanently bricked the app the moment it was
+                // restored. Clamped to an always-constructible range here, at parse time, same as
+                // GattSyncManager.deserializeMilestones' matching fix for the identical issue reachable
+                // via a malicious paired peer over BLE.
+                month = o.getInt("month").coerceIn(1, 12),
+                day = o.getInt("day").coerceIn(1, 31),
                 year = if (o.isNull("year")) null else o.optInt("year"),
                 createdAt = o.getLong("createdAt"),
                 updatedAt = o.getLong("updatedAt"),

@@ -8,7 +8,7 @@ a shared space for date ideas, memories, and streaks.
 
 ## Install (both phones)
 
-1. Copy the current `Twogether-<version>.apk` (e.g. `Twogether-2.2.apk`) to each
+1. Copy the current `Twogether-<version>.apk` (e.g. `Twogether-2.3.apk`) to each
    phone (email it to yourself, AirDrop-equivalent, USB, Google Drive — anything).
    The version in the filename always matches the latest build in this folder;
    after that, the in-app auto-updater keeps both phones current automatically.

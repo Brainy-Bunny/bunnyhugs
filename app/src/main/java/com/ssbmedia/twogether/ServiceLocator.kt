@@ -13,6 +13,8 @@ import com.ssbmedia.twogether.data.repo.MomentNoteRepository
 import com.ssbmedia.twogether.data.repo.MomentRepository
 import com.ssbmedia.twogether.data.repo.SessionRepository
 import com.ssbmedia.twogether.data.repo.TimeCapsuleRepository
+import android.util.Log
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -31,7 +33,20 @@ object ServiceLocator {
      * writes to pairingStore, which flips MainActivity's nav state and disposes SettingsScreen (and
      * cancels its viewModelScope) practically immediately; the rest of unpair()'s teardown (stopping
      * the foreground service, emitting the unpaired event) must not be cancelled by that. */
-    val applicationScope: CoroutineScope by lazy { CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate) }
+    /** BUG fix: an independent testing round found several distinct crash sites (setPin, clearPin,
+     * unpair, restoreBackupDurable's DataStore calls, milestone-alarm scheduling on app start) that all
+     * traced back to the same root cause - this scope had no CoroutineExceptionHandler, so ANY uncaught
+     * exception on it (a genuine DataStore IOException, a malformed-data crash, anything) killed the
+     * whole app process instead of just failing that one operation. Each of those call sites is also
+     * being hardened individually where it matters for user-visible feedback (a failed PIN save should
+     * show an error, not just "not crash") - this is the last-resort net underneath all of them, so a
+     * FUTURE uncaught exception here degrades to a log line instead of a fatal crash by default. */
+    private val applicationScopeExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        Log.e("ServiceLocator", "Uncaught exception on applicationScope", throwable)
+    }
+    val applicationScope: CoroutineScope by lazy {
+        CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate + applicationScopeExceptionHandler)
+    }
 
     val database: AppDatabase by lazy { AppDatabase.get(appContext) }
 

@@ -289,7 +289,7 @@ fun HomeScreen(
 
     // lastSeenAt clamps an open session's live duration to the last confirmed sighting + absence
     // timeout, matching Home's own effectivelyTogether staleness check below - see
-    // StatsCalculator.effectiveOpenSessionCutoff's doc for why (a stale/orphaned open session must
+    // StatsCalculator.effectiveOpenSessionEnd's doc for why (a stale/orphaned open session must
     // never silently "grow" forever just because something read it).
     val stats = remember(sessions, now, proximityState.lastSeenAt) {
         StatsCalculator.compute(sessions, now, lastSeenAt = proximityState.lastSeenAt)

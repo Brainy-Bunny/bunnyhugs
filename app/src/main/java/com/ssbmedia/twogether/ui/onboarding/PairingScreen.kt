@@ -121,9 +121,37 @@ class PairingViewModel(private val pairingStore: PairingStore) : ViewModel() {
 
 private val emojiOptions = listOf("💕", "😍", "🥰", "💛", "🐢", "🐰", "🌸", "✨")
 
+/**
+ * SECURITY fix: an independent testing round found that [PairingViewModel], scoped via `viewModel()` to
+ * MainActivity's own Activity-level ViewModelStore, survives being swapped out of composition once
+ * pairing succeeds (MainActivity moves to TwogetherNavHost) and is silently RETAINED there - so if
+ * pairing is later cleared (unpair, or a backup restore) and MainActivity swaps back to PairingScreen,
+ * plain `viewModel()` resolves to that SAME stale instance, with whatever step/pendingCode it was last
+ * left at mid-flow. Live-reproduced: this landed the user on the PERMISSIONS step (no Back button,
+ * doesn't host "Restore from a backup") with the OLD pendingCode still set - tapping "Skip for now"
+ * silently re-paired the phone with the pre-restore/pre-unpair secret, directly violating the documented
+ * "a restore/unpair ALWAYS leaves the phone unpaired" guarantee (see BackupManager's own SECURITY
+ * comments).
+ *
+ * Fixed by keying PairingViewModel's `viewModel()` call on this generation counter instead of adding a
+ * manual reset function: bumping it (see unpair()'s and restoreBackup()'s own call sites) makes Compose
+ * create a genuinely FRESH ViewModel instance the next time PairingScreen composes, discarding the stale
+ * one entirely - no separate "did we already reset for this session" bookkeeping needed. Deliberately
+ * in-memory only, NOT persisted: it must survive a plain screen rotation (a user mid-onboarding rotating
+ * their phone must NOT lose their in-progress step/typed fields - rotation recreates the Activity, but
+ * this singleton, like AppLockManager/RestoreFlowState, is retained across that) while still being
+ * fresh-per-process, since a genuine unpair/restore always requires the app to already be running.
+ */
+object PairingSessionGeneration {
+    internal var value: Int = 0
+}
+
 @Composable
 fun PairingScreen(onPaired: () -> Unit) {
-    val vm: PairingViewModel = viewModel(factory = SimpleViewModelFactory { PairingViewModel(ServiceLocator.pairingStore) })
+    val vm: PairingViewModel = viewModel(
+        key = "pairing-${PairingSessionGeneration.value}",
+        factory = SimpleViewModelFactory { PairingViewModel(ServiceLocator.pairingStore) }
+    )
     val context = LocalContext.current
     val lastConnection by vm.lastConnection.collectAsState()
 

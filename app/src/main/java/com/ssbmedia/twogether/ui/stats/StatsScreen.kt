@@ -70,7 +70,7 @@ fun StatsScreen(
     val sessions by vm.sessions.collectAsState()
     val proximityState by vm.proximityState.collectAsState()
     // lastSeenAt clamps an open session's live duration to the last confirmed sighting + absence
-    // timeout - see StatsCalculator.effectiveOpenSessionCutoff's doc.
+    // timeout - see StatsCalculator.effectiveOpenSessionEnd's doc.
     val stats = remember(sessions, proximityState.lastSeenAt) {
         StatsCalculator.compute(sessions, lastSeenAt = proximityState.lastSeenAt)
     }

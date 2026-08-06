@@ -150,7 +150,7 @@ fun CalendarScreen(
     var sessionPendingDelete by remember { mutableStateOf<TogetherSession?>(null) }
 
     // lastSeenAt clamps an open session's live duration so a stale/orphaned open session can't inflate
-    // day totals - see StatsCalculator.effectiveOpenSessionCutoff's doc.
+    // day totals - see StatsCalculator.effectiveOpenSessionEnd's doc.
     val minutesPerDay = remember(sessions, proximityState.lastSeenAt) {
         StatsCalculator.buildDailyMinuteMap(sessions, zone = zone, lastSeenAt = proximityState.lastSeenAt)
     }

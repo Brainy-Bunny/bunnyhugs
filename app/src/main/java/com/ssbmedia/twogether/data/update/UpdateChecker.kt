@@ -123,9 +123,20 @@ object UpdateChecker {
             // "app-release.apk" parsed to the non-blank-but-garbled "app-release"). Now requires the
             // parsed result to actually look like a version (starts with a digit) before using it,
             // falling back to the tag exactly as originally documented for anything else.
+            //
+            // BUG fix: a later testing round found the strip above was case-SENSITIVE
+            // (removePrefix/removeSuffix have no ignoreCase overload in the stdlib) while the asset match
+            // above (endsWith(".apk", ignoreCase = true)) is case-insensitive - so an asset literally
+            // named "Twogether-2.2.APK" matched the search but then failed to strip its suffix, leaving
+            // "2.2.APK" as the parsed result; since '2' is still a digit, the guard above would have let
+            // that garbled string straight through as the shown version. Stripped manually with an
+            // explicit ignoreCase check on both ends instead, so casing in the asset name can never affect
+            // the result.
             val versionName = apkAssetName
-                ?.removePrefix("Twogether-")
-                ?.removeSuffix(".apk")
+                ?.let { name ->
+                    val withoutPrefix = if (name.startsWith("Twogether-", ignoreCase = true)) name.substring("Twogether-".length) else name
+                    if (withoutPrefix.endsWith(".apk", ignoreCase = true)) withoutPrefix.dropLast(4) else withoutPrefix
+                }
                 ?.takeIf { it.isNotBlank() && it.first().isDigit() }
                 ?: tagName
 

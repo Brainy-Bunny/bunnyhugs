@@ -78,7 +78,7 @@ fun BadgesScreen(onBack: () -> Unit) {
     val proximityState by vm.proximityState.collectAsState()
     val unlockDates by vm.unlockDates.collectAsState()
     // lastSeenAt clamps an open session's live duration so badge progress can't be inflated by a
-    // stale/orphaned open session - see StatsCalculator.effectiveOpenSessionCutoff's doc.
+    // stale/orphaned open session - see StatsCalculator.effectiveOpenSessionEnd's doc.
     val stats = remember(sessions, proximityState.lastSeenAt) {
         StatsCalculator.compute(sessions, lastSeenAt = proximityState.lastSeenAt)
     }

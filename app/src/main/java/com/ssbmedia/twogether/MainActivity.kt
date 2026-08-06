@@ -4,6 +4,7 @@ import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,6 +33,8 @@ import com.ssbmedia.twogether.data.datastore.ThemeMode
 import com.ssbmedia.twogether.lock.AppLockManager
 import com.ssbmedia.twogether.notif.Notifications
 import com.ssbmedia.twogether.service.ProximityForegroundService
+import com.ssbmedia.twogether.ui.backup.RestorePickerHost
+import com.ssbmedia.twogether.ui.backup.onRestoreFilePicked
 import com.ssbmedia.twogether.ui.lock.PinLockScreen
 import com.ssbmedia.twogether.ui.nav.TwogetherNavHost
 import com.ssbmedia.twogether.ui.onboarding.PairingScreen
@@ -42,8 +45,17 @@ class MainActivity : ComponentActivity() {
     private val cameraTrigger = mutableIntStateOf(0)
     private val milestoneTrigger = mutableStateOf<String?>(null)
 
+    // BUG fix: registered here as an Activity-level property (constructed before onCreate/onStart, per
+    // AndroidX's own requirement that registerForActivityResult be called before STARTED), NOT inside any
+    // composable - see RestorePickerHost's own doc for why. This is what actually survives a PIN relock
+    // happening mid-pick; the composable that triggers it does not.
+    private val restorePickerLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) onRestoreFilePicked(this, uri)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        RestorePickerHost.launchPicker = { restorePickerLauncher.launch(arrayOf("*/*")) }
 
         if (intent?.getBooleanExtra(Notifications.EXTRA_OPEN_CAMERA, false) == true) {
             cameraTrigger.intValue = 1

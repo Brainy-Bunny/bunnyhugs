@@ -53,7 +53,7 @@ class CapsulesViewModel : ViewModel() {
     val sessions = ServiceLocator.sessionRepository.observeAll()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     // Live proximity read (same source Home uses for its staleness check) so an open session's
-    // eligibility hours can be clamped the same way - see StatsCalculator.effectiveOpenSessionCutoff's
+    // eligibility hours can be clamped the same way - see StatsCalculator.effectiveOpenSessionEnd's
     // doc. Without this, a stale/orphaned open session (service killed while together, permission
     // revoked so it never restarts to self-heal) could inflate cumulative hours enough to permanently
     // and irreversibly unlock a capsule early, purely from elapsed wall-clock reading time.
@@ -70,7 +70,7 @@ class CapsulesViewModel : ViewModel() {
             combine(sessions, proximityState) { list, state -> list to state }.collect { (list, state) ->
                 // state.lastSeenAt <= 0L means proximityState's cold DataStore-backed flow hasn't
                 // produced its first real emission yet and we're still looking at the stateIn default
-                // ProximityPersistedState() - see StatsCalculator.effectiveOpenSessionCutoff's doc: that
+                // ProximityPersistedState() - see StatsCalculator.effectiveOpenSessionEnd's doc: that
                 // intentionally falls back to an UNCLAMPED cutoff when lastSeenAt isn't available yet,
                 // which is fine for every other (display-only, self-correcting) screen but not here,
                 // since this collector performs an irreversible unlockedAt write. Skip until a genuine

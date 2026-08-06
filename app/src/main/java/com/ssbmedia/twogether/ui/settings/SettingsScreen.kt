@@ -128,14 +128,25 @@ class SettingsViewModel : ViewModel() {
             // once, carrying whether the save actually succeeded so the dialog can show an error and let
             // the user retry instead of silently closing as if the PIN had been set.
             try {
-                ServiceLocator.settingsStore.setPin(PinUtil.hash(pin))
                 // AppLockManager.isLocked defaults to true and is otherwise only cleared by successfully
                 // entering the PIN on PinLockScreen. Without this, turning PIN lock on for the first time
                 // (isLocked has never been flipped false yet) immediately re-shows the lock screen right
                 // after the user just typed the same PIN into the "set PIN" dialog - forcing them to
                 // enter it twice in a row for no reason. The user is already authenticated in this
                 // session (they're sitting in Settings), so unlock immediately.
+                //
+                // BUG fix: unlock() now runs BEFORE the DataStore write below, not after - an independent
+                // testing round live-reproduced a race where the settings Flow's pinEnabled=true emission
+                // (collected separately by MainActivity) could land before this unlock() call did, so
+                // MainActivity's `when` briefly evaluated pinEnabled=true && isLocked=true (still) ->
+                // swapped to PinLockScreen -> then immediately back once unlock() landed - but
+                // TwogetherNavHost is a fresh composable instance each time that branch is (re)entered, so
+                // the app lost its back stack and bounced to Home, with BatteryOptimizationGate re-firing
+                // as a visible side effect. Unlocking first means isLocked is already false by the time
+                // pinEnabled's write is ever observed, so that brief "both true" window can't occur at all
+                // regardless of dispatch timing - not just a narrower window, a structurally closed one.
                 AppLockManager.unlock()
+                ServiceLocator.settingsStore.setPin(PinUtil.hash(pin))
                 // BUG fix: onDone used to be called synchronously right after launching this coroutine
                 // (i.e. the dialog closed and the "App lock (PIN)" switch was shown immediately), NOT after
                 // the write above actually completed. Since the hash alone can take 1-3s, the switch would
@@ -191,6 +202,11 @@ class SettingsViewModel : ViewModel() {
                 it.copy(isTogether = false, continuousTogetherSince = 0L, currentSessionId = -1L, pendingReunionCelebration = false)
             }
             ServiceLocator.pairingStore.unpair()
+            // SECURITY fix: see PairingSessionGeneration's own doc - without this, the PairingViewModel
+            // instance retained since the original pairing flow could resurface with stale mid-flow
+            // state (step/pendingCode) the next time MainActivity swaps back to PairingScreen, letting
+            // "Skip for now" silently re-pair with the OLD secret instead of landing cleanly on LANDING.
+            com.ssbmedia.twogether.ui.onboarding.PairingSessionGeneration.value++
             AppEvents.emitUnpaired()
             onDone()
         }
@@ -275,7 +291,12 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
             }
 
             SettingsSection(title = "Notifications") {
-                SettingsRow(label = "Notifications enabled", subtitle = "15-minute photo nudges and updates") {
+                // BUG fix: subtitle used to say "...and updates", but settings.notificationsEnabled is
+                // only ever read in one place (ProximityForegroundService.checkPhotoReminder) - it has
+                // never actually gated the app-update notification, milestone notifications, or anything
+                // else. Fixed the copy to describe what this switch actually controls rather than change
+                // its scope to match the old (aspirational, never-implemented) copy.
+                SettingsRow(label = "Notifications enabled", subtitle = "15-minute photo nudges") {
                     Switch(checked = settings.notificationsEnabled, onCheckedChange = { vm.setNotificationsEnabled(it) })
                 }
                 SettingsRow(label = "Default snooze length", subtitle = "${settings.defaultSnoozeMinutes} minutes") {
