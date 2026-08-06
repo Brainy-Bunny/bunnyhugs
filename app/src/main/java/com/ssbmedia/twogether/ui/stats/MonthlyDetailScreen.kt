@@ -75,7 +75,11 @@ fun MonthlyDetailScreen(initialMetric: String, onBack: () -> Unit) {
     val sessions by vm.sessions.collectAsState()
     val proximityState by vm.proximityState.collectAsState()
 
-    var metric by remember {
+    // BUG fix: was plain `remember`, unlike hasJumpedToLatest below - an independent audit round noted
+    // the days/hours toggle silently reset back to initialMetric on a config change (rotation) that
+    // recreates the Activity, discarding whatever the user had actually selected. rememberSaveable
+    // (enums are Serializable by default on the JVM, no custom Saver needed) survives that.
+    var metric by rememberSaveable {
         mutableStateOf(if (initialMetric == "hours") MonthlyMetric.HOURS else MonthlyMetric.DAYS)
     }
 

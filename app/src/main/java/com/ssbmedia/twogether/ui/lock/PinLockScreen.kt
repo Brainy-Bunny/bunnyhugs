@@ -174,13 +174,28 @@ private fun ForgotPinContent(onCancel: () -> Unit, onReset: () -> Unit) {
                 scope.launch {
                     try {
                         val pairing = ServiceLocator.pairingStore.current()
+                        // BUG fix: PinLockScreen (and this reset path with it) only became reachable
+                        // while UNPAIRED once the PIN-lock/pairing branch order in MainActivity was fixed
+                        // to close a security gap (PIN used to be silently skippable by unpairing first).
+                        // That surfaced a lockout this path never had to handle before: unpair() clears
+                        // pairSecretHash outright (moving it to lastSecretHash instead - see PairingStore's
+                        // own doc), so checking ONLY pairSecretHash here made a real, correct pairing code
+                        // always fail to reset the PIN once the phone was unpaired - permanently locking
+                        // the user out of their own app (short of clearing all app data). Falls back to the
+                        // last connection's snapshot, which is exactly "the code I originally paired with"
+                        // from the user's own perspective and survives an unpair for precisely this kind
+                        // of recovery (see LastConnectionInfo's doc). A restore, unlike unpair, forces
+                        // BOTH hashes null AND pinEnabled false together (see BackupManager's own SECURITY
+                        // doc) - so this fallback is never even reachable in that case, no risk there.
+                        val lastConnection = ServiceLocator.pairingStore.currentLastConnection()
+                        val secretHashToCheck = pairing.pairSecretHash?.takeIf { it.isNotBlank() } ?: lastConnection.secretHash
                         // Accepts both the current strengthened hash and the old bare-SHA-256 hash a
                         // device paired before the PBKDF2 upgrade would still have stored - see
                         // Hashing.matchesPairingCode for why this is deliberately NOT auto-migrated the
                         // way the PIN hash is. BLOCKER fix: off Main - see PinUtil.hash's doc, same
                         // 600k-round PBKDF2 cost applies here.
                         val codeMatches = withContext(Dispatchers.Default) {
-                            Hashing.matchesPairingCode(code, pairing.pairSecretHash)
+                            Hashing.matchesPairingCode(code, secretHashToCheck)
                         }
                         if (codeMatches) {
                             AppLockManager.resetFailedPinAttempts()

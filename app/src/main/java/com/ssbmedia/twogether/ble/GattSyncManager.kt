@@ -17,6 +17,7 @@ import com.ssbmedia.twogether.data.db.DEFAULT_LIST_ID
 import com.ssbmedia.twogether.data.db.DateIdea
 import com.ssbmedia.twogether.data.db.ListCategory
 import com.ssbmedia.twogether.data.db.Milestone
+import com.ssbmedia.twogether.notif.MilestoneAlarmScheduler
 import com.ssbmedia.twogether.data.db.Moment
 import com.ssbmedia.twogether.data.db.MomentNote
 import com.ssbmedia.twogether.data.db.TogetherSession
@@ -31,6 +32,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -165,7 +167,13 @@ class GattSyncManager(
         val momentsArr = root.optJSONArray("moments")
         momentRepository.mergeRemoteStubs(deserializeMoments(momentsArr))
         momentNoteRepository.mergeRemote(deserializeNotes(root.optJSONArray("notes")), deviceId)
-        milestoneRepository.mergeRemote(deserializeMilestones(root.optJSONArray("milestones")))
+        // BUG fix: an independent audit round found milestones arriving via sync never got their yearly
+        // alarm armed until the next cold start/boot, unlike every other way a Milestone enters the DB
+        // (local add, backup restore, app start) - all of which call MilestoneAlarmScheduler right away.
+        // Arms only what was actually upserted here, not the whole table, for the same reason
+        // BackupManager.scheduleAll is only ever called once per restore rather than on every sync.
+        val upsertedMilestones = milestoneRepository.mergeRemote(deserializeMilestones(root.optJSONArray("milestones")))
+        MilestoneAlarmScheduler.scheduleAll(context, upsertedMilestones.filter { !it.deleted })
         return parseRemoteMomentInfo(momentsArr)
     }
 
@@ -753,7 +761,20 @@ class GattSyncManager(
 
                 val buffer = synchronized(serverLock) { serverIncoming.getOrPut(addr) { ByteArrayOutputStream() } }
                 val flag = value[0]
-                if (value.size > 1) synchronized(serverLock) { buffer.write(value, 1, value.size - 1) }
+                if (value.size > 1) {
+                    // BUG fix: see metadataResponseSignal's own doc (client-side) - mirrors
+                    // serverPhotoIncoming's own cap (handleServerPhotoChunk below); this buffer had no
+                    // equivalent one, so an already-authenticated client that never sent a LAST flag could
+                    // grow it unbounded.
+                    synchronized(serverLock) {
+                        if (buffer.size() + value.size - 1 > MAX_SYNC_JSON_BYTES) {
+                            Log.w(TAG, "Incoming metadata payload from client exceeded sanity cap - dropping")
+                            buffer.reset()
+                        } else {
+                            buffer.write(value, 1, value.size - 1)
+                        }
+                    }
+                }
                 if (flag == BleConstants.CHUNK_FLAG_LAST) {
                     val raw = synchronized(serverLock) {
                         serverIncoming.remove(addr)
@@ -996,6 +1017,36 @@ class GattSyncManager(
     private var photoDoneSignal: CompletableDeferred<Unit>? = null
     private var clientPhotoReceivedCount = 0
     private var clientPhotoExpectedCount = 0
+    // BUG fix: an independent audit round found the JSON metadata phase had neither of the two
+    // defenses the photo phase already has (MAX_PHOTO_FRAME_BYTES + PHOTO_PHASE_TIMEOUT_MILLIS) - a
+    // malformed/misbehaving already-authenticated peer that kept sending chunks without ever sending
+    // the LAST flag could grow clientIncoming unbounded, and there was no timeout on waiting for the
+    // server's response at all, so a wedged sync could hold this device's single-sync-attempt-at-a-time
+    // guard (see connectAsClient callers) open indefinitely instead of failing and releasing it for the
+    // next attempt. Completed the moment clientIncoming's LAST flag arrives (see onCharacteristicChanged)
+    // - mirrors clientPhotoSendComplete/photoDoneSignal's own pattern exactly.
+    //
+    // MAJOR fix, round 2: the first version of this fix raced this signal against a single fixed
+    // METADATA_PHASE_TIMEOUT_MILLIS deadline covering the WHOLE phase (this device's full upload +
+    // the server's DB merge + the server's full response) - a second independent review round did the
+    // throughput math and found that deadline was far too tight for the protocol's real chunk size
+    // (MAX_CHUNK_PAYLOAD, ~180 bytes, one chunk per BLE connection event) once a couple's synced history
+    // grew large: a perfectly legitimate, large-but-real payload could genuinely take longer than a
+    // fixed deadline sized for the "well under 1MB" common case, and once a couple's data crossed that
+    // line, EVERY future sync would abort at the same point forever - strictly worse than the unbounded
+    // wait this was meant to fix. Replaced with a STALL timeout instead (see
+    // METADATA_STALL_TIMEOUT_MILLIS): the deadline resets on every chunk of genuine progress (sent OR
+    // received - see metadataLastActivityAtMillis), so a slow-but-real large transfer keeps making
+    // progress indefinitely, while a peer that goes silent mid-phase still gets caught quickly. A
+    // separate, much longer METADATA_PHASE_ABSOLUTE_CEILING_MILLIS bounds the worst case too (a peer
+    // trickling one chunk just under the stall threshold forever), matching the same
+    // stall-plus-absolute-ceiling shape a careful timeout design needs.
+    // BUG fix: made @Volatile per a review round's own suggestion - this is written from
+    // BluetoothGattCallback methods (binder threads) and read from the watchdog coroutine's own
+    // dispatcher, and the stale-watchdog guard added alongside it (`if (metadataResponseSignal !== signal)
+    // break`) only actually works if that reassignment is guaranteed visible across threads.
+    @Volatile private var metadataResponseSignal: CompletableDeferred<Unit>? = null
+    @Volatile private var metadataLastActivityAtMillis: Long = 0L
 
     fun connectAsClient(device: BluetoothDevice, handshakeKey: ByteArray, onSyncDone: (Boolean) -> Unit) {
         if (!BlePermissions.hasBlePermissions(context)) return onSyncDone(false)
@@ -1016,6 +1067,8 @@ class GattSyncManager(
         photoDoneSignal = null
         clientPhotoReceivedCount = 0
         clientPhotoExpectedCount = 0
+        metadataResponseSignal = null
+        metadataLastActivityAtMillis = 0L
         // Both of these are mutated from BluetoothGattCallback methods, which run on binder threads (not
         // necessarily the same thread, and not guaranteed not to interleave) - just like
         // serverIncoming/serverOutQueue/authenticatedDevices/deviceMtus on the server side above, a
@@ -1073,6 +1126,7 @@ class GattSyncManager(
                     clientPhotoIncoming.reset()
                     clientPhotoSendComplete?.complete(Unit)
                     photoDoneSignal?.complete(Unit)
+                    metadataResponseSignal?.complete(Unit)
                     finish(false)
                     try { gatt.close() } catch (e: SecurityException) { /* ignore */ }
                 }
@@ -1197,6 +1251,50 @@ class GattSyncManager(
                     if (handshakeAcked) false else { handshakeAcked = true; true }
                 }
                 if (firstHandshakeAck) {
+                    // BUG fix: see metadataResponseSignal's own doc - without this watchdog, a peer that
+                    // authenticated correctly but then never sent back a metadata response (or sent one
+                    // that never completed with a LAST flag) left this device waiting forever, holding
+                    // its single-sync-attempt guard open with no way to recover except killing the app.
+                    // Stall-based, not a fixed deadline - see metadataResponseSignal's own "round 2" doc
+                    // for why. Polls rather than a single withTimeoutOrNull so it can compare against a
+                    // deadline that keeps moving forward as long as genuine progress (metadataLastActivityAtMillis)
+                    // keeps happening.
+                    val signal = CompletableDeferred<Unit>()
+                    metadataResponseSignal = signal
+                    metadataLastActivityAtMillis = System.currentTimeMillis()
+                    val phaseStartedAtMillis = metadataLastActivityAtMillis
+                    scope.launch {
+                        while (!signal.isCompleted) {
+                            delay(METADATA_STALL_CHECK_INTERVAL_MILLIS)
+                            if (signal.isCompleted) break
+                            // BUG fix: a second independent review round pointed out this closure reads
+                            // the SHARED metadataLastActivityAtMillis, not one scoped to its own `signal`
+                            // - so if this exact attempt were ever abandoned without its `signal` being
+                            // completed (disconnectClient() closes the gatt without going through the
+                            // normal onConnectionStateChange DISCONNECTED path, which is what would
+                            // otherwise complete it), this watchdog could linger up to the full ceiling
+                            // and then call finish(false) on behalf of a sync that's no longer this
+                            // device's current attempt - a stale finish() is a harmless no-op by itself,
+                            // but is one guard too many to rely on alone. Bailing out the moment
+                            // metadataResponseSignal has been reassigned to a NEWER attempt's signal means
+                            // this watchdog only ever acts on its own, still-current attempt.
+                            if (metadataResponseSignal !== signal) break
+                            val now = System.currentTimeMillis()
+                            val sinceLastActivity = now - metadataLastActivityAtMillis
+                            val sincePhaseStart = now - phaseStartedAtMillis
+                            val stalled = sinceLastActivity > METADATA_STALL_TIMEOUT_MILLIS
+                            val exceededCeiling = sincePhaseStart > METADATA_PHASE_ABSOLUTE_CEILING_MILLIS
+                            if (!stalled && !exceededCeiling) continue
+                            Log.w(
+                                TAG,
+                                if (stalled) "Metadata phase stalled - no progress for ${sinceLastActivity}ms"
+                                else "Metadata phase exceeded absolute ceiling (${sincePhaseStart}ms) despite ongoing progress"
+                            )
+                            finish(false)
+                            try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
+                            break
+                        }
+                    }
                     scope.launch {
                         val payload = buildPayload()
                         synchronized(clientLock) { clientOutQueue = toChunks(payload, clientChunkPayload).toMutableList() }
@@ -1251,10 +1349,23 @@ class GattSyncManager(
                 }
 
                 val flag = value[0]
-                if (value.size > 1) clientIncoming.write(value, 1, value.size - 1)
+                if (value.size > 1) {
+                    // BUG fix: see metadataResponseSignal's own doc - mirrors clientPhotoIncoming's own
+                    // cap immediately above; this buffer had no equivalent one at all.
+                    if (clientIncoming.size() + value.size - 1 > MAX_SYNC_JSON_BYTES) {
+                        Log.w(TAG, "Incoming metadata payload from server exceeded sanity cap - dropping")
+                        clientIncoming.reset()
+                    } else {
+                        clientIncoming.write(value, 1, value.size - 1)
+                    }
+                    // BUG fix: see metadataResponseSignal's own doc - every chunk actually received
+                    // counts as progress for the stall watchdog too, not just chunks sent.
+                    metadataLastActivityAtMillis = System.currentTimeMillis()
+                }
                 if (flag == BleConstants.CHUNK_FLAG_LAST) {
                     val raw = clientIncoming.toByteArray()
                     clientIncoming.reset()
+                    metadataResponseSignal?.complete(Unit)
                     scope.launch {
                         val remoteMomentInfo = try {
                             applyPayload(raw)
@@ -1301,6 +1412,9 @@ class GattSyncManager(
             characteristic.value = next
             @Suppress("DEPRECATION")
             gatt.writeCharacteristic(characteristic)
+            // BUG fix: see metadataResponseSignal's own doc - every chunk actually sent counts as
+            // progress for the stall watchdog, resetting its deadline.
+            metadataLastActivityAtMillis = System.currentTimeMillis()
         } catch (e: SecurityException) {
             Log.w(TAG, "Missing permission to write characteristic", e)
         }
@@ -1445,5 +1559,32 @@ class GattSyncManager(
          * flag (which would otherwise grow serverPhotoIncoming/clientPhotoIncoming unbounded) - generous
          * enough for any real phone-camera JPEG. */
         private const val MAX_PHOTO_FRAME_BYTES = 25_000_000
+
+        /** BUG fix: sanity ceiling on the reassembled JSON metadata payload (sessions/moments/dateIdeas/
+         * milestones/etc, both directions) - see metadataResponseSignal's own doc for why this and the
+         * timeout constants below exist. This is a defensive ceiling against a misbehaving peer growing
+         * the buffer forever, NOT a sizing estimate of a normal payload - MAX_CHUNK_PAYLOAD-sized chunks
+         * at real BLE throughput would take a long time to actually reach this, which is exactly why the
+         * timeout below is stall-based rather than sized off this constant. */
+        private const val MAX_SYNC_JSON_BYTES = 10_000_000
+
+        /** BUG fix, round 2: how often the metadata-phase watchdog polls for stalled progress - see
+         * metadataResponseSignal's own "round 2" doc for the full reasoning behind this stall-based
+         * design replacing the original fixed-deadline one. */
+        private const val METADATA_STALL_CHECK_INTERVAL_MILLIS = 5_000L
+
+        /** BUG fix, round 2: the metadata phase gives up if NO chunk (sent or received) has made
+         * progress for this long - not "the whole phase took longer than this," which a large-but-real
+         * payload could legitimately exceed at this protocol's real throughput (~180-byte chunks, one
+         * per BLE connection event). A peer that's genuinely gone silent mid-phase is caught quickly;
+         * one still trickling real data, however slowly, is allowed to keep going. */
+        private const val METADATA_STALL_TIMEOUT_MILLIS = 20_000L
+
+        /** BUG fix, round 2: absolute worst-case ceiling on the whole metadata phase regardless of
+         * ongoing trickle progress - defense-in-depth against a peer that deliberately sends just enough
+         * to keep resetting the stall timeout above without ever actually finishing, which would
+         * otherwise be able to hold this device's single-sync-attempt guard open indefinitely. Generous
+         * enough that no legitimate transfer at this protocol's real throughput should ever hit it. */
+        private const val METADATA_PHASE_ABSOLUTE_CEILING_MILLIS = 600_000L
     }
 }

@@ -41,6 +41,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -60,9 +61,11 @@ import com.ssbmedia.twogether.data.db.MomentNote
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.ui.components.EmptyState
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.time.Instant
 import java.time.ZoneId
@@ -214,7 +217,15 @@ private fun MomentThumbnail(moment: Moment, isTransferring: Boolean, onClick: ()
     // Feature 2: renders off photoDownloaded now (not isRemote) - a remote-stub moment whose photo
     // transfer has since completed correctly shows the real image here, not the placeholder forever. The
     // File(...).isFile check stays as a defensive belt-and-suspenders against the flag and disk disagreeing.
-    val hasLocalPhoto = remember(moment.photoUri, moment.photoDownloaded) { moment.photoDownloaded && File(moment.photoUri).isFile }
+    // BUG fix: this was a plain `remember { ... }`, which runs its blocking disk I/O synchronously on the
+    // UI thread the first time each grid item composes (and again whenever these keys change) - in a grid
+    // with many moments, that's a blocking syscall per thumbnail right as it scrolls into view, a real
+    // (if usually small) jank risk an independent audit round flagged. produceState moves the actual
+    // File.isFile check onto Dispatchers.IO, defaulting to `false` (the placeholder) for the one frame
+    // before it resolves rather than blocking composition to get the real answer immediately.
+    val hasLocalPhoto by produceState(initialValue = false, moment.photoUri, moment.photoDownloaded) {
+        value = withContext(Dispatchers.IO) { moment.photoDownloaded && File(moment.photoUri).isFile }
+    }
     if (hasLocalPhoto) {
         AsyncImage(
             model = moment.photoUri,

@@ -119,8 +119,9 @@ fun onRestoreFilePicked(context: Context, uri: Uri) {
  * same flip was ALSO disposing the composable meant to show the "Restore complete / Restart now" dialog
  * right as the result arrived, so a successful restore could silently finish with no confirmation and no
  * restart ever triggered. Fixed by [RestoreFlowState] surviving that flip AND (separately) by
- * PairingViewModel resetting to LANDING on every fresh entry, so the flip always lands somewhere that
- * hosts this same button - see PairingScreen's own fix doc.
+ * PairingViewModel being discarded and recreated fresh via [com.ssbmedia.twogether.ui.onboarding.PairingSessionGeneration]'s
+ * key bump (NOT a manual reset call - see that object's own doc for why), so the flip always lands
+ * cleanly on LANDING, which hosts this same button - see PairingScreen's own fix doc.
  */
 @Composable
 fun RestoreBackupButton(trigger: @Composable (onClick: () -> Unit) -> Unit) {

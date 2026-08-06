@@ -332,6 +332,15 @@ fun HomeScreen(
             )
     }
 
+    // BUG fix: ReunionOverlay used to be a sibling of the LazyColumn INSIDE Scaffold's own trailing
+    // content lambda - which only fills the area below topBar, since topBar is a separate Scaffold slot
+    // that always composes ON TOP of the content slot regardless of what that slot renders. That let the
+    // top app bar (with its Settings icon) visually bleed through and intercept taps meant for the
+    // "full-screen" celebration overlay - the exact same bug class already fixed once in
+    // MomentsScreen.kt's full-screen photo viewer. Wrapping the whole Scaffold in an outer Box and
+    // moving ReunionOverlay to be a SIBLING of Scaffold (not nested inside its content lambda) makes it
+    // genuinely cover the top bar too.
+    Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
         topBar = {
             CenterAlignedTopAppBar(
@@ -474,6 +483,7 @@ fun HomeScreen(
                 )
             }
         }
+    }
 
         if (showReunion) {
             ReunionOverlay(onDismiss = { showReunion = false })

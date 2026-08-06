@@ -45,6 +45,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -101,7 +102,7 @@ class MilestonesViewModel : ViewModel() {
 }
 
 @Composable
-fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null) {
+fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onInitialMilestoneConsumed: () -> Unit = {}) {
     val vm: MilestonesViewModel = viewModel(factory = SimpleViewModelFactory { MilestonesViewModel() })
     val milestones by vm.milestones.collectAsState()
     val moments by vm.moments.collectAsState()
@@ -110,11 +111,36 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null) {
 
     var showAddDialog by remember { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<Milestone?>(null) }
-    var retrospectiveFor by remember { mutableStateOf<Milestone?>(null) }
+    // BUG fix: was `var retrospectiveFor by remember { mutableStateOf<Milestone?>(null) }` - a further
+    // review round found that plain `remember` here defeated the ROTATION half of the fix below (making
+    // NavGraph's latchedMilestoneId `rememberSaveable`): the caller's latch is nulled via
+    // onInitialMilestoneConsumed() within milliseconds of opening, well before a rotation could ever
+    // save it, so by the time the Activity is recreated nothing anywhere still remembers a retrospective
+    // was open - the screen just came back with an empty retrospectiveFor. Storing only the milestone's
+    // ID via rememberSaveable (a plain String, no custom Saver needed) and deriving the actual Milestone
+    // object from the already-loaded list survives rotation independently of the latch - which as a
+    // side effect also fixes the pre-existing (not a regression - this bug already existed before any of
+    // this notification work) case of a MANUALLY-opened retrospective (tapping a row) dropping on
+    // rotation too.
+    var retrospectiveForId by rememberSaveable { mutableStateOf<String?>(null) }
+    val retrospectiveFor = milestones.firstOrNull { it.id == retrospectiveForId }
 
+    // BUG fix: an independent review round found the caller-side latch (NavGraph.kt's
+    // latchedMilestoneId, which this screen's initialMilestoneId is fed from) was never cleared after
+    // being consumed - so EVERY later visit to this screen (not just the one right after a notification
+    // tap) kept re-finding the same milestone in `milestones` and silently reopening its retrospective
+    // again, since retrospectiveForId itself resets to null on every fresh composition of this screen
+    // (Compose Navigation disposes a popped destination). Only calling onInitialMilestoneConsumed() once
+    // a REAL match is actually found - not on an earlier pass where `milestones` simply hasn't loaded
+    // yet - matters: clearing the caller's latch prematurely (before the real list loads) would silently
+    // reintroduce the original blocker this whole mechanism exists to fix.
     LaunchedEffect(initialMilestoneId, milestones) {
-        if (initialMilestoneId != null && retrospectiveFor == null) {
-            retrospectiveFor = milestones.firstOrNull { it.id == initialMilestoneId }
+        if (initialMilestoneId != null && retrospectiveForId == null) {
+            val match = milestones.firstOrNull { it.id == initialMilestoneId }
+            if (match != null) {
+                retrospectiveForId = match.id
+                onInitialMilestoneConsumed()
+            }
         }
     }
 
@@ -148,7 +174,7 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null) {
                     Card(
                         shape = MaterialTheme.shapes.large,
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
-                        onClick = { retrospectiveFor = milestone }
+                        onClick = { retrospectiveForId = milestone.id }
                     ) {
                         Row(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
@@ -193,7 +219,7 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null) {
     }
 
     retrospectiveFor?.let { milestone ->
-        MilestoneRetrospective(milestone = milestone, moments = moments, zone = zone, onDismiss = { retrospectiveFor = null })
+        MilestoneRetrospective(milestone = milestone, moments = moments, zone = zone, onDismiss = { retrospectiveForId = null })
     }
 }
 
@@ -346,5 +372,15 @@ private fun MilestoneRetrospective(milestone: Milestone, moments: List<Moment>, 
     }
 }
 
+/** BLOCKER fix, defense-in-depth: month/day here come straight from a stored [Milestone] row - as of
+ * v2.3, both known ingestion points (BackupManager.parseMilestones, GattSyncManager.deserializeMilestones)
+ * clamp these before they ever reach the DB, so a NEWLY-arriving bad value can no longer get in. But a row
+ * that was already corrupted BEFORE that fix shipped (e.g. synced from a partner still on v2.2, or
+ * restored from a backup taken back then) is still sitting in some phone's local DB right now, unclamped
+ * - and Month.of(month) throws for anything outside 1-12, which would crash this screen (and the
+ * retrospective view, which shares this same formatter) every time it tried to render that one row.
+ * Clamped here too, at the single shared formatter both call sites go through, so a pre-existing bad row
+ * displays a nearest-valid label instead of crashing - matching MilestoneAlarmScheduler.safeDate's own
+ * defensive clamp for the exact same reason. */
 private fun monthDayLabel(month: Int, day: Int): String =
-    "${Month.of(month).getDisplayName(TextStyle.FULL, Locale.getDefault())} $day"
+    "${Month.of(month.coerceIn(1, 12)).getDisplayName(TextStyle.FULL, Locale.getDefault())} ${day.coerceIn(1, 31)}"

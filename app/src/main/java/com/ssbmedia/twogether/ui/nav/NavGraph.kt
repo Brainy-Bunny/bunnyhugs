@@ -9,6 +9,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -43,7 +47,13 @@ private val bottomItems = listOf(
 )
 
 @Composable
-fun TwogetherNavHost(cameraTrigger: Int, onUnpaired: () -> Unit, openMilestoneId: String? = null) {
+fun TwogetherNavHost(
+    cameraTrigger: Int,
+    onUnpaired: () -> Unit,
+    openMilestoneId: String? = null,
+    onCameraTriggerConsumed: () -> Unit = {},
+    onMilestoneIdConsumed: () -> Unit = {}
+) {
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
     // Calendar's registered destination route is its full query-param PATTERN (see
@@ -59,17 +69,44 @@ fun TwogetherNavHost(cameraTrigger: Int, onUnpaired: () -> Unit, openMilestoneId
     // (rather than a one-time flag) is the intended "check again later" behavior.
     BatteryOptimizationGate()
 
+    // BUG fix: an independent audit round found neither trigger was ever cleared at its source
+    // (MainActivity's cameraTrigger/milestoneTrigger) after being consumed here - so if this WHOLE
+    // NavHost was ever torn down and recomposed fresh (e.g. the PIN-lock branch swap in MainActivity's
+    // own `when`, or a config change), a brand-new LaunchedEffect instance would see the same
+    // still-non-null/still-positive value as if it were a genuinely new notification tap, silently
+    // re-navigating to Camera or re-opening an old milestone's retrospective with no user action at all.
+    // Calling back up to clear the source value the moment it's consumed means any FUTURE non-null value
+    // is guaranteed to be a real new tap, not a stale leftover surviving recomposition.
     LaunchedEffect(cameraTrigger) {
         if (cameraTrigger > 0) {
             navController.navigate(Screen.Camera.route) { launchSingleTop = true }
+            onCameraTriggerConsumed()
         }
     }
 
     // Feature F: tapping a milestone's yearly notification opens the app straight into the Milestones
     // screen with that milestone's retrospective pre-opened (see MilestonesScreen's initialMilestoneId).
+    //
+    // BUG fix: an independent review round caught that the cameraTrigger fix's exact pattern (clear the
+    // source in the SAME LaunchedEffect that calls navigate()) breaks THIS trigger specifically, and
+    // live-reproduced it: navigate() only schedules the Milestones destination to compose on a LATER
+    // recomposition, not synchronously - so by the time MilestonesScreen actually composes and reads
+    // openMilestoneId (passed straight through as its initialMilestoneId param), onMilestoneIdConsumed()
+    // had already nulled the source, and the retrospective never opened at all. Latching the id into
+    // this LOCAL remembered value FIRST, and passing THAT (not the live openMilestoneId param) down to
+    // MilestonesScreen below, means clearing the upstream source immediately afterward is now safe -
+    // MilestonesScreen no longer depends on openMilestoneId staying non-null past this point.
+    // BUG fix: was plain `remember` - a second independent review round found that rotating the device
+    // WHILE the notification-opened retrospective was showing silently dropped it, since the nav back
+    // stack itself is restored (rememberNavController's own state is saveable) but this latch wasn't,
+    // so MilestonesScreen recomposed with initialMilestoneId already null. rememberSaveable (a plain
+    // String survives a Bundle natively, no custom Saver needed) fixes that.
+    var latchedMilestoneId by rememberSaveable { mutableStateOf<String?>(null) }
     LaunchedEffect(openMilestoneId) {
         if (openMilestoneId != null) {
+            latchedMilestoneId = openMilestoneId
             navController.navigate(Screen.Milestones.route) { launchSingleTop = true }
+            onMilestoneIdConsumed()
         }
     }
 
@@ -187,7 +224,14 @@ fun TwogetherNavHost(cameraTrigger: Int, onUnpaired: () -> Unit, openMilestoneId
             composable(Screen.Capsules.route) { CapsulesScreen(onBack = { navController.popBackStack() }) }
             composable(Screen.Badges.route) { BadgesScreen(onBack = { navController.popBackStack() }) }
             composable(Screen.Milestones.route) {
-                MilestonesScreen(onBack = { navController.popBackStack() }, initialMilestoneId = openMilestoneId)
+                MilestonesScreen(
+                    onBack = { navController.popBackStack() },
+                    initialMilestoneId = latchedMilestoneId,
+                    // BUG fix: see MilestonesScreen's own doc - without this, latchedMilestoneId stayed
+                    // set forever (this local `remember` only resets on a full NavHost teardown), so
+                    // every later Milestones visit kept reopening the same notification's retrospective.
+                    onInitialMilestoneConsumed = { latchedMilestoneId = null }
+                )
             }
             composable(Screen.Settings.route) { SettingsScreen(onBack = { navController.popBackStack() }, onUnpaired = onUnpaired) }
             composable(Screen.Camera.route) {

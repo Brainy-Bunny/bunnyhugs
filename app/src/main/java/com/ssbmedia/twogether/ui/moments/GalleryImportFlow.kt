@@ -76,11 +76,19 @@ fun GalleryImportHost(
     var pendingUri by remember { mutableStateOf<Uri?>(null) }
     var suggestedDate by remember { mutableStateOf<LocalDate?>(null) }
     var isSaving by remember { mutableStateOf(false) }
+    // BUG fix: a copy failure (storage full, a revoked/expired content:// grant, etc - see
+    // copyPickedImageToMomentsDir's own doc for why it returns null rather than throwing) used to just
+    // silently close this dialog with isSaving reset and nothing else - no error, no moment added, no
+    // indication anything had even been attempted. An independent audit round flagged this as the one
+    // gallery-import failure path with zero user-visible feedback, unlike every other failure path in
+    // this app (setPin, backup restore, etc) which all show something.
+    var saveError by remember { mutableStateOf<String?>(null) }
 
     val pickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null) {
             pendingUri = uri
             suggestedDate = readExifDate(context, uri)
+            saveError = null
         }
     }
 
@@ -92,9 +100,11 @@ fun GalleryImportHost(
         BackfillPhotoDateDialog(
             suggestedDate = suggestedDate,
             isSaving = isSaving,
+            saveError = saveError,
             onDismiss = { if (!isSaving) pendingUri = null },
             onConfirm = { date, togetherRange ->
                 isSaving = true
+                saveError = null
                 scope.launch {
                     val savedFile = withContext(Dispatchers.IO) { copyPickedImageToMomentsDir(context, uri) }
                     if (savedFile != null) {
@@ -122,8 +132,14 @@ fun GalleryImportHost(
                         }
                     }
                     isSaving = false
-                    pendingUri = null
-                    if (savedFile != null) onImported()
+                    if (savedFile != null) {
+                        pendingUri = null
+                        onImported()
+                    } else {
+                        // BUG fix: see saveError's own doc - dialog stays open (not silently dismissed)
+                        // so the user knows the import failed and can retry or cancel explicitly.
+                        saveError = "Couldn't import that photo - try again"
+                    }
                 }
             }
         )
@@ -194,6 +210,7 @@ private fun extensionFor(resolver: ContentResolver, uri: Uri): String {
 private fun BackfillPhotoDateDialog(
     suggestedDate: LocalDate?,
     isSaving: Boolean,
+    saveError: String? = null,
     onDismiss: () -> Unit,
     onConfirm: (LocalDate, Pair<Long, Long>?) -> Unit
 ) {
@@ -307,6 +324,14 @@ private fun BackfillPhotoDateDialog(
                             modifier = Modifier.padding(top = 8.dp)
                         )
                     }
+                }
+                saveError?.let {
+                    Text(
+                        it,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 12.dp)
+                    )
                 }
             }
         },

@@ -434,14 +434,19 @@ class MilestoneRepository(private val dao: MilestoneDao) {
     }
 
     /** Union+tombstone merge by id + updatedAt, same LWW shape as DateIdeaRepository.mergeRemote - these
-     * are simple, rarely-edited additions, so plain last-write-wins is appropriate (see task spec). */
-    suspend fun mergeRemote(remote: List<Milestone>) {
+     * are simple, rarely-edited additions, so plain last-write-wins is appropriate (see task spec).
+     * BUG fix: returns what was actually upserted (was Unit) - an independent audit round found that
+     * unlike every OTHER way a Milestone enters the DB (a local add, a backup restore, app start, boot),
+     * a milestone arriving via THIS path never got its yearly alarm armed at all until the next cold
+     * start - see this function's caller in GattSyncManager for the actual fix. */
+    suspend fun mergeRemote(remote: List<Milestone>): List<Milestone> {
         val local = dao.getAll().associateBy { it.id }
         val toUpsert = remote.filter { r ->
             val l = local[r.id]
             l == null || r.updatedAt > l.updatedAt
         }
         if (toUpsert.isNotEmpty()) dao.upsertAll(toUpsert)
+        return toUpsert
     }
 }
 

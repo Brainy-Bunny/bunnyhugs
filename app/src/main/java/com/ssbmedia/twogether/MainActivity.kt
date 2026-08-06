@@ -129,12 +129,40 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         }
-                        !loadedPairing.isPaired -> PairingScreen(onPaired = { startProximityService() })
+                        // BUG fix: the PIN-lock check used to run AFTER the pairing check, so it was only
+                        // ever reachable while paired - unpairing (which does NOT clear a configured PIN;
+                        // only a restore forces pinEnabled=false, see BackupManager's own SECURITY doc)
+                        // left the phone with a fully configured PIN that was silently never enforced
+                        // again. An independent live testing round found this exact live-reproducible gap:
+                        // enable PIN -> unpair -> relock/relaunch -> PairingScreen opens with NO PIN
+                        // prompt, exposing the partner's name/emoji, a one-tap "Reconnect", and the
+                        // destructive "Restore from a backup" flow to anyone holding the unlocked phone.
+                        // Checking PIN lock FIRST, before the pairing branch, means it gates access
+                        // regardless of pairing state - exactly matching what Settings' own "App lock
+                        // (PIN) - required to open the app" copy already promises.
                         loadedSettings.pinEnabled && AppLockManager.isLocked -> PinLockScreen()
+                        !loadedPairing.isPaired -> PairingScreen(onPaired = { startProximityService() })
                         else -> TwogetherNavHost(
                             cameraTrigger = trigger,
                             onUnpaired = { stopProximityService() },
-                            openMilestoneId = milestoneId
+                            openMilestoneId = milestoneId,
+                            // BUG fix: an independent review round found this fix (clearing the
+                            // in-memory trigger state) was incomplete - onCreate re-reads these same
+                            // extras from `intent` on EVERY Activity recreation, including a plain
+                            // rotation, which doesn't go through onNewIntent at all and so never gets a
+                            // chance to re-derive a null. Without also removing the extra from the
+                            // Intent itself, rotating right after consuming a notification tap silently
+                            // re-triggered the exact same navigation all over again. removeExtra() means
+                            // a later onCreate (from rotation, or process death + restore) sees nothing
+                            // to re-read.
+                            onCameraTriggerConsumed = {
+                                cameraTrigger.intValue = 0
+                                intent?.removeExtra(Notifications.EXTRA_OPEN_CAMERA)
+                            },
+                            onMilestoneIdConsumed = {
+                                milestoneTrigger.value = null
+                                intent?.removeExtra(Notifications.EXTRA_OPEN_MILESTONE_ID)
+                            }
                         )
                     }
                 }

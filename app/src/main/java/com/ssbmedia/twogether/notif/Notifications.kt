@@ -33,12 +33,21 @@ object Notifications {
 
     const val STATUS_NOTIFICATION_ID = 1001
     const val REMINDER_NOTIFICATION_ID = 1002
+    // BUG fix: these three used to be 3000/4000/5000 - well inside the range MILESTONE_NOTIFICATION_ID_BASE
+    // + (hash and 0x0FFFFFFF) can actually produce (up to ~268 million), so some real milestone's hash
+    // was always capable of landing exactly on one of them. Two IDs colliding means whichever notification
+    // posts second silently replaces the first on screen, and manager.cancel() on one of these fixed IDs
+    // could unintentionally cancel an unrelated milestone's still-relevant notification. Moved below 2000
+    // instead - alongside STATUS/REMINDER - so the milestone range (2000 and up) is now exclusively
+    // reserved for milestones and can never collide with any fixed-ID notification again.
+    const val UPDATE_NOTIFICATION_ID = 1003
+    const val BATTERY_WARNING_NOTIFICATION_ID = 1004
+    const val RESTORE_GAVE_UP_NOTIFICATION_ID = 1005
     /** Base id for a milestone's yearly notification - offset by a stable per-milestone hash so
-     * different milestones never clobber each other's notification (see MilestoneAlarmScheduler). */
+     * different milestones never clobber each other's notification (see MilestoneAlarmScheduler). Always
+     * >= 2000 and (per the hash mask) always < 2000 + 0x0FFFFFFF - see the fixed IDs above for why nothing
+     * else may ever be assigned an ID in that range. */
     const val MILESTONE_NOTIFICATION_ID_BASE = 2000
-    const val UPDATE_NOTIFICATION_ID = 3000
-    const val BATTERY_WARNING_NOTIFICATION_ID = 4000
-    const val RESTORE_GAVE_UP_NOTIFICATION_ID = 5000
 
     const val EXTRA_OPEN_CAMERA = "open_camera"
     /** Feature F: carries which milestone to open the "throughout the years" retrospective for, when the
