@@ -44,9 +44,28 @@ object AppLockManager : DefaultLifecycleObserver {
     }
 
     fun recordFailedPinAttempt() {
+        val now = System.currentTimeMillis()
+        // BUG fix: a lockout already in progress must never be extended by a further recorded attempt -
+        // every caller's UI already disables its PIN field/button while isPinLockedOut() is true, so this
+        // shouldn't be reachable through normal interaction, but it's cheap, correct insurance against
+        // any caller that doesn't check first (or a race between the lockout timer and a submit action):
+        // without this guard, a call landing while still locked out would still increment the counter and
+        // re-arm a FRESH 30s from "now", so a lockout could in principle keep extending indefinitely
+        // instead of ever actually expiring.
+        if (isPinLockedOut(now)) return
+        // BUG fix: failedPinAttempts used to never come back down except on a full success - so once it
+        // first reached the threshold, EVERY later wrong guess re-armed a brand new 30s lockout
+        // immediately, even long after the previous one had already expired and the documented "5 wrong
+        // attempts -> 30-second lockout" behavior would suggest a fresh start. A served, expired lockout
+        // now genuinely resets the count, giving a real fresh set of attempts rather than a ratchet that
+        // only ever gets stricter.
+        if (pinLockedOutUntilMillis != 0L && now >= pinLockedOutUntilMillis) {
+            failedPinAttempts = 0
+            pinLockedOutUntilMillis = 0L
+        }
         failedPinAttempts++
         if (failedPinAttempts >= FAILED_ATTEMPTS_BEFORE_LOCKOUT) {
-            pinLockedOutUntilMillis = System.currentTimeMillis() + LOCKOUT_MILLIS
+            pinLockedOutUntilMillis = now + LOCKOUT_MILLIS
         }
     }
 

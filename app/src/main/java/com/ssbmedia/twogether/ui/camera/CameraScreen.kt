@@ -165,7 +165,15 @@ fun CameraScreen(onSaved: () -> Unit, onCancel: () -> Unit) {
                         onClick = {
                             val capture = imageCapture ?: return@FloatingActionButton
                             isSaving = true
-                            val fileName = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                            // BUG fix: second-granularity timestamps meant two captures on THIS device
+                            // within the same wall-clock second would silently collide onto one filename -
+                            // the second capture's bytes would overwrite the first's real photo file,
+                            // while both still had their own separate Moment DB rows (one now pointing at
+                            // the wrong image, or a 404'd thumbnail if the first row's file got replaced
+                            // by the second's content). Millisecond precision plus a short random suffix
+                            // makes this collision-proof regardless of how close together two captures land.
+                            val fileName = SimpleDateFormat("yyyyMMdd_HHmmssSSS", Locale.US).format(Date()) +
+                                "_" + java.util.UUID.randomUUID().toString().take(6)
                             val outputDir = File(context.filesDir, "moments").apply { mkdirs() }
                             val outputFile = File(outputDir, "$fileName.jpg")
                             val outputOptions = ImageCapture.OutputFileOptions.Builder(outputFile).build()

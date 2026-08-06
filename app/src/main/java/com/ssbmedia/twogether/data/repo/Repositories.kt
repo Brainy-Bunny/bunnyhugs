@@ -342,6 +342,16 @@ class MomentRepository(private val dao: MomentDao, private val context: Context)
             return if (ext in SAFE_PHOTO_EXTENSIONS) ext else "jpg"
         }
 
+        /** syncId is documented above/at both call sites as "a UUID, already trusted as an identifier" -
+         * but neither caller (mergeRemoteStubs' wire data, BackupManager.parseMoments' backup-JSON data)
+         * actually validated that shape before this fix, so a crafted syncId containing "/" or ".."
+         * could steer the file this function returns outside filesDir/moments/ entirely (e.g.
+         * syncId = "../../databases/evil"). SECURITY fix: validated HERE, the one shared place both
+         * callers already funnel through, instead of trusting either caller to have checked - anything
+         * not matching a plain UUID-safe charset (letters/digits/hyphen/underscore, reasonable length)
+         * is replaced with a fresh random UUID rather than used verbatim. */
+        private val SAFE_SYNC_ID = Regex("^[A-Za-z0-9_-]{1,64}$")
+
         /** The ONE place a remote Moment's local photo destination is computed: deterministic, keyed only
          * by the moment's own syncId (a UUID) inside this app's own filesDir/moments/ directory - never
          * influenced by anything the network peer sent beyond the sanitized extension. Because every
@@ -349,8 +359,9 @@ class MomentRepository(private val dao: MomentDao, private val context: Context)
          * same file the way second-granularity capture-timestamp filenames could. */
         fun localPhotoFile(context: Context, syncId: String, extension: String): File {
             val safeExt = if (extension in SAFE_PHOTO_EXTENSIONS) extension else "jpg"
+            val safeSyncId = if (SAFE_SYNC_ID.matches(syncId)) syncId else java.util.UUID.randomUUID().toString()
             val dir = File(context.filesDir, "moments")
-            return File(dir, "$syncId.$safeExt")
+            return File(dir, "$safeSyncId.$safeExt")
         }
     }
 }

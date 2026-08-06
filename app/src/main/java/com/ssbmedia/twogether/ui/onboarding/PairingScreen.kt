@@ -8,6 +8,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -331,7 +332,11 @@ private fun PartnerInfoContent(name: String, onNameChange: (String) -> Unit, emo
             shape = MaterialTheme.shapes.large
         )
         Spacer(modifier = Modifier.height(16.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        // BUG fix: the plain Row here had no wrap/scroll, so on a real device width 2 of the 8 emoji
+        // chips clipped off the right edge entirely and were unselectable - same failure class as the
+        // old "Quick Links were invisible" bug (see HomeScreen's own FlowRow fix for that one). FlowRow
+        // wraps onto a second line instead of clipping.
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             emojiOptions.forEach { option ->
                 val selected = option == emoji
                 Card(

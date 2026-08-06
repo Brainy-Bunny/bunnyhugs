@@ -1,6 +1,8 @@
 package com.ssbmedia.twogether.ui.settings
 
 import android.content.Context
+import android.content.Intent
+import android.util.Log
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -44,6 +46,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -60,12 +63,16 @@ import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.lock.AppLockManager
 import com.ssbmedia.twogether.lock.PinUtil
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import com.ssbmedia.twogether.ui.update.UpdateInstallActivity
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+
+private const val SETTINGS_TAG = "SettingsViewModel"
 
 class SettingsViewModel : ViewModel() {
     val settings = ServiceLocator.settingsStore.settings
@@ -98,7 +105,13 @@ class SettingsViewModel : ViewModel() {
         }
     }
 
-    fun setPin(pin: String) {
+    /** Clears a stale pending-update indicator whose cached APK has gone missing - see the Updates
+     * section's own comment for why this exists. */
+    fun clearPendingUpdate() {
+        viewModelScope.launch { ServiceLocator.settingsStore.clearPendingUpdate() }
+    }
+
+    fun setPin(pin: String, onDone: (success: Boolean) -> Unit) {
         // MINOR fix: launched on the app-scoped coroutine, NOT viewModelScope - same reasoning as
         // unpair() below. PinUtil.hash() now does real, visible work (600k-round PBKDF2, up to ~1-3s on
         // a mid-range phone); navigating out of Settings within that window used to cancel viewModelScope
@@ -106,19 +119,42 @@ class SettingsViewModel : ViewModel() {
         // pinHash/pinEnabled were never actually written). At the old 20k-round cost (~tens of ms) this
         // was never realistically reachable.
         ServiceLocator.applicationScope.launch {
-            ServiceLocator.settingsStore.setPin(PinUtil.hash(pin))
-            // AppLockManager.isLocked defaults to true and is otherwise only cleared by successfully
-            // entering the PIN on PinLockScreen. Without this, turning PIN lock on for the first time
-            // (isLocked has never been flipped false yet) immediately re-shows the lock screen right
-            // after the user just typed the same PIN into the "set PIN" dialog - forcing them to
-            // enter it twice in a row for no reason. The user is already authenticated in this
-            // session (they're sitting in Settings), so unlock immediately.
-            AppLockManager.unlock()
+            // BUG fix: an independent review round pointed out this had no error handling at all -
+            // applicationScope has no CoroutineExceptionHandler, so a genuine DataStore IOException
+            // (disk full, I/O failure - documented as a real possibility of DataStore's edit{}, not a
+            // "can't happen" case) would crash the whole app uncaught. Separately, even if it hadn't
+            // crashed, onDone() would never have fired, leaving SetPinDialog's isSaving spinner stuck
+            // true forever (fields+buttons disabled, no way to dismiss). onDone now always fires exactly
+            // once, carrying whether the save actually succeeded so the dialog can show an error and let
+            // the user retry instead of silently closing as if the PIN had been set.
+            try {
+                ServiceLocator.settingsStore.setPin(PinUtil.hash(pin))
+                // AppLockManager.isLocked defaults to true and is otherwise only cleared by successfully
+                // entering the PIN on PinLockScreen. Without this, turning PIN lock on for the first time
+                // (isLocked has never been flipped false yet) immediately re-shows the lock screen right
+                // after the user just typed the same PIN into the "set PIN" dialog - forcing them to
+                // enter it twice in a row for no reason. The user is already authenticated in this
+                // session (they're sitting in Settings), so unlock immediately.
+                AppLockManager.unlock()
+                // BUG fix: onDone used to be called synchronously right after launching this coroutine
+                // (i.e. the dialog closed and the "App lock (PIN)" switch was shown immediately), NOT after
+                // the write above actually completed. Since the hash alone can take 1-3s, the switch would
+                // legitimately still read the OLD value for that whole window - not a stale-recomposition
+                // bug, just zero feedback that the save was still in flight. Calling onDone here instead,
+                // after the real write, means the dialog only closes once the switch is guaranteed correct.
+                onDone(true)
+            } catch (e: Exception) {
+                Log.w(SETTINGS_TAG, "Failed to save PIN", e)
+                onDone(false)
+            }
         }
     }
 
     fun clearPin() {
-        viewModelScope.launch { ServiceLocator.settingsStore.clearPin() }
+        // MINOR fix: matches setPin()'s own applicationScope reasoning above for consistency - this
+        // write is fast (no PBKDF2 involved), so the cancellation window was always narrow, but there's
+        // no reason this one PIN-mutating action should be the odd one out still exposed to it.
+        ServiceLocator.applicationScope.launch { ServiceLocator.settingsStore.clearPin() }
     }
 
     fun unpair(onDone: () -> Unit) {
@@ -329,6 +365,47 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
             }
 
             SettingsSection(title = "Updates") {
+                // BUG fix: a downloaded update used to be discoverable ONLY via the dismissible "Update
+                // available" OS notification - swipe it away, or have notifications off entirely
+                // (app-level or OS-permission-level), and there was no way back to it short of manually
+                // tapping "Check for updates now" again. This persists regardless of notification state,
+                // reading the same durable flag UpdateChecker sets the moment it finishes downloading.
+                if (settings.pendingUpdateVersionCode > BuildConfig.VERSION_CODE) {
+                    val pendingName = settings.pendingUpdateVersionName ?: "update"
+                    val pendingPath = settings.pendingUpdateApkPath
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(12.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Update $pendingName ready", fontWeight = FontWeight.SemiBold)
+                                Text("Tap Install to update now", style = MaterialTheme.typography.bodySmall)
+                            }
+                            TextButton(onClick = {
+                                val apkFile = pendingPath?.let { File(it) }
+                                if (apkFile != null && apkFile.isFile) {
+                                    context.startActivity(
+                                        Intent(context, UpdateInstallActivity::class.java).apply {
+                                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                                            putExtra(UpdateInstallActivity.EXTRA_APK_PATH, apkFile.absolutePath)
+                                        }
+                                    )
+                                } else {
+                                    // The cached APK is gone (cleared storage, cache eviction, etc.) -
+                                    // clear the stale flag rather than leaving a permanently-broken
+                                    // "Install" button; the user can re-check to re-download it.
+                                    vm.clearPendingUpdate()
+                                    updateCheckMessage = "That update file is no longer available - tap \"Check now\" to re-download it."
+                                }
+                            }) { Text("Install") }
+                        }
+                    }
+                }
                 SettingsRow(
                     label = "Check for updates automatically",
                     subtitle = "Uses the internet just for this — everything else in Twogether stays fully offline"
@@ -385,7 +462,7 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
     }
 
     if (showPinDialog) {
-        SetPinDialog(onDismiss = { showPinDialog = false }, onSave = { pin -> vm.setPin(pin); showPinDialog = false })
+        SetPinDialog(onDismiss = { showPinDialog = false }, onSave = { pin, onResult -> vm.setPin(pin, onResult) })
     }
 
     pinVerifyPurpose?.let { purpose ->
@@ -410,7 +487,7 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
             text = {
                 Text(
                     "This won't delete your history, photos, or stats — they stay on this phone. " +
-                        "You'll just need to reconnect with $displayName phone to resume tracking time together."
+                        "You'll just need to reconnect with $displayName's phone to resume tracking time together."
                 )
             },
             confirmButton = {
@@ -535,6 +612,7 @@ private fun VerifyCurrentPinDialog(currentPinHash: String?, onDismiss: () -> Uni
                     value = pin,
                     onValueChange = { pin = it.filter { c -> c.isDigit() }.take(6); error = null },
                     label = { Text("Current PIN") },
+                    visualTransformation = PasswordVisualTransformation(),
                     keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                     enabled = !lockedOut
@@ -587,43 +665,75 @@ private fun VerifyCurrentPinDialog(currentPinHash: String?, onDismiss: () -> Uni
 }
 
 @Composable
-private fun SetPinDialog(onDismiss: () -> Unit, onSave: (String) -> Unit) {
+private fun SetPinDialog(onDismiss: () -> Unit, onSave: (String, onResult: (success: Boolean) -> Unit) -> Unit) {
     var pin by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
+    // BUG fix: the dialog used to close (and the caller's "App lock (PIN)" switch render) IMMEDIATELY
+    // on tapping Save, before the 600k-round PBKDF2 hash + actual DataStore write had finished (up to
+    // ~1-3s) - so the switch briefly, legitimately showed the OLD value with zero indication a save was
+    // still in progress. isSaving disables the button and shows a spinner for that real window instead.
+    var isSaving by remember { mutableStateOf(false) }
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!isSaving) onDismiss() },
         title = { Text("Set a PIN") },
         text = {
             Column {
                 Text("Choose a 4-6 digit PIN.", style = MaterialTheme.typography.bodySmall)
+                // BUG fix: KeyboardType.NumberPassword only picks the numeric-password KEYBOARD LAYOUT -
+                // it doesn't mask the displayed characters on its own. Only PinLockScreen's own field had
+                // visualTransformation = PasswordVisualTransformation() applied; this one and Confirm PIN
+                // below, plus VerifyCurrentPinDialog's field above, rendered the digits in clear text.
                 OutlinedTextField(
+                    // BUG fix: error was only ever recomputed inside Save's onClick, never cleared as the
+                    // user typed - so e.g. "PINs don't match" stayed on screen even after editing one
+                    // field to actually match, until Save was tapped again.
                     value = pin,
-                    onValueChange = { pin = it.filter { c -> c.isDigit() }.take(6) },
+                    onValueChange = { pin = it.filter { c -> c.isDigit() }.take(6); error = null },
                     label = { Text("PIN") },
+                    visualTransformation = PasswordVisualTransformation(),
                     keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    enabled = !isSaving
                 )
                 OutlinedTextField(
                     value = confirm,
-                    onValueChange = { confirm = it.filter { c -> c.isDigit() }.take(6) },
+                    onValueChange = { confirm = it.filter { c -> c.isDigit() }.take(6); error = null },
                     label = { Text("Confirm PIN") },
+                    visualTransformation = PasswordVisualTransformation(),
                     keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    enabled = !isSaving
                 )
                 error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp)) }
             }
         },
         confirmButton = {
-            TextButton(onClick = {
-                when {
-                    pin.length < 4 -> error = "PIN must be at least 4 digits"
-                    pin != confirm -> error = "PINs don't match"
-                    else -> onSave(pin)
-                }
-            }) { Text("Save") }
+            if (isSaving) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp))
+            } else {
+                TextButton(onClick = {
+                    when {
+                        pin.length < 4 -> error = "PIN must be at least 4 digits"
+                        pin != confirm -> error = "PINs don't match"
+                        else -> {
+                            isSaving = true
+                            // BUG fix: onResult now carries whether the save actually succeeded - a
+                            // failure (e.g. a real DataStore I/O error) used to be indistinguishable from
+                            // success at this call site (there was no failure path at all), so the dialog
+                            // would just hang with isSaving stuck true if setPin ever threw. On failure
+                            // this now un-sticks the spinner AND surfaces an error instead of silently
+                            // closing as if the PIN had been set.
+                            onSave(pin) { success ->
+                                isSaving = false
+                                if (success) onDismiss() else error = "Couldn't save PIN - try again"
+                            }
+                        }
+                    }
+                }) { Text("Save") }
+            }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !isSaving) { Text("Cancel") } }
     )
 }

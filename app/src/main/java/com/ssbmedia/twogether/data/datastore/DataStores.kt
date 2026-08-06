@@ -210,6 +210,18 @@ data class AppSettings(
      * whichever of app-start or UpdateWorker ran it - throttles app-start's own check so reopening
      * the app repeatedly can't re-hit the network every time; see UpdateChecker.MIN_CHECK_INTERVAL_MS. */
     val lastUpdateCheckAt: Long = 0L,
+    /** BUG fix: a downloaded update used to be discoverable ONLY via the dismissible "Update available"
+     * OS notification - swipe it away (or have notifications disabled entirely, app-level or
+     * OS-permission-level) and there was no way to find out an update was ready short of manually
+     * tapping "Check for updates now" again. These three durably record the last update UpdateChecker
+     * actually downloaded, so Settings can show a persistent "Update X ready to install" row regardless
+     * of notification state. [pendingUpdateVersionCode] is 0 when nothing is pending; a UI reader should
+     * also treat it as stale (and ignore it) once it's <= BuildConfig.VERSION_CODE - covers the update
+     * having already been installed via the notification without a fresh check ever running to clear
+     * these explicitly. */
+    val pendingUpdateVersionCode: Int = 0,
+    val pendingUpdateVersionName: String? = null,
+    val pendingUpdateApkPath: String? = null,
     /** Drag-and-drop reordering of Home's "Quick links" grid - deliberately per-device, NOT synced
      * between partners (each person may want their own layout), so this lives in local settingsDs
      * rather than anywhere that gets shared/paired. Comma-joined list of the stable quick-link ids
@@ -257,6 +269,9 @@ class SettingsStore(private val context: Context) {
         val THEME_MODE = stringPreferencesKey("theme_mode")
         val PENDING_RESTORE_PATH = stringPreferencesKey("pending_restore_path")
         val PENDING_RESTORE_ATTEMPTS = intPreferencesKey("pending_restore_attempts")
+        val PENDING_UPDATE_VERSION_CODE = intPreferencesKey("pending_update_version_code")
+        val PENDING_UPDATE_VERSION_NAME = stringPreferencesKey("pending_update_version_name")
+        val PENDING_UPDATE_APK_PATH = stringPreferencesKey("pending_update_apk_path")
     }
 
     val settings: Flow<AppSettings> = context.settingsDs.data.map { p ->
@@ -277,7 +292,10 @@ class SettingsStore(private val context: Context) {
             // enum name Room/DataStore can't map back) - falls back to SYSTEM rather than crashing.
             themeMode = p[Keys.THEME_MODE]?.let { raw -> runCatching { ThemeMode.valueOf(raw) }.getOrNull() } ?: ThemeMode.SYSTEM,
             pendingRestorePath = p[Keys.PENDING_RESTORE_PATH],
-            pendingRestoreAttempts = p[Keys.PENDING_RESTORE_ATTEMPTS] ?: 0
+            pendingRestoreAttempts = p[Keys.PENDING_RESTORE_ATTEMPTS] ?: 0,
+            pendingUpdateVersionCode = p[Keys.PENDING_UPDATE_VERSION_CODE] ?: 0,
+            pendingUpdateVersionName = p[Keys.PENDING_UPDATE_VERSION_NAME],
+            pendingUpdateApkPath = p[Keys.PENDING_UPDATE_APK_PATH]
         )
     }
 
@@ -357,6 +375,28 @@ class SettingsStore(private val context: Context) {
 
     suspend fun setLastUpdateCheckAt(time: Long) {
         context.settingsDs.edit { it[Keys.LAST_UPDATE_CHECK_AT] = time }
+    }
+
+    /** See [AppSettings.pendingUpdateVersionCode]'s doc. Called once by UpdateChecker right after it
+     * downloads a confirmed-newer release, so Settings can show a persistent "Update ready" indicator
+     * independent of the dismissible OS notification. */
+    suspend fun setPendingUpdate(versionCode: Int, versionName: String, apkPath: String) {
+        context.settingsDs.edit { p ->
+            p[Keys.PENDING_UPDATE_VERSION_CODE] = versionCode
+            p[Keys.PENDING_UPDATE_VERSION_NAME] = versionName
+            p[Keys.PENDING_UPDATE_APK_PATH] = apkPath
+        }
+    }
+
+    /** Clears the pending-update indicator - called once UpdateChecker confirms this build is already
+     * up to date (the pending update must have been installed already), or by Settings defensively if
+     * the cached APK it points at has gone missing. */
+    suspend fun clearPendingUpdate() {
+        context.settingsDs.edit { p ->
+            p.remove(Keys.PENDING_UPDATE_VERSION_CODE)
+            p.remove(Keys.PENDING_UPDATE_VERSION_NAME)
+            p.remove(Keys.PENDING_UPDATE_APK_PATH)
+        }
     }
 
     /** Persists the user's drag-and-drop reordering of Home's "Quick links" grid. [orderedIds] is

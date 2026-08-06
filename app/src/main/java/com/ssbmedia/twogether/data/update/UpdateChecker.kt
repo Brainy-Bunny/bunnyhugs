@@ -3,6 +3,7 @@ package com.ssbmedia.twogether.data.update
 import android.content.Context
 import android.util.Log
 import com.ssbmedia.twogether.BuildConfig
+import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.notif.Notifications
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -62,12 +63,23 @@ object UpdateChecker {
         // releases published yet" - both are correctly reported as CheckFailed to the manual-check
         // UI (there's nothing actionable to tell the user apart between those two cases).
         val info = fetchLatestRelease() ?: return@withContext CheckOutcome.CheckFailed
-        if (info.versionCode <= BuildConfig.VERSION_CODE) return@withContext CheckOutcome.UpToDate
+        if (info.versionCode <= BuildConfig.VERSION_CODE) {
+            // BUG fix: this build already covers whatever was pending (most likely the user installed
+            // it via a still-live notification tap, without ever coming back through this function to
+            // clear it explicitly) - see AppSettings.pendingUpdateVersionCode's doc.
+            ServiceLocator.settingsStore.clearPendingUpdate()
+            return@withContext CheckOutcome.UpToDate
+        }
 
         val apkFile = downloadApk(context, info.downloadUrl)
             ?: return@withContext CheckOutcome.DownloadFailed
 
         Notifications.showUpdateAvailableNotification(context, apkFile, info.versionName)
+        // BUG fix: durably records that this update is ready, independent of the OS notification's own
+        // dismissal state (or notifications being disabled entirely) - see AppSettings.
+        // pendingUpdateVersionCode's doc. Settings reads this to show a persistent "Update ready"
+        // indicator that doesn't depend on the user having seen/kept the notification.
+        ServiceLocator.settingsStore.setPendingUpdate(info.versionCode, info.versionName, apkFile.absolutePath)
         CheckOutcome.UpdateAvailable(info, apkFile)
     }
 
@@ -79,6 +91,7 @@ object UpdateChecker {
 
             val assets = json.optJSONArray("assets") ?: return null
             var apkUrl: String? = null
+            var apkAssetName: String? = null
             for (i in 0 until assets.length()) {
                 val asset = assets.optJSONObject(i) ?: continue
                 val name = asset.optString("name", "")
@@ -86,20 +99,39 @@ object UpdateChecker {
                     val url = asset.optString("browser_download_url", "")
                     if (url.isNotBlank()) {
                         apkUrl = url
+                        apkAssetName = name
                         break
                     }
                 }
             }
             val downloadUrl = apkUrl ?: return null
 
-            // Deliberately NOT the release's free-text "name" field (e.g. "Twogether v1.1") - that's
-            // written by whoever cuts the release and already tends to include the app's own name,
-            // which would double up awkwardly wherever this versionName gets embedded in UI text (the
-            // notification body, the manual-check dialog). The tag itself (e.g. "v2") is guaranteed
-            // short and consistently formatted, since it's exactly what checkAndNotify just parsed.
+            // BUG fix: this used to be the raw tag (e.g. "v11") - which is deliberately versionCode, not
+            // a human-readable version, so the update notification/dialog read "Twogether v11 is ready"
+            // even though the user thinks of this release as "2.1". Not the release's free-text "name"
+            // field either (e.g. "Twogether 2.1") - that's written by whoever cuts the release and
+            // already tends to include the app's own name, which would double up awkwardly wherever this
+            // versionName gets embedded in UI text. Instead, parsed from the APK asset's OWN filename,
+            // which this project has consistently named "Twogether-<versionName>.apk" (e.g.
+            // "Twogether-2.1.apk") ever since the very first release - structured, not free text, and
+            // already the thing a human would actually call this version. Falls back to the tag if a
+            // release's APK is ever named some other way.
+            //
+            // BUG fix: an independent review round caught that the fallback above was dead code in
+            // practice - takeIf { it.isNotBlank() } only rejects a genuinely EMPTY result, not one that
+            // simply didn't match the expected "Twogether-<x>.apk" shape (e.g. an asset literally named
+            // "app-release.apk" parsed to the non-blank-but-garbled "app-release"). Now requires the
+            // parsed result to actually look like a version (starts with a digit) before using it,
+            // falling back to the tag exactly as originally documented for anything else.
+            val versionName = apkAssetName
+                ?.removePrefix("Twogether-")
+                ?.removeSuffix(".apk")
+                ?.takeIf { it.isNotBlank() && it.first().isDigit() }
+                ?: tagName
+
             UpdateInfo(
                 versionCode = versionCode,
-                versionName = tagName,
+                versionName = versionName,
                 downloadUrl = downloadUrl
             )
         } catch (e: Exception) {

@@ -316,7 +316,13 @@ private fun MilestoneRetrospective(milestone: Milestone, moments: List<Moment>, 
                     Text("$year", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 12.dp, bottom = 8.dp))
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         yearMoments.forEach { moment ->
-                            val hasLocalPhoto = remember(moment.photoUri, moment.isRemote) { !moment.isRemote && File(moment.photoUri).isFile }
+                            // BUG fix: was `!moment.isRemote`, the pre-Feature-2 signal for "do we hold
+                            // the photo bytes" - MomentsScreen was already updated to the correct
+                            // `photoDownloaded` flag when photo sync was added (a partner's photo can be
+                            // isRemote=true AND fully downloaded), but this screen was missed. Without
+                            // this fix, a successfully-downloaded partner photo showed the placeholder
+                            // here while rendering correctly in the Moments gallery.
+                            val hasLocalPhoto = remember(moment.photoUri, moment.photoDownloaded) { moment.photoDownloaded && File(moment.photoUri).isFile }
                             if (hasLocalPhoto) {
                                 AsyncImage(
                                     model = moment.photoUri,

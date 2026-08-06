@@ -218,11 +218,23 @@ private fun BackfillPhotoDateDialog(
         parsedDate.isAfter(today) -> "Date can't be in the future"
         else -> null
     }
+    // BUG fix: for a same-day (today) entry, a "To" time later than the actual current wall-clock time
+    // used to save silently, creating a manual TogetherSession that ends in the future - unlike
+    // CalendarScreen's own backfill dialog (see its elapsedMinutesToday check), this screen had no
+    // equivalent guard at all. A future-dated session isn't caught by StatsCalculator's open-session
+    // clamp either (that only clamps sessions with no endedAt - this one has a real, just-wrong, endedAt),
+    // so it silently inflated all-time hours/longest-session until that moment in the future actually
+    // arrived.
+    val nowTimeToday = remember(parsedDate, today) {
+        if (parsedDate == today) LocalTime.now(zone) else null
+    }
+
     // Only evaluated/shown when wasTogether is checked - a blank/invalid time range must never block
     // saving the photo itself, since the together-time part is optional.
     val togetherError: String? = if (!wasTogether) null else when {
         parsedFrom == null || parsedTo == null -> "Enter both times as H:MM (24-hour)"
         !parsedTo.isAfter(parsedFrom) -> "\"To\" must be after \"From\""
+        nowTimeToday != null && parsedTo.isAfter(nowTimeToday) -> "\"To\" can't be later than the current time"
         else -> null
     }
     val error = dateError ?: togetherError

@@ -110,7 +110,10 @@ object BadgeCatalog {
             }
         }
         return when (type) {
-            BadgeType.HOURS -> Badge("hours_$threshold", type, threshold, "$threshold Hours Together", "💛")
+            // BUG fix: HOURS' smallest seed is 1, so "$threshold Hours Together" was reachable at
+            // threshold=1 ("1 Hours Together") - PERFECT_WEEKS below already handled this correctly for
+            // its own singular case, this one just hadn't been.
+            BadgeType.HOURS -> Badge("hours_$threshold", type, threshold, "$threshold Hour" + (if (threshold == 1) "" else "s") + " Together", "💛")
             BadgeType.DAILY_STREAK -> Badge("daily_$threshold", type, threshold, "$threshold Day Streak", "🔥")
             BadgeType.WEEKLY_STREAK -> Badge("weekly_$threshold", type, threshold, "$threshold Week Streak", "🌟")
             BadgeType.REUNIONS -> Badge("reunion_$threshold", type, threshold, "$threshold Reunions", "🤗")

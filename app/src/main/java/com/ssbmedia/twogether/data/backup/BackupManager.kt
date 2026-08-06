@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.room.withTransaction
 import com.ssbmedia.twogether.ServiceLocator
@@ -21,6 +22,7 @@ import com.ssbmedia.twogether.data.db.Moment
 import com.ssbmedia.twogether.data.db.MomentNote
 import com.ssbmedia.twogether.data.db.TimeCapsule
 import com.ssbmedia.twogether.data.db.TogetherSession
+import com.ssbmedia.twogether.data.repo.MomentRepository
 import com.ssbmedia.twogether.notif.MilestoneAlarmScheduler
 import com.ssbmedia.twogether.notif.Notifications
 import kotlinx.coroutines.CancellationException
@@ -87,6 +89,7 @@ import java.util.zip.ZipOutputStream
  * row), works identically on every API level 26+, and needs no storage permission at all.
  */
 object BackupManager {
+    private const val TAG = "BackupManager"
     private const val MANIFEST_ENTRY = "manifest.json"
     /** v1 -> v2: added sessions[].syncId, moments[].syncId/isRemote, momentNotes[], milestones[],
      * settings.localDeviceId.
@@ -226,7 +229,7 @@ object BackupManager {
             }
 
             ServiceLocator.settingsStore.setLastBackupResult(now, true)
-            BackupResult(true, publishedUri, "Backup saved to Downloads/$BACKUP_FOLDER_NAME (${sizeBytes / 1024} KB, ${moments.size} photo(s)).")
+            BackupResult(true, publishedUri, "Backup saved to Downloads/$BACKUP_FOLDER_NAME (${formatBackupSize(sizeBytes)}, ${moments.size} photo(s)).")
         } catch (e: CancellationException) {
             // MUST rethrow, never swallow - a blanket catch(e: Exception) below would otherwise also
             // catch this (CancellationException IS an Exception) and let this coroutine "complete
@@ -242,6 +245,16 @@ object BackupManager {
             ServiceLocator.settingsStore.setLastBackupResult(now, false)
             BackupResult(false, null, "Backup failed: ${e.message ?: e.javaClass.simpleName}")
         }
+    }
+
+    /** BUG fix: the result message used to do plain integer `sizeBytes / 1024`, so any backup under
+     * 1024 bytes (a genuinely tiny but completely valid backup - e.g. a couple with no photos yet)
+     * displayed as "0 KB", reading to the user like nothing was actually backed up. Shows bytes for
+     * anything under 1 KB, and rounds (not truncates) KB/MB for everything else. */
+    private fun formatBackupSize(sizeBytes: Long): String = when {
+        sizeBytes < 1024 -> "$sizeBytes bytes"
+        sizeBytes < 1024 * 1024 -> "${Math.round(sizeBytes / 1024.0)} KB"
+        else -> "${"%.1f".format(sizeBytes / (1024.0 * 1024.0))} MB"
     }
 
     private fun photoZipEntryName(moment: Moment): String = "photos/${moment.id}_${File(moment.photoUri).name}"
@@ -337,6 +350,11 @@ object BackupManager {
                     put("unlockAtHours", c.unlockAtHours.toDouble())
                     put("createdAt", c.createdAt)
                     put("unlockedAt", c.unlockedAt)
+                    // BUG fix: was missing entirely, so a restore always defaulted this to 0 regardless
+                    // of what it actually was - see parseTimeCapsules' matching fix for the full failure
+                    // scenario (a restored capsule's anti-cheat effective threshold silently drifts
+                    // upward by the couple's full current manual-hours credit).
+                    put("manualHoursAtCreation", c.manualHoursAtCreation.toDouble())
                 })
             }
         })
@@ -650,7 +668,7 @@ object BackupManager {
                     sessions = parseSessions(root.getJSONArray("sessions")),
                     dateIdeas = parseDateIdeas(root.getJSONArray("dateIdeas")),
                     timeCapsules = parseTimeCapsules(root.getJSONArray("timeCapsules")),
-                    moments = parseMoments(root.getJSONArray("moments")),
+                    moments = parseMoments(root.getJSONArray("moments"), context),
                     momentNotes = parseMomentNotes(root.optJSONArray("momentNotes")),
                     milestones = parseMilestones(root.optJSONArray("milestones")),
                     listCategories = parseListCategories(root.optJSONArray("listCategories")),
@@ -741,12 +759,48 @@ object BackupManager {
             ServiceLocator.badgeUnlocksStore.restoreRaw(parsed.badgeUnlocks)
 
             // Photo files last, once the DB rows that reference them are already committed.
+            //
+            // HIGH SECURITY fix, defense-in-depth: moment.photoUri is already sanitized at parse time
+            // (see parseMoments' own doc), so this canonical-path re-check should never actually trigger
+            // in practice - but it's the same cheap insurance GattSyncManager.savePhotoBytes already
+            // applies against its own already-safe path, for exactly the same reason: a future regression
+            // upstream of this point (a bug in parseMoments, a new code path that builds a Moment some
+            // other way) should never turn back into an arbitrary-file-write, silently.
+            val momentsDirCanonical = try {
+                File(context.filesDir, "moments").canonicalFile
+            } catch (e: Exception) {
+                null
+            }
             parsed.moments.forEach { moment ->
                 val entryName = moment.photoZipEntryHint ?: return@forEach
                 val extracted = extractedPhotos[entryName] ?: return@forEach
                 val destFile = File(moment.photoUri)
+                val destCanonical = try {
+                    destFile.canonicalFile
+                } catch (e: Exception) {
+                    return@forEach
+                }
+                if (momentsDirCanonical == null || destCanonical.parentFile != momentsDirCanonical) {
+                    Log.w(TAG, "Refusing to restore photo for moment ${moment.moment.syncId} - resolved path $destCanonical is outside $momentsDirCanonical")
+                    return@forEach
+                }
                 destFile.parentFile?.mkdirs()
                 extracted.copyTo(destFile, overwrite = true)
+            }
+
+            // MINOR fix: a restore onto a phone that already had its own local photos (not the primary
+            // "wipe and reinstall" scenario this feature targets, but a legitimate secondary one - e.g.
+            // restoring an older backup to undo a mistake) used to leave every pre-existing photo file on
+            // disk as an invisible, permanently orphaned duplicate - nothing referenced them anymore
+            // (the Room table above was already wholesale-replaced), but nothing ever deleted them
+            // either, silently doubling the app's photo storage. Deletes anything left in moments/ that
+            // isn't referenced by the just-restored moment set, matching the "REPLACE everything" the
+            // confirm dialog already promises.
+            if (momentsDirCanonical != null) {
+                val referencedNames = parsed.moments.mapNotNull { File(it.photoUri).name }.toSet()
+                momentsDirCanonical.listFiles()?.forEach { f ->
+                    if (f.isFile && f.name !in referencedNames) f.delete()
+                }
             }
 
             // Feature F: re-arm every restored milestone's yearly alarm - a fresh install (the disaster
@@ -822,6 +876,18 @@ object BackupManager {
         )
     }
 
+    /**
+     * BUG fix: manualHoursAtCreation used to be omitted entirely from the manifest, so every restored
+     * capsule silently defaulted to 0 - the anti-cheat model (see TimeCapsuleRepository's doc) computes
+     * a capsule's EFFECTIVE unlock threshold as `unlockAtHours + (currentManualCredit -
+     * manualHoursAtCreation)`, so restoring with this at 0 (instead of whatever the couple's manual
+     * credit actually was at creation) makes the effective threshold silently rise by the couple's full
+     * CURRENT manual-hours credit - a real, irreversible-feeling regression a user could observe as
+     * "my capsule got harder to unlock after I restored a backup". `optDouble` defaults to 0.0 for a v1/
+     * v2/pre-this-fix backup that genuinely never had this key, which is the correct behavior for THOSE
+     * older backups (there's no better value to fall back to) - only the round-trip through a
+     * current-format backup needed fixing.
+     */
     private fun parseTimeCapsules(arr: JSONArray): List<TimeCapsule> = (0 until arr.length()).map { i ->
         val o = arr.getJSONObject(i)
         TimeCapsule(
@@ -829,17 +895,36 @@ object BackupManager {
             text = o.getString("text"),
             unlockAtHours = o.getDouble("unlockAtHours").toFloat(),
             createdAt = o.getLong("createdAt"),
-            unlockedAt = if (o.isNull("unlockedAt")) null else o.getLong("unlockedAt")
+            unlockedAt = if (o.isNull("unlockedAt")) null else o.getLong("unlockedAt"),
+            manualHoursAtCreation = o.optDouble("manualHoursAtCreation", 0.0).toFloat()
         )
     }
 
-    private fun parseMoments(arr: JSONArray): List<MomentWithZipHint> = (0 until arr.length()).map { i ->
+    /**
+     * HIGH SECURITY fix: `photoUri` here is UNTRUSTED data from the backup zip's manifest.json - a
+     * crafted/tampered backup could set it to an arbitrary absolute path (e.g. this app's own Room DB
+     * file or a DataStore preferences file) for restoreBackup()'s later `File(moment.photoUri).../
+     * copyTo(overwrite=true)` step to overwrite. This is the exact same vulnerability class as
+     * MomentRepository.mergeRemoteStubs' SECURITY fix for the live BLE sync path (see its own doc) -
+     * that fix was never carried over to the restore path until now. Same remedy: the wire/file value is
+     * used for NOTHING but a best-effort file-extension hint (via MomentRepository.extensionFromHint,
+     * validated against a hardcoded allowlist), and the actual local photoUri is always the
+     * deterministic MomentRepository.localPhotoFile(context, syncId, ...) path instead - computed here,
+     * at parse time, so the DB row itself never holds an attacker-influenced PHOTO-URI path at any point.
+     * `syncId` itself (also from the same untrusted manifest) is a SEPARATE input to that same
+     * localPhotoFile() call - an independent review round caught that it wasn't being validated either,
+     * so a crafted syncId could still steer the computed path outside filesDir/moments/ even with
+     * photoUri itself fully ignored. That's now fixed centrally inside localPhotoFile() itself (see its
+     * own doc), which also covers mergeRemoteStubs' identical wire-data syncId for the BLE sync path.
+     */
+    private fun parseMoments(arr: JSONArray, context: Context): List<MomentWithZipHint> = (0 until arr.length()).map { i ->
         val o = arr.getJSONObject(i)
         val syncId = o.optStringOrNull("syncId")?.takeIf { it.isNotBlank() } ?: java.util.UUID.randomUUID().toString()
         val isRemote = o.optBoolean("isRemote", false)
+        val rawPhotoUriHint = o.getString("photoUri")
         val moment = Moment(
             id = o.getLong("id"),
-            photoUri = o.getString("photoUri"),
+            photoUri = MomentRepository.localPhotoFile(context, syncId, MomentRepository.extensionFromHint(rawPhotoUriHint)).absolutePath,
             takenAt = o.getLong("takenAt"),
             sessionId = if (o.isNull("sessionId")) null else o.getLong("sessionId"),
             syncId = syncId,

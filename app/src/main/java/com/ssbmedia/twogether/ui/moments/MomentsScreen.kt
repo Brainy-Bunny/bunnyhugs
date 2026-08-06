@@ -108,6 +108,16 @@ fun MomentsScreen(onBack: () -> Unit, onNavigateCamera: () -> Unit) {
     // this triggers. New Moments land in the same observeAll() Flow this screen already collects, so
     // nothing else here needs to change once GalleryImportHost's onImported fires.
     GalleryImportHost(onImported = {}) { launchGalleryPicker ->
+        // BUG fix: MomentFullScreen used to be rendered INSIDE the Scaffold's content slot below, which
+        // only fills the content area BELOW the top bar - the Scaffold's own topBar and
+        // floatingActionButton are separate slots that always compose on top of it regardless. Despite
+        // MomentFullScreen's own Box being "fillMaxSize()" with a 94%-black background, the top app bar
+        // and both FABs stayed live and visible drawn OVER it - specifically, the camera FAB overlapped
+        // the note's "Save" button by more than half its area, and since the FAB sits above in z-order,
+        // taps in that overlap region opened the camera instead of saving the note. Moving
+        // MomentFullScreen to a sibling of the Scaffold (inside this outer Box, composed after it) makes
+        // it a true full-screen overlay covering the top bar and FABs too, matching the intended design.
+        Box(modifier = Modifier.fillMaxSize()) {
         Scaffold(
             topBar = {
                 CenterAlignedTopAppBar(
@@ -182,6 +192,7 @@ fun MomentsScreen(onBack: () -> Unit, onNavigateCamera: () -> Unit) {
             }
         }
         }
+        }
 
         selected?.let { moment ->
             MomentFullScreen(
@@ -194,7 +205,7 @@ fun MomentsScreen(onBack: () -> Unit, onNavigateCamera: () -> Unit) {
                 onDelete = { vm.deleteMoment(moment); selected = null }
             )
         }
-    }
+        }
     }
 }
 

@@ -198,13 +198,16 @@ private fun BadgeProgressBarsSection(stats: TogetherStats) {
                 BadgeMaxedRow(emoji = badge.emoji, label = "Days", caption = "${badge.title} 💛")
             } else {
                 val (daysPrev, daysNext) = BadgeCatalog.nextAndPrevThreshold(BadgeType.DAILY_STREAK, stats.longestDailyStreak)
+                val daysRemaining = (daysNext - stats.longestDailyStreak).coerceAtLeast(0)
                 BadgeProgressBarRow(
                     emoji = "🔥",
                     label = "Days",
                     current = stats.longestDailyStreak.toDouble(),
                     prevThreshold = daysPrev,
                     nextThreshold = daysNext,
-                    caption = "${(daysNext - stats.longestDailyStreak).coerceAtLeast(0)} days to your next badge"
+                    // BUG fix: "1 days to your next badge" was reachable whenever exactly 1 more day
+                    // would complete the streak.
+                    caption = "$daysRemaining day" + (if (daysRemaining == 1) "" else "s") + " to your next badge"
                 )
             }
 
@@ -213,13 +216,14 @@ private fun BadgeProgressBarsSection(stats: TogetherStats) {
                 BadgeMaxedRow(emoji = badge.emoji, label = "Week Streak", caption = "${badge.title} 💛")
             } else {
                 val (weeksPrev, weeksNext) = BadgeCatalog.nextAndPrevThreshold(BadgeType.WEEKLY_STREAK, stats.longestWeeklyStreak)
+                val weeksRemaining = (weeksNext - stats.longestWeeklyStreak).coerceAtLeast(0)
                 BadgeProgressBarRow(
                     emoji = "🌟",
                     label = "Week Streak",
                     current = stats.longestWeeklyStreak.toDouble(),
                     prevThreshold = weeksPrev,
                     nextThreshold = weeksNext,
-                    caption = "${(weeksNext - stats.longestWeeklyStreak).coerceAtLeast(0)} weeks to your next badge"
+                    caption = "$weeksRemaining week" + (if (weeksRemaining == 1) "" else "s") + " to your next badge"
                 )
             }
 
@@ -228,13 +232,14 @@ private fun BadgeProgressBarsSection(stats: TogetherStats) {
                 BadgeMaxedRow(emoji = badge.emoji, label = "Reunions", caption = "${badge.title} 💛")
             } else {
                 val (reunionsPrev, reunionsNext) = BadgeCatalog.nextAndPrevThreshold(BadgeType.REUNIONS, stats.reunionCount)
+                val reunionsRemaining = (reunionsNext - stats.reunionCount).coerceAtLeast(0)
                 BadgeProgressBarRow(
                     emoji = "🤗",
                     label = "Reunions",
                     current = stats.reunionCount.toDouble(),
                     prevThreshold = reunionsPrev,
                     nextThreshold = reunionsNext,
-                    caption = "${(reunionsNext - stats.reunionCount).coerceAtLeast(0)} reunions to your next badge"
+                    caption = "$reunionsRemaining reunion" + (if (reunionsRemaining == 1) "" else "s") + " to your next badge"
                 )
             }
         }

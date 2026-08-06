@@ -408,7 +408,9 @@ fun HomeScreen(
                     ) {
                         Column(Modifier.padding(16.dp)) {
                             Text("🔥 Daily streak", style = MaterialTheme.typography.bodySmall)
-                            Text("${stats.currentDailyStreak} days", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                            // BUG fix: a 1-day streak (very common right after the couple's first day
+                            // together) read as "1 days".
+                            Text("${stats.currentDailyStreak} day" + (if (stats.currentDailyStreak == 1) "" else "s"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                         }
                     }
                     Card(
