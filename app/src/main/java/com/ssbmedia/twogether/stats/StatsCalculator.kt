@@ -316,9 +316,35 @@ object StatsCalculator {
         lastSeenAt: Long,
         absenceTimeoutMillis: Long
     ): List<Interval> {
+        // MINOR fix, defense-in-depth (ultimate-app-review, round-2 re-verification, Sonnet): every
+        // ingestion path (GattSyncManager's wire sync, BackupManager's restore) already validates a
+        // session's bounds through SessionBoundsValidator before it ever reaches local storage - but
+        // this function reads whatever is ALREADY in the local table, with no floor of its own. A row
+        // that reached the table some other way (a future bug in either ingestion path, or literal
+        // on-device root/`run-as` tampering with this app's own database - live-reproduced during
+        // round-2 testing, requires already having root on your own phone, same threat-model boundary
+        // this app already accepts elsewhere) still reached buildDailyMinuteMap's one-calendar-day-at-a-
+        // time walk unfiltered, reproducing the exact unrecoverable OutOfMemoryError crash-loop the
+        // ingestion-side fixes were meant to eliminate. This is the last line of defense, not the
+        // primary fix - a row failing this filter is silently excluded from stats rather than being
+        // "fixed" (there's no correct value to guess at this layer), same fail-safe direction as an
+        // ingestion path rejecting an implausible row outright.
+        //
+        // Deliberately does NOT also reject a start/end merely ahead of the `now` parameter (unlike the
+        // ingestion-side validators) - `now` here is caller-supplied and can be legitimately stale by
+        // more than a few minutes relative to real wall-clock time (see "today is derived from the now
+        // parameter..." below, an intentional B75-class rollover fix that depends on real sessions being
+        // allowed to sit ahead of a stale `now`). Only catches the OVERFLOW-CLASS garbage this layer
+        // exists to stop: a startedAt/endedAt so far outside any real calendar date, or a duration so
+        // long, that no legitimate together-session could ever produce it - not "unusually recent."
         val raw = sessions
             .map { Interval(it.startedAt, it.endedAt ?: effectiveOpenSessionEnd(it.startedAt, now, lastSeenAt, absenceTimeoutMillis)) }
             .filter { it.end > it.start }
+            .filter {
+                it.start >= com.ssbmedia.twogether.util.SessionBoundsValidator.MIN_PLAUSIBLE_TIMESTAMP_MILLIS &&
+                    it.end >= com.ssbmedia.twogether.util.SessionBoundsValidator.MIN_PLAUSIBLE_TIMESTAMP_MILLIS &&
+                    (it.end - it.start) <= com.ssbmedia.twogether.ble.GattSyncManager.MAX_PLAUSIBLE_SESSION_DURATION_MILLIS
+            }
             .sortedBy { it.start }
         if (raw.isEmpty()) return emptyList()
 
