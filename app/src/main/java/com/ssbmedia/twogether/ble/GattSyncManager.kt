@@ -194,17 +194,23 @@ class GattSyncManager(
 
     private fun deserializeDateIdeas(arr: JSONArray?): List<DateIdea> {
         if (arr == null) return emptyList()
-        return (0 until arr.length()).map { i ->
+        return (0 until arr.length()).mapNotNull { i ->
             val o = arr.getJSONObject(i)
+            val id = o.getString("id")
+            val updatedAt = o.getLong("updatedAt")
+            if (!isPlausibleWireUpdatedAt(updatedAt)) {
+                Log.w(TAG, "Dropping remote dateIdea $id with implausible updatedAt=$updatedAt")
+                return@mapNotNull null
+            }
             DateIdea(
-                id = o.getString("id"),
+                id = id,
                 text = o.getString("text"),
                 // Defensive fallback (not getString): a payload from a not-yet-updated partner device, or
                 // any other edge case where the key is somehow missing, degrades safely into the default
                 // list rather than throwing and aborting the whole merge.
                 listId = o.optString("listId", DEFAULT_LIST_ID),
                 done = o.getBoolean("done"),
-                updatedAt = clampWireUpdatedAt(o.getLong("updatedAt")),
+                updatedAt = updatedAt,
                 deleted = o.getBoolean("deleted")
             )
         }
@@ -226,13 +232,19 @@ class GattSyncManager(
 
     private fun deserializeListCategories(arr: JSONArray?): List<ListCategory> {
         if (arr == null) return emptyList()
-        return (0 until arr.length()).map { i ->
+        return (0 until arr.length()).mapNotNull { i ->
             val o = arr.getJSONObject(i)
+            val id = o.getString("id")
+            val updatedAt = o.getLong("updatedAt")
+            if (!isPlausibleWireUpdatedAt(updatedAt)) {
+                Log.w(TAG, "Dropping remote listCategory $id with implausible updatedAt=$updatedAt")
+                return@mapNotNull null
+            }
             ListCategory(
-                id = o.getString("id"),
+                id = id,
                 name = o.getString("name"),
                 createdAt = o.getLong("createdAt"),
-                updatedAt = clampWireUpdatedAt(o.getLong("updatedAt")),
+                updatedAt = updatedAt,
                 deleted = o.optBoolean("deleted", false)
             )
         }
@@ -269,14 +281,15 @@ class GattSyncManager(
             // around now, or an implausibly long duration. A deleted-tombstone row (endedAt still present
             // per the isNull check above) is exempt from the "not in the future" check on startedAt/endedAt
             // individually but still must satisfy end >= start and the duration ceiling.
-            val now = System.currentTimeMillis()
-            val maxPlausibleBound = now + MAX_CLOCK_SKEW_TOLERANCE_MILLIS
+            val updatedAt = o.optLong("updatedAt", 0L)
+            val maxPlausibleBound = System.currentTimeMillis() + MAX_CLOCK_SKEW_TOLERANCE_MILLIS
             if (endedAt < startedAt ||
                 startedAt > maxPlausibleBound ||
                 endedAt > maxPlausibleBound ||
-                (endedAt - startedAt) > MAX_PLAUSIBLE_SESSION_DURATION_MILLIS
+                (endedAt - startedAt) > MAX_PLAUSIBLE_SESSION_DURATION_MILLIS ||
+                !isPlausibleWireUpdatedAt(updatedAt)
             ) {
-                Log.w(TAG, "Rejecting implausible remote session $syncId: startedAt=$startedAt endedAt=$endedAt")
+                Log.w(TAG, "Rejecting implausible remote session $syncId: startedAt=$startedAt endedAt=$endedAt updatedAt=$updatedAt")
                 return@mapNotNull null
             }
             TogetherSession(
@@ -284,16 +297,23 @@ class GattSyncManager(
                 endedAt = endedAt,
                 isManual = o.optBoolean("isManual", false),
                 syncId = syncId,
-                updatedAt = clampWireUpdatedAt(o.optLong("updatedAt", 0L)),
+                updatedAt = updatedAt,
                 deleted = o.optBoolean("deleted", false)
             )
         }
     }
 
-    /** BLOCKER fix (shared helper): clamps a peer-supplied `updatedAt` used in every LWW merge to
-     * `now + MAX_CLOCK_SKEW_TOLERANCE_MILLIS` - see that constant's doc for the full reasoning. */
-    private fun clampWireUpdatedAt(wireUpdatedAt: Long): Long =
-        wireUpdatedAt.coerceAtMost(System.currentTimeMillis() + MAX_CLOCK_SKEW_TOLERANCE_MILLIS)
+    /** BLOCKER fix, round 3 (shared helper): an independent testing round found the original approach of
+     * CLAMPING an implausible peer-supplied `updatedAt` to `now + tolerance` (rather than rejecting it)
+     * didn't actually self-heal as intended - because full tables are resent on every sync, and the clamp
+     * ceiling is the RECEIVER's current `now` at the moment of each sync, a still-poisoned row on one
+     * device gets re-clamped to a fresh, ever-later ceiling every round, letting it repeatedly beat and
+     * overwrite the victim's genuine edits made in between syncs, not just win once. Rejecting the record
+     * outright instead (used at every LWW merge call site below, same as deserializeSessions above)
+     * eliminates the drift entirely: an implausible remote value can never win, no matter how many times
+     * it's retransmitted or how much time passes, since it's simply never merged in the first place. */
+    private fun isPlausibleWireUpdatedAt(wireUpdatedAt: Long): Boolean =
+        wireUpdatedAt <= System.currentTimeMillis() + MAX_CLOCK_SKEW_TOLERANCE_MILLIS
 
     private fun serializeMoments(moments: List<Moment>): JSONArray {
         val arr = JSONArray()
@@ -324,12 +344,17 @@ class GattSyncManager(
             val o = arr.getJSONObject(i)
             val syncId = o.optString("syncId", "")
             if (syncId.isBlank()) return@mapNotNull null
+            val updatedAt = o.optLong("updatedAt", 0L)
+            if (!isPlausibleWireUpdatedAt(updatedAt)) {
+                Log.w(TAG, "Dropping remote moment $syncId with implausible updatedAt=$updatedAt")
+                return@mapNotNull null
+            }
             Moment(
                 photoUri = o.optString("photoUri", ""),
                 takenAt = o.getLong("takenAt"),
                 syncId = syncId,
                 isRemote = true,
-                updatedAt = clampWireUpdatedAt(o.optLong("updatedAt", 0L)),
+                updatedAt = updatedAt,
                 deleted = o.optBoolean("deleted", false)
             )
         }
@@ -365,13 +390,19 @@ class GattSyncManager(
 
     private fun deserializeNotes(arr: JSONArray?): List<MomentNote> {
         if (arr == null) return emptyList()
-        return (0 until arr.length()).map { i ->
+        return (0 until arr.length()).mapNotNull { i ->
             val o = arr.getJSONObject(i)
+            val momentSyncId = o.getString("momentSyncId")
+            val updatedAt = o.getLong("updatedAt")
+            if (!isPlausibleWireUpdatedAt(updatedAt)) {
+                Log.w(TAG, "Dropping remote moment note for $momentSyncId with implausible updatedAt=$updatedAt")
+                return@mapNotNull null
+            }
             MomentNote(
-                momentSyncId = o.getString("momentSyncId"),
+                momentSyncId = momentSyncId,
                 authorDeviceId = o.getString("authorDeviceId"),
                 text = o.optString("text", ""),
-                updatedAt = clampWireUpdatedAt(o.getLong("updatedAt")),
+                updatedAt = updatedAt,
                 deleted = o.optBoolean("deleted", false)
             )
         }
@@ -396,10 +427,16 @@ class GattSyncManager(
 
     private fun deserializeMilestones(arr: JSONArray?): List<Milestone> {
         if (arr == null) return emptyList()
-        return (0 until arr.length()).map { i ->
+        return (0 until arr.length()).mapNotNull { i ->
             val o = arr.getJSONObject(i)
+            val id = o.getString("id")
+            val updatedAt = o.getLong("updatedAt")
+            if (!isPlausibleWireUpdatedAt(updatedAt)) {
+                Log.w(TAG, "Dropping remote milestone $id with implausible updatedAt=$updatedAt")
+                return@mapNotNull null
+            }
             Milestone(
-                id = o.getString("id"),
+                id = id,
                 label = o.getString("label"),
                 // BLOCKER fix: month/day here are WIRE DATA from the paired peer, unvalidated. An
                 // independent testing round found that an out-of-range month (e.g. 0 or 13) reaches
@@ -413,7 +450,7 @@ class GattSyncManager(
                 day = o.getInt("day").coerceIn(1, 31),
                 year = if (o.isNull("year")) null else o.getInt("year"),
                 createdAt = o.getLong("createdAt"),
-                updatedAt = clampWireUpdatedAt(o.getLong("updatedAt")),
+                updatedAt = updatedAt,
                 deleted = o.optBoolean("deleted", false)
             )
         }
