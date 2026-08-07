@@ -171,7 +171,11 @@ object UpdateChecker {
         } catch (e: Exception) {
             return false
         }
-        val host = uri.host ?: return false
+        // MINOR fix (ultimate-app-review, fresh-reviewer re-verify of the fix above): a trailing root
+        // label dot ("github.com.") is a DNS-equivalent FQDN for the same host, but was falsely
+        // REJECTED (fails safe, never a security hole - just an over-broad rejection) since neither
+        // equals() nor endsWith() strip it. Normalized away before comparing.
+        val host = (uri.host ?: return false).removeSuffix(".")
         return uri.scheme.equals("https", ignoreCase = true) &&
             (host.equals("github.com", ignoreCase = true) ||
                 host.endsWith(".githubusercontent.com", ignoreCase = true))

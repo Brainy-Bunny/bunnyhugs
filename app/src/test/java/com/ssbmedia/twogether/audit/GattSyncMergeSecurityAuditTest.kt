@@ -167,4 +167,33 @@ class GattSyncMergeSecurityAuditTest {
         val result = invokePrivate<List<*>>(newManager(), "deserializeDateIdeas", arr)
         assertEquals("only the legitimate idea should survive the merge", 1, result.size)
     }
+
+    // Below: proposed by the fresh Sonnet reviewer that re-verified the URL-validation fix and
+    // critiqued this file's coverage (ultimate-app-review Step 4 localized-fix routing).
+
+    @Test
+    fun `isPlausibleWireUpdatedAt boundary - just inside vs just outside the skew tolerance`() {
+        // MAX_CLOCK_SKEW_TOLERANCE_MILLIS = 5 minutes and the real check reads System.currentTimeMillis()
+        // itself, so an exact-millisecond boundary against a `now` captured in the test is inherently
+        // flaky (two separate clock reads, real wall-clock drift between them). A 2s safety margin on
+        // each side is well within the 5-minute tolerance being tested but well outside realistic
+        // test-execution drift.
+        val now = System.currentTimeMillis()
+        val manager = newManager()
+        assertTrue(invokePrivate<Boolean>(manager, "isPlausibleWireUpdatedAt", now + 5 * 60_000L - 2_000L))
+        assertTrue(
+            "clearly past the skew tolerance must be rejected",
+            !invokePrivate<Boolean>(manager, "isPlausibleWireUpdatedAt", now + 5 * 60_000L + 2_000L)
+        )
+    }
+
+    @Test
+    fun `a legitimate newer record still wins the merge`() {
+        // Positive control for the reject-not-clamp fix: rejection must be specific to implausible
+        // values, not an accidental blanket rejection of anything newer than what's already local.
+        val now = System.currentTimeMillis()
+        val arr = sessionJson("s3", now - 3_600_000L, now - 1_800_000L, now)
+        val result = invokePrivate<List<*>>(newManager(), "deserializeSessions", arr)
+        assertEquals(1, result.size)
+    }
 }

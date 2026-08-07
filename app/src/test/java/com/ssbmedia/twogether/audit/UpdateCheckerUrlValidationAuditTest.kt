@@ -57,4 +57,50 @@ class UpdateCheckerUrlValidationAuditTest {
     fun `a malformed url is rejected, not thrown`() {
         assertFalse(isTrusted("not a url at all"))
     }
+
+    // Below: proposed by the fresh Sonnet reviewer that re-verified isTrustedReleaseAssetUrl
+    // (ultimate-app-review Step 4 localized-fix routing) - closing the coverage gaps it flagged.
+
+    @Test
+    fun `userinfo before the real host does not prevent trust`() {
+        // https://evil.com@github.com/... - uri.host is genuinely "github.com" here (userinfo is a
+        // separate URI component), so this one is EXPECTED to be trusted - included to document that,
+        // not as a bypass. The dangerous direction (real host name used only as userinfo, real host
+        // being something else) is the next test.
+        assertTrue(isTrusted("https://evil.com@github.com/Twogether-2.5.apk"))
+    }
+
+    @Test
+    fun `userinfo used to smuggle a fake host in front of the real-looking suffix is rejected`() {
+        // https://github.com@evil.com/... - uri.host is "evil.com"; "github.com" is just userinfo
+        // (credentials), the realistic phishing shape a naive string-contains check would miss.
+        assertFalse(isTrusted("https://github.com@evil.com/Twogether-2.5.apk"))
+    }
+
+    @Test
+    fun `an IP-literal host is rejected`() {
+        assertFalse(isTrusted("https://140.82.121.3/Twogether-2.5.apk"))
+    }
+
+    @Test
+    fun `a javascript scheme is rejected`() {
+        assertFalse(isTrusted("javascript:alert(1)"))
+    }
+
+    @Test
+    fun `a file scheme is rejected`() {
+        assertFalse(isTrusted("file:///etc/passwd"))
+    }
+
+    @Test
+    fun `a trailing-dot FQDN for the real host is still trusted`() {
+        // "github.com." is DNS-equivalent to "github.com" - must not be falsely rejected (fails safe
+        // either way, but the intent is to accept the real host in all its equivalent forms).
+        assertTrue(isTrusted("https://github.com./Twogether-2.5.apk"))
+    }
+
+    @Test
+    fun `uppercase scheme is still accepted`() {
+        assertTrue(isTrusted("HTTPS://github.com/Twogether-2.5.apk"))
+    }
 }
