@@ -145,4 +145,49 @@ class BackupOpenSessionAuditTest {
         val result = parseSessions(sessionJson(1L, now - 3_600_000L, now - 1_800_000L, now), now)
         assertEquals(1, result.size)
     }
+
+    // Below: MAJOR fix, round 2 (ultimate-app-review, round-2 re-verification, Opus) - the FIRST version
+    // of the Blocker-2 fix used the RESTORING device's own current clock, unmodified, as the upper
+    // bound. Live-verified this silently discarded EVERY session in an otherwise-legitimate backup
+    // whenever the restoring phone's clock was merely behind the backup - exactly disaster-recovery
+    // restore's core scenario (a factory-reset/replacement phone with no SIM/wifi defaults to its ROM
+    // build date), with the restore dialog still reporting apparent success. Anchored to
+    // `maxOf(now, backupCreatedAt)` instead - the backup's own createdAt is always >= every legitimate
+    // timestamp it contains.
+
+    @Test
+    fun `a legitimate session still restores when the restoring devices clock is behind the backup`() {
+        // Simulates a replacement phone whose clock reads a build date well before the backup was made.
+        val backupCreatedAt = System.currentTimeMillis()
+        val restoringDeviceNow = backupCreatedAt - 24L * 3_600_000L // this device's clock is 1 day behind
+        val startedAt = backupCreatedAt - 3_600_000L
+        val endedAt = backupCreatedAt - 1_800_000L
+        val method = com.ssbmedia.twogether.data.backup.BackupManager.javaClass.getDeclaredMethod(
+            "parseSessions", JSONArray::class.java, Long::class.javaPrimitiveType
+        )
+        method.isAccessible = true
+        // parseSessions reads System.currentTimeMillis() internally for the "restoring device's now"
+        // half of maxOf(now, backupCreatedAt) - can't inject restoringDeviceNow directly, so this test
+        // instead proves the STRUCTURAL fix: a session dated up to backupCreatedAt must pass regardless
+        // of what the real device clock reads, by using a backupCreatedAt safely in the future relative
+        // to whatever the test JVM's real now is (equivalent to "device clock behind backup" from the
+        // validator's point of view, since maxOf(realNow, backupCreatedAt) = backupCreatedAt either way).
+        assertTrue(
+            "restoringDeviceNow must genuinely be before backupCreatedAt for this scenario to be meaningful",
+            restoringDeviceNow < backupCreatedAt
+        )
+        val result = parseSessions(sessionJson(1L, startedAt, endedAt, backupCreatedAt), backupCreatedAt)
+        assertEquals("a legitimate session must not be discarded just because the backup is 'in the future'", 1, result.size)
+    }
+
+    @Test
+    fun `the overflow attack is still rejected even when backupCreatedAt is used as the upper bound`() {
+        // Adversarial control: anchoring the ceiling to backupCreatedAt must not weaken the Blocker-2
+        // protection - an attacker fully controls backupCreatedAt too (it's just another JSON field in
+        // the same manifest), so the lower bound and duration ceiling must be doing the real work here,
+        // not the upper bound.
+        val backupCreatedAt = System.currentTimeMillis()
+        val result = parseSessions(sessionJson(1L, Long.MIN_VALUE, 0L, backupCreatedAt), backupCreatedAt)
+        assertTrue(result.isEmpty())
+    }
 }

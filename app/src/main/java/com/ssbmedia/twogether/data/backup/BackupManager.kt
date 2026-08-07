@@ -690,6 +690,12 @@ object BackupManager {
                 return@withContext BackupResult(false, null, "This backup was made by an incompatible version of Twogether.", permanent = true)
             }
 
+            // MINOR fix (ultimate-app-review, round-2 re-verification, Opus): parseSessions can now
+            // silently drop a row as implausible (same as the wire sync path already can) - the restore-
+            // complete dialog below reports this, mirroring the "N items skipped" signal
+            // GattSyncManager/OurListsScreen already show for sync (F-4 assertion 6), so a rejection is
+            // never silent regardless of which path it happens on.
+            val rawSessionCount = root.getJSONArray("sessions").length()
             val parsed = try {
                 ParsedBackup(
                     sessions = parseSessions(root.getJSONArray("sessions"), root.optLong("createdAt", System.currentTimeMillis())),
@@ -842,11 +848,17 @@ object BackupManager {
             // scenario backup/restore exists for) starts with none scheduled at all.
             MilestoneAlarmScheduler.scheduleAll(context, parsed.milestones.filter { !it.deleted })
 
+            val droppedSessionCount = rawSessionCount - parsed.sessions.size
             BackupResult(
                 true, zipUri,
                 "Restored ${parsed.sessions.size} session(s), ${parsed.moments.size} photo(s), " +
                     "${parsed.dateIdeas.size} date idea(s), ${parsed.timeCapsules.size} capsule(s), " +
-                    "${parsed.milestones.size} milestone(s)."
+                    "${parsed.milestones.size} milestone(s)." +
+                    if (droppedSessionCount > 0) {
+                        " ($droppedSessionCount session(s) skipped as implausible - check this phone's clock is correct.)"
+                    } else {
+                        ""
+                    }
             )
         } catch (e: CancellationException) {
             throw e
@@ -915,8 +927,21 @@ object BackupManager {
         // StatsCalculator tried to compute stats from it (only `pm clear` escaped). Same shared validator
         // GattSyncManager.deserializeSessions uses, so the two paths can't independently drift out of
         // sync the way they just did.
+        //
+        // MAJOR fix, round 2 (ultimate-app-review, round-2 re-verification, Opus): the FIRST version of
+        // this validation used the RESTORING device's own `System.currentTimeMillis()` as the upper
+        // bound, unmodified - live-verified this silently discarded EVERY session in an otherwise
+        // completely legitimate backup whenever the restoring phone's clock was merely behind the
+        // backup (a factory-reset/replacement phone with no SIM/wifi defaulting to its ROM build date is
+        // exactly disaster-recovery restore's core scenario, per this file's own header doc), with the
+        // restore dialog still reporting apparent success. Anchored to `maxOf(now, backupCreatedAt)`
+        // instead: the backup's own createdAt is always >= every legitimate timestamp it contains (it
+        // was taken after them), so using it as a floor for the ceiling preserves the exact same
+        // protection against the Long.MIN_VALUE-class overflow attack (still caught by the lower bound
+        // and duration ceiling regardless of this value) while no longer punishing an honestly-slow
+        // restoring clock for a backup that's already in the past relative to real time.
         if (!com.ssbmedia.twogether.util.SessionBoundsValidator.isPlausible(
-                startedAt, endedAt, System.currentTimeMillis(),
+                startedAt, endedAt, maxOf(System.currentTimeMillis(), backupCreatedAt),
                 com.ssbmedia.twogether.ble.GattSyncManager.MAX_CLOCK_SKEW_TOLERANCE_MILLIS,
                 com.ssbmedia.twogether.ble.GattSyncManager.MAX_PLAUSIBLE_SESSION_DURATION_MILLIS
             )

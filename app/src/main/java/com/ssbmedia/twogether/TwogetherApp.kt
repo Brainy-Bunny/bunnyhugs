@@ -54,14 +54,20 @@ class TwogetherApp : Application() {
         // Resumes a backup restore that got interrupted before completing (process death mid-restore) -
         // see BackupManager.restoreBackupDurable/resumePendingRestoreIfAny's docs. A no-op on every
         // normal app start where nothing is pending, which is the overwhelming majority of the time.
+        //
+        // MINOR fix (ultimate-app-review, round-2 re-verification, Opus): ClockSkewSelfHeal.run() used
+        // to be its own independent launch{} here, racing this one - a resumed restore's clearAll() +
+        // repopulate transaction could interleave with the self-heal's own read-filter-upsertAll sweep
+        // and resurrect a row (including a moment whose photo file the restore had already deleted) the
+        // restore was in the middle of legitimately discarding. Sequenced into this same coroutine,
+        // AFTER any pending restore resumes, so the self-heal only ever runs against a database that's
+        // either fully restored or was never touched by a restore at all this session.
         ServiceLocator.applicationScope.launch {
             BackupManager.resumePendingRestoreIfAny(this@TwogetherApp)
-        }
-        // MAJOR fix (ultimate-app-review, post-restart full-scope round, Opus): self-heals any row this
-        // device itself wrote with an implausibly future updatedAt during a past period of genuine clock
-        // error - see ClockSkewSelfHeal's own doc. A no-op on every normal app start where nothing is
-        // stale, which is the overwhelming majority of the time.
-        ServiceLocator.applicationScope.launch {
+            // MAJOR fix (ultimate-app-review, post-restart full-scope round, Opus): self-heals any row
+            // this device itself wrote with an implausibly future updatedAt during a past period of
+            // genuine clock error - see ClockSkewSelfHeal's own doc. A no-op on every normal app start
+            // where nothing is stale, which is the overwhelming majority of the time.
             ClockSkewSelfHeal.run()
         }
     }

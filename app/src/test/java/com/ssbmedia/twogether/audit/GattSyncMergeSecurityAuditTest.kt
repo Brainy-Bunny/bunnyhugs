@@ -354,8 +354,16 @@ class GattSyncMergeSecurityAuditTest {
 
     @Test
     fun `exactly at the cap boundary still passes through`() {
-        val oneYear = 365L * 24 * 3_600_000L
-        assertEquals(oneYear, boundPeerClockOffset(oneYear))
+        val thirtyDays = 30L * 24 * 3_600_000L
+        assertEquals(thirtyDays, boundPeerClockOffset(thirtyDays))
+    }
+
+    @Test
+    fun `a ten-month offset (Opus round-2 finding) now correctly falls back to zero`() {
+        // The original 1-year cap let this through, laundering the peer's honest current data ~10
+        // months into the past on the receiving device - tightened per this constant's own doc.
+        val tenMonths = 300L * 24 * 3_600_000L
+        assertEquals(0L, boundPeerClockOffset(tenMonths))
     }
 
     // Below: proposed by the fresh Sonnet reviewer in the post-restart full-scope round (ultimate-app-

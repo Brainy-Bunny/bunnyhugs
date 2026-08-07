@@ -1750,10 +1750,16 @@ class GattSyncManager(
         /** MAJOR fix (ultimate-app-review, post-restart full-scope round, Opus): caps how large a
          * peer-reported clock offset applyPayload's correction will ever act on - see its own doc for
          * why an unbounded offset let an obviously-broken peer clock (e.g. set to 2050) launder its data
-         * into a plausible-looking but wrong moment in the past instead of being rejected outright. 1
-         * year is far beyond any genuine unsynced-clock drift (minutes to days) while still comfortably
-         * covering a wrong-year mistake in either direction. */
-        const val MAX_PLAUSIBLE_PEER_CLOCK_OFFSET_MILLIS = 365L * 24 * 60 * 60 * 1000
+         * into a plausible-looking but wrong moment in the past instead of being rejected outright.
+         *
+         * MINOR fix, round 2 (ultimate-app-review, round-2 re-verification, Opus): the original 1-year
+         * cap was looser than this constant's own doc justified ("minutes to days") - a peer 10 months
+         * fast still got its honest current data fully corrected and landed on the partner dated ~10
+         * months in the past, the same silent-mis-dating failure mode this cap exists to prevent, just
+         * smaller. 30 days comfortably covers a genuinely unsynced clock (including "phone sat off for a
+         * month") while a peer wrong by a whole season or more now correctly falls back to no
+         * correction instead of being "helpfully" laundered to a still-very-wrong date. */
+        const val MAX_PLAUSIBLE_PEER_CLOCK_OFFSET_MILLIS = 30L * 24 * 60 * 60 * 1000
 
         /** BLOCKER fix: an independent testing round found `deserializeSessions` accepted a peer's
          * `startedAt`/`endedAt` verbatim with zero bounds checking - a forged or buggy session (e.g.
