@@ -78,6 +78,10 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -121,4 +125,9 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation("junit:junit:4.13.2")
+    // ultimate-app-review spec-tests: unit tests here need real org.json (Android's unit-test stub
+    // jar throws "not mocked" for it) and Mockito to construct GattSyncManager without a real
+    // Context/Room DB - see app/src/test/.../audit/'s own doc for what this suite covers and why.
+    testImplementation("org.json:json:20231013")
+    testImplementation("org.mockito:mockito-core:5.12.0")
 }
