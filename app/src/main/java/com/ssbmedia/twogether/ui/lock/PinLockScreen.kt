@@ -48,14 +48,24 @@ fun PinLockScreen() {
 
     // Basic throttle feedback - see AppLockManager.recordFailedPinAttempt's doc. Ticks once a second
     // only while actually locked out, purely so the countdown text stays live; harmless/no-op otherwise.
+    // MAJOR fix: an independent testing round found `now` was only sampled once, at this composable's
+    // FIRST composition - if the screen had been showing for a while (e.g. the user took a few minutes
+    // trying PINs) before the 5th wrong guess actually triggered lockout, the countdown's very first
+    // frame computed against that stale, long-ago `now` and displayed a wildly inflated remaining time
+    // (observed live: "try again in 210s" for a real 30s lockout). The old LaunchedEffect(lockedOut) also
+    // had a chicken-and-egg problem: `lockedOut` itself was derived from the same stale `now`. Keying the
+    // effect on Unit and sampling `now` fresh as its very first statement (before any delay) fixes both -
+    // lockedOut is always derived from a just-sampled clock, and the ticking loop only starts once we've
+    // confirmed we're actually still locked out.
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
-    val lockedOut = AppLockManager.isPinLockedOut(now)
-    LaunchedEffect(lockedOut) {
-        while (AppLockManager.isPinLockedOut(System.currentTimeMillis())) {
-            kotlinx.coroutines.delay(1000)
+    LaunchedEffect(Unit) {
+        while (true) {
             now = System.currentTimeMillis()
+            if (!AppLockManager.isPinLockedOut(now)) break
+            kotlinx.coroutines.delay(1000)
         }
     }
+    val lockedOut = AppLockManager.isPinLockedOut(now)
 
     Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
         if (!showForgot) {
@@ -137,14 +147,18 @@ private fun ForgotPinContent(onCancel: () -> Unit, onReset: () -> Unit) {
     // should be the odd one out now that its siblings are hardened - see PinLockScreen's own matching code
     // for the same reasoning.
     var isVerifying by remember { mutableStateOf(false) }
+    // MAJOR fix: same stale-`now`-at-composition bug as the main gate above (see its doc for the full
+    // reasoning) - duplicated here since ForgotPinContent shares the same countdown display and lockout
+    // counter but is a separate composable.
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
-    val lockedOut = AppLockManager.isPinLockedOut(now)
-    LaunchedEffect(lockedOut) {
-        while (AppLockManager.isPinLockedOut(System.currentTimeMillis())) {
-            kotlinx.coroutines.delay(1000)
+    LaunchedEffect(Unit) {
+        while (true) {
             now = System.currentTimeMillis()
+            if (!AppLockManager.isPinLockedOut(now)) break
+            kotlinx.coroutines.delay(1000)
         }
     }
+    val lockedOut = AppLockManager.isPinLockedOut(now)
 
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
         Text("Reset your PIN", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
