@@ -48,21 +48,24 @@ fun PinLockScreen() {
 
     // Basic throttle feedback - see AppLockManager.recordFailedPinAttempt's doc. Ticks once a second
     // only while actually locked out, purely so the countdown text stays live; harmless/no-op otherwise.
-    // MAJOR fix: an independent testing round found `now` was only sampled once, at this composable's
-    // FIRST composition - if the screen had been showing for a while (e.g. the user took a few minutes
-    // trying PINs) before the 5th wrong guess actually triggered lockout, the countdown's very first
-    // frame computed against that stale, long-ago `now` and displayed a wildly inflated remaining time
-    // (observed live: "try again in 210s" for a real 30s lockout). The old LaunchedEffect(lockedOut) also
-    // had a chicken-and-egg problem: `lockedOut` itself was derived from the same stale `now`. Keying the
-    // effect on Unit and sampling `now` fresh as its very first statement (before any delay) fixes both -
-    // lockedOut is always derived from a just-sampled clock, and the ticking loop only starts once we've
-    // confirmed we're actually still locked out.
+    // MAJOR fix, round 2: an independent testing round found `now` was only sampled once, at this
+    // composable's FIRST composition, producing a wildly inflated countdown if the screen had been open
+    // a while before lockout actually triggered (observed live: "210s" for a real 30s lockout). A first
+    // attempt fixed the staleness by keying the effect on Unit and sampling immediately - but Unit never
+    // changes, so once the effect ran to completion at first composition (while NOT yet locked out, the
+    // common case) it never restarted, freezing `now` forever and leaving the screen PERMANENTLY stuck
+    // showing an inflated countdown after every subsequent lockout, with no recovery short of force-
+    // stopping the app - strictly worse than the original bug. Fix: key the effect on
+    // `AppLockManager.pinLockedOutUntilMillis` itself (already a Compose `mutableStateOf`, so reading it
+    // here subscribes to changes) instead of the derived `lockedOut` boolean or a constant - this makes
+    // the effect restart exactly when a lockout is newly armed (or cleared), sampling `now` fresh at that
+    // precise moment every time, with no staleness and no one-shot dead-end.
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            now = System.currentTimeMillis()
-            if (!AppLockManager.isPinLockedOut(now)) break
+    LaunchedEffect(AppLockManager.pinLockedOutUntilMillis) {
+        now = System.currentTimeMillis()
+        while (AppLockManager.isPinLockedOut(now)) {
             kotlinx.coroutines.delay(1000)
+            now = System.currentTimeMillis()
         }
     }
     val lockedOut = AppLockManager.isPinLockedOut(now)
@@ -147,15 +150,17 @@ private fun ForgotPinContent(onCancel: () -> Unit, onReset: () -> Unit) {
     // should be the odd one out now that its siblings are hardened - see PinLockScreen's own matching code
     // for the same reasoning.
     var isVerifying by remember { mutableStateOf(false) }
-    // MAJOR fix: same stale-`now`-at-composition bug as the main gate above (see its doc for the full
-    // reasoning) - duplicated here since ForgotPinContent shares the same countdown display and lockout
-    // counter but is a separate composable.
+    // MAJOR fix, round 2: same stale-`now`-at-composition bug as the main gate above, PLUS the round-2
+    // regression where keying on Unit made the effect a permanent one-shot that never restarted after
+    // running once while not-yet-locked-out - see that composable's doc for the full reasoning. Same fix
+    // here: key on `AppLockManager.pinLockedOutUntilMillis` itself so the effect restarts fresh exactly
+    // when a lockout is (re)armed.
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            now = System.currentTimeMillis()
-            if (!AppLockManager.isPinLockedOut(now)) break
+    LaunchedEffect(AppLockManager.pinLockedOutUntilMillis) {
+        now = System.currentTimeMillis()
+        while (AppLockManager.isPinLockedOut(now)) {
             kotlinx.coroutines.delay(1000)
+            now = System.currentTimeMillis()
         }
     }
     val lockedOut = AppLockManager.isPinLockedOut(now)
