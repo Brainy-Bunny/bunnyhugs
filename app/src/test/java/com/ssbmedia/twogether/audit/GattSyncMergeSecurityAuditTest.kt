@@ -301,4 +301,46 @@ class GattSyncMergeSecurityAuditTest {
             kotlin.math.abs(stored - now) < 5_000L
         )
     }
+
+    // Below: proposed by the fresh Sonnet reviewer in the post-restart full-scope round (ultimate-app-
+    // review) - F-1's magic-byte check had no dedicated regression coverage, unlike every other fix
+    // this file guards.
+
+    private fun looksLikeImage(bytes: ByteArray): Boolean = invokePrivate(newManager(), "looksLikeImage", bytes)
+
+    @Test
+    fun `a jpeg magic-byte header is accepted`() {
+        assertTrue(looksLikeImage(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte()) + ByteArray(20)))
+    }
+
+    @Test
+    fun `a png magic-byte header is accepted`() {
+        assertTrue(looksLikeImage(byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47) + ByteArray(20)))
+    }
+
+    @Test
+    fun `a webp riff header is accepted`() {
+        val bytes = "RIFF".toByteArray() + ByteArray(4) + "WEBP".toByteArray() + ByteArray(10)
+        assertTrue(looksLikeImage(bytes))
+    }
+
+    @Test
+    fun `an unrelated file's bytes are rejected - the live-verified F-1 attack`() {
+        // Fable's actual attack: a poisoned photoUri pointed at the peer's own SQLite DB / DataStore
+        // protobuf, both of which streamed through with no content check at all.
+        assertTrue(
+            "SQLite header must be rejected",
+            !looksLikeImage("SQLite format 3 ".toByteArray() + ByteArray(20))
+        )
+    }
+
+    @Test
+    fun `bytes too short to contain any magic header are rejected, not thrown`() {
+        assertTrue(!looksLikeImage(byteArrayOf(1, 2, 3)))
+    }
+
+    @Test
+    fun `empty bytes are rejected, not thrown`() {
+        assertTrue(!looksLikeImage(ByteArray(0)))
+    }
 }
