@@ -104,7 +104,10 @@ object UpdateChecker {
                     }
                 }
             }
-            val downloadUrl = apkUrl ?: return null
+            val downloadUrl = apkUrl?.takeIf { isTrustedReleaseAssetUrl(it) } ?: run {
+                if (apkUrl != null) Log.w(TAG, "Rejecting update: asset URL host is not a trusted GitHub host: $apkUrl")
+                return null
+            }
 
             // BUG fix: this used to be the raw tag (e.g. "v11") - which is deliberately versionCode, not
             // a human-readable version, so the update notification/dialog read "Twogether v11 is ready"
@@ -149,6 +152,29 @@ object UpdateChecker {
             Log.w(TAG, "Update check failed", e)
             null
         }
+    }
+
+    /** MAJOR fix: an independent adversarial testing round found the download URL from the GitHub
+     * Releases API response (`browser_download_url`) was used verbatim with no host/scheme check - if
+     * the API response were ever tampered with in transit (or GitHub itself compromised at the API
+     * layer) this would download and prompt-install a binary from an arbitrary host. Android's own
+     * same-signing-key enforcement on install is the real backstop (an attacker can't get a
+     * differently-signed APK to actually replace this one), which is why this was accepted as a MAJOR
+     * rather than a blocker - but since the auto-updater is a permanent, load-bearing feature (not
+     * something to remove), closing the gap between "the API said so" and "this URL is actually
+     * GitHub's" is worth the few lines. Requires https and an actual GitHub release-asset host -
+     * `github.com` (browser_download_url's normal host) or `objects.githubusercontent.com`
+     * (redirect-signing CDN GitHub sometimes returns for this exact URL directly). */
+    private fun isTrustedReleaseAssetUrl(url: String): Boolean {
+        val uri = try {
+            java.net.URI(url)
+        } catch (e: Exception) {
+            return false
+        }
+        val host = uri.host ?: return false
+        return uri.scheme.equals("https", ignoreCase = true) &&
+            (host.equals("github.com", ignoreCase = true) ||
+                host.endsWith(".githubusercontent.com", ignoreCase = true))
     }
 
     private fun httpGetJson(urlString: String): JSONObject? {
