@@ -204,7 +204,7 @@ class GattSyncManager(
                 // list rather than throwing and aborting the whole merge.
                 listId = o.optString("listId", DEFAULT_LIST_ID),
                 done = o.getBoolean("done"),
-                updatedAt = o.getLong("updatedAt"),
+                updatedAt = clampWireUpdatedAt(o.getLong("updatedAt")),
                 deleted = o.getBoolean("deleted")
             )
         }
@@ -232,7 +232,7 @@ class GattSyncManager(
                 id = o.getString("id"),
                 name = o.getString("name"),
                 createdAt = o.getLong("createdAt"),
-                updatedAt = o.getLong("updatedAt"),
+                updatedAt = clampWireUpdatedAt(o.getLong("updatedAt")),
                 deleted = o.optBoolean("deleted", false)
             )
         }
@@ -259,16 +259,41 @@ class GattSyncManager(
             val o = arr.getJSONObject(i)
             val syncId = o.optString("syncId", "")
             if (syncId.isBlank() || o.isNull("endedAt")) return@mapNotNull null
+            val startedAt = o.getLong("startedAt")
+            val endedAt = o.getLong("endedAt")
+            // BLOCKER fix: an independent testing round found this accepted a peer's session bounds
+            // verbatim - a forged/buggy endedAt far in the future (or before startedAt) merges in as a
+            // normal closed session and permanently corrupts all-time stats / irreversibly unlocks time
+            // capsules, with no in-app way to remove it. Reject anything that couldn't plausibly be a
+            // real together-session: end before start, either bound outside a small clock-skew window
+            // around now, or an implausibly long duration. A deleted-tombstone row (endedAt still present
+            // per the isNull check above) is exempt from the "not in the future" check on startedAt/endedAt
+            // individually but still must satisfy end >= start and the duration ceiling.
+            val now = System.currentTimeMillis()
+            val maxPlausibleBound = now + MAX_CLOCK_SKEW_TOLERANCE_MILLIS
+            if (endedAt < startedAt ||
+                startedAt > maxPlausibleBound ||
+                endedAt > maxPlausibleBound ||
+                (endedAt - startedAt) > MAX_PLAUSIBLE_SESSION_DURATION_MILLIS
+            ) {
+                Log.w(TAG, "Rejecting implausible remote session $syncId: startedAt=$startedAt endedAt=$endedAt")
+                return@mapNotNull null
+            }
             TogetherSession(
-                startedAt = o.getLong("startedAt"),
-                endedAt = o.getLong("endedAt"),
+                startedAt = startedAt,
+                endedAt = endedAt,
                 isManual = o.optBoolean("isManual", false),
                 syncId = syncId,
-                updatedAt = o.optLong("updatedAt", 0L),
+                updatedAt = clampWireUpdatedAt(o.optLong("updatedAt", 0L)),
                 deleted = o.optBoolean("deleted", false)
             )
         }
     }
+
+    /** BLOCKER fix (shared helper): clamps a peer-supplied `updatedAt` used in every LWW merge to
+     * `now + MAX_CLOCK_SKEW_TOLERANCE_MILLIS` - see that constant's doc for the full reasoning. */
+    private fun clampWireUpdatedAt(wireUpdatedAt: Long): Long =
+        wireUpdatedAt.coerceAtMost(System.currentTimeMillis() + MAX_CLOCK_SKEW_TOLERANCE_MILLIS)
 
     private fun serializeMoments(moments: List<Moment>): JSONArray {
         val arr = JSONArray()
@@ -304,7 +329,7 @@ class GattSyncManager(
                 takenAt = o.getLong("takenAt"),
                 syncId = syncId,
                 isRemote = true,
-                updatedAt = o.optLong("updatedAt", 0L),
+                updatedAt = clampWireUpdatedAt(o.optLong("updatedAt", 0L)),
                 deleted = o.optBoolean("deleted", false)
             )
         }
@@ -346,7 +371,7 @@ class GattSyncManager(
                 momentSyncId = o.getString("momentSyncId"),
                 authorDeviceId = o.getString("authorDeviceId"),
                 text = o.optString("text", ""),
-                updatedAt = o.getLong("updatedAt"),
+                updatedAt = clampWireUpdatedAt(o.getLong("updatedAt")),
                 deleted = o.optBoolean("deleted", false)
             )
         }
@@ -388,7 +413,7 @@ class GattSyncManager(
                 day = o.getInt("day").coerceIn(1, 31),
                 year = if (o.isNull("year")) null else o.getInt("year"),
                 createdAt = o.getLong("createdAt"),
-                updatedAt = o.getLong("updatedAt"),
+                updatedAt = clampWireUpdatedAt(o.getLong("updatedAt")),
                 deleted = o.optBoolean("deleted", false)
             )
         }
@@ -1567,6 +1592,24 @@ class GattSyncManager(
          * at real BLE throughput would take a long time to actually reach this, which is exactly why the
          * timeout below is stall-based rather than sized off this constant. */
         private const val MAX_SYNC_JSON_BYTES = 10_000_000
+
+        /** BLOCKER fix: an independent testing round found that every LWW merge (dateIdeas,
+         * listCategories, milestones, momentNotes) trusted the peer's `updatedAt` absolutely, with no
+         * clamp - a peer with a wrong clock (or a forged payload) could stamp a value far in the future,
+         * after which no local edit could ever win again since local writes stamp real wall-clock time.
+         * Clamping incoming `updatedAt` to `now + this tolerance` bounds the damage to a small, genuine
+         * clock-skew window: a poisoned/forged row can still win once, but any subsequent real local edit
+         * (stamped with actual current time, which will already exceed the clamped value) wins back. */
+        const val MAX_CLOCK_SKEW_TOLERANCE_MILLIS = 5 * 60_000L
+
+        /** BLOCKER fix: an independent testing round found `deserializeSessions` accepted a peer's
+         * `startedAt`/`endedAt` verbatim with zero bounds checking - a forged or buggy session (e.g.
+         * `endedAt` far in the future, or a multi-thousand-hour duration) merges in as a normal closed
+         * session, permanently corrupting all-time stats and irreversibly unlocking time capsules, with
+         * no in-app way to remove it (delete only works for locally-manual entries). Reject anything that
+         * couldn't be a real "together" session: end before start, either bound outside a small window
+         * around now, or a duration longer than any plausible continuous together-session. */
+        const val MAX_PLAUSIBLE_SESSION_DURATION_MILLIS = 30L * 24 * 60 * 60 * 1000 // 30 days
 
         /** BUG fix, round 2: how often the metadata-phase watchdog polls for stalled progress - see
          * metadataResponseSignal's own "round 2" doc for the full reasoning behind this stall-based

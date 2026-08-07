@@ -864,7 +864,7 @@ object BackupManager {
             // v1/v2 backups (made before this feature existed) have no updatedAt/deleted keys - default
             // to "never tombstoned", same defensive optLong/optBoolean pattern as syncId's backward-compat
             // handling just above.
-            updatedAt = o.optLong("updatedAt", 0L),
+            updatedAt = clampBackupUpdatedAt(o.optLong("updatedAt", 0L)),
             deleted = o.optBoolean("deleted", false)
         )
     }
@@ -879,10 +879,17 @@ object BackupManager {
             // deserializeDateIdeas optString default.
             listId = o.optStringOrNull("listId") ?: DEFAULT_LIST_ID,
             done = o.optBoolean("done", false),
-            updatedAt = o.getLong("updatedAt"),
+            updatedAt = clampBackupUpdatedAt(o.getLong("updatedAt")),
             deleted = o.optBoolean("deleted", false)
         )
     }
+
+    /** BLOCKER fix (mirrors GattSyncManager.clampWireUpdatedAt's doc): a backup zip's manifest.json is
+     * just as untrusted as a live BLE peer's payload - a crafted or corrupted backup with a far-future
+     * `updatedAt` would otherwise let a restored row permanently win every future LWW merge against this
+     * couple's real edits. Same clamp, same tolerance window. */
+    private fun clampBackupUpdatedAt(wireUpdatedAt: Long): Long =
+        wireUpdatedAt.coerceAtMost(System.currentTimeMillis() + 5 * 60_000L)
 
     /**
      * BUG fix: manualHoursAtCreation used to be omitted entirely from the manifest, so every restored
@@ -957,7 +964,7 @@ object BackupManager {
                 momentSyncId = o.getString("momentSyncId"),
                 authorDeviceId = o.getString("authorDeviceId"),
                 text = o.optString("text", ""),
-                updatedAt = o.getLong("updatedAt"),
+                updatedAt = clampBackupUpdatedAt(o.getLong("updatedAt")),
                 deleted = o.optBoolean("deleted", false)
             )
         }
@@ -984,7 +991,7 @@ object BackupManager {
                 day = o.getInt("day").coerceIn(1, 31),
                 year = if (o.isNull("year")) null else o.optInt("year"),
                 createdAt = o.getLong("createdAt"),
-                updatedAt = o.getLong("updatedAt"),
+                updatedAt = clampBackupUpdatedAt(o.getLong("updatedAt")),
                 deleted = o.optBoolean("deleted", false)
             )
         }
@@ -998,7 +1005,7 @@ object BackupManager {
                 id = o.getString("id"),
                 name = o.getString("name"),
                 createdAt = o.getLong("createdAt"),
-                updatedAt = o.getLong("updatedAt"),
+                updatedAt = clampBackupUpdatedAt(o.getLong("updatedAt")),
                 deleted = o.optBoolean("deleted", false)
             )
         }
