@@ -185,10 +185,14 @@ object BackupManager {
             val lastConnection = ServiceLocator.pairingStore.currentLastConnection()
             val settings = ServiceLocator.settingsStore.current()
             val badgeUnlocks = ServiceLocator.badgeUnlocksStore.current()
+            // BLOCKER fix, round 2 (ultimate-app-review, post-restart full-scope round, Opus): needed so
+            // buildManifest can close any open session properly (see its own doc) instead of dropping
+            // or leaving it open - this device's OWN current lastSeenAt, read fresh right at backup time.
+            val lastSeenAtMillis = com.ssbmedia.twogether.data.datastore.ProximityStateStore(context).current().lastSeenAt
 
             val manifest = buildManifest(
                 sessions, dateIdeas, timeCapsules, moments, momentNotes, milestones, listCategories,
-                pairing, lastConnection, settings, badgeUnlocks
+                pairing, lastConnection, settings, badgeUnlocks, lastSeenAtMillis
             )
 
             // Write to a cache-dir temp file first and only move it into the real backups folder once
@@ -270,10 +274,12 @@ object BackupManager {
         pairing: PairingInfo,
         lastConnection: LastConnectionInfo,
         settings: AppSettings,
-        badgeUnlocks: Map<String, Long>
+        badgeUnlocks: Map<String, Long>,
+        lastSeenAtMillis: Long
     ): JSONObject = JSONObject().apply {
         put("backupFormatVersion", BACKUP_FORMAT_VERSION)
-        put("createdAt", System.currentTimeMillis())
+        val backupCreatedAt = System.currentTimeMillis()
+        put("createdAt", backupCreatedAt)
 
         // SECURITY: pairSecretHash/lastSecretHash and pinHash are DELIBERATELY never written here.
         // pairSecretHash is byte-sliced directly into the live BLE handshake token (see
@@ -317,23 +323,31 @@ object BackupManager {
 
         put("sessions", JSONArray().apply {
             // BLOCKER fix (ultimate-app-review, Fable F-2): an OPEN session (endedAt == null) must
-            // never be serialized into a backup. StatsCalculator.effectiveOpenSessionEnd bounds an open
-            // session against the RESTORING device's own live lastSeenAt, not against anything in the
-            // backup itself - so restoring while genuinely together with a partner (lastSeenAt ~ now)
-            // credited the WHOLE backup-to-restore gap (live-verified: a 30-day-old open session
-            // restored ~30 days of credit and irreversibly unlocked every time capsule up to 500h,
-            // reproducing the exact B63 disaster its own fix was meant to close). This mirrors the
-            // policy GattSyncManager.buildPayload already enforces for the identical reason (S19: open
-            // sessions are never put on the wire) - a backup and a sync are both "this session data is
-            // about to be read as truth by a device with its own independent live proximity state",
-            // and an open session's remaining duration is exactly the part that state can't safely
-            // vouch for. The device's own proximity tracking re-establishes any currently-open session
-            // itself, live, right after restore - nothing real is lost by not backing this up.
-            sessions.filter { it.endedAt != null }.forEach { s ->
+            // never be serialized VERBATIM into a backup. StatsCalculator.effectiveOpenSessionEnd
+            // bounds an open session against the RESTORING device's own live lastSeenAt, not against
+            // anything in the backup itself - so restoring while genuinely together with a partner
+            // (lastSeenAt ~ now) credited the WHOLE backup-to-restore gap (live-verified: a 30-day-old
+            // open session restored ~30 days of credit and irreversibly unlocked every time capsule up
+            // to 500h, reproducing the exact B63 disaster its own fix was meant to close).
+            //
+            // BLOCKER fix, round 2 (ultimate-app-review, post-restart full-scope round, Opus): the
+            // original version of this fix DROPPED open sessions entirely rather than closing them -
+            // live-verified this silently lost real together-time from every weekly BackupWorker
+            // backup for any couple with a long-running open session (a cohabiting couple's session can
+            // span days). Now closes each open session here, at BACKUP time, using the exact same
+            // effectiveOpenSessionEnd formula the live Stats/Home screens already trust for this
+            // device's OWN current session - anchored to THIS device's real lastSeenAt (a genuinely
+            // trustworthy witness right now, unlike the restoring device's unrelated lastSeenAt later).
+            // The backup then always contains only CLOSED sessions, matching the same policy
+            // GattSyncManager.buildPayload already enforces for BLE sync (S19) - nothing on the wire or
+            // in a backup should ever need a receiver's guess about "how open is this."
+            sessions.forEach { s ->
+                val closedEndedAt = s.endedAt
+                    ?: com.ssbmedia.twogether.stats.StatsCalculator.effectiveOpenSessionEnd(s.startedAt, backupCreatedAt, lastSeenAtMillis)
                 put(JSONObject().apply {
                     put("id", s.id)
                     put("startedAt", s.startedAt)
-                    put("endedAt", s.endedAt)
+                    put("endedAt", closedEndedAt)
                     put("isManual", s.isManual)
                     put("syncId", s.syncId)
                     put("updatedAt", s.updatedAt)
@@ -863,21 +877,53 @@ object BackupManager {
         val photoUri get() = moment.photoUri
     }
 
-    private fun parseSessions(arr: JSONArray, backupCreatedAt: Long): List<TogetherSession> = (0 until arr.length()).map { i ->
+    private fun parseSessions(arr: JSONArray, backupCreatedAt: Long): List<TogetherSession> = (0 until arr.length()).mapNotNull { i ->
         val o = arr.getJSONObject(i)
         // syncId defaults to a fresh random UUID for a v1 backup (made before Feature A existed) - safe
         // to backfill independently here, same reasoning as AppDatabase.MIGRATION_2_3's backfill.
         val syncId = o.optStringOrNull("syncId")?.takeIf { it.isNotBlank() } ?: java.util.UUID.randomUUID().toString()
         val startedAt = o.getLong("startedAt")
-        // BLOCKER fix, defense-in-depth (ultimate-app-review, Fable F-2): buildManifest no longer
-        // writes an open session at all (see its own doc), but a backup from an older build, or a
-        // hand-crafted/corrupted one, could still carry endedAt==null. Rather than trust the
-        // RESTORING device's own live lastSeenAt to bound it (that's the bug - it measures the gap
-        // between two unrelated observations instead of elapsed togetherness), close it here using the
-        // BACKUP's own createdAt - a timestamp from the same snapshot as startedAt, not the restoring
-        // device's current moment. Clamped to never be before startedAt (a backup taken instantly after
-        // the session opened must credit ~0, never negative).
-        val endedAt = if (o.isNull("endedAt")) maxOf(startedAt, backupCreatedAt) else o.getLong("endedAt")
+        // BLOCKER fix, defense-in-depth (ultimate-app-review, Fable F-2): buildManifest now always
+        // closes an open session before writing it (see its own doc), but a backup from an OLDER build,
+        // or a hand-crafted/corrupted one, could still carry endedAt==null. Rather than trust the
+        // RESTORING device's own live lastSeenAt to bound it (that's the original bug - it measures the
+        // gap between two unrelated observations instead of elapsed togetherness), close it here using
+        // the BACKUP's own createdAt.
+        //
+        // BLOCKER fix, round 2 (ultimate-app-review, post-restart full-scope round, Opus): the original
+        // version of this fallback used `maxOf(startedAt, backupCreatedAt)` - correct for a session that
+        // was genuinely just-opened at backup time, but live-verified WRONG for a STALE open session
+        // already sitting in the DB before the backup was even taken (service killed / permission
+        // revoked / reboot - states StatsCalculator.effectiveOpenSessionEnd's own doc says are reachable):
+        // it credited the full stale gap again, reproducing the original disaster through the ordinary
+        // upgrade path (an old-build backup restored on this build). Capped to never credit more than
+        // the same absence-timeout window every other "how long was an open session really open" answer
+        // in this app already uses (S18) - conservative (may under-credit a session that really was
+        // fresh at backup time), which is the safe direction for an ingestion path that can no longer
+        // ask the original device what actually happened. `maxOf(startedAt, ...)` outer bound keeps this
+        // from ever going negative if backupCreatedAt is somehow before startedAt.
+        val endedAt = if (o.isNull("endedAt")) {
+            maxOf(startedAt, minOf(backupCreatedAt, startedAt + com.ssbmedia.twogether.ble.ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS))
+        } else {
+            o.getLong("endedAt")
+        }
+        val updatedAt = clampBackupUpdatedAt(o.optLong("updatedAt", 0L))
+        // BLOCKER fix (ultimate-app-review, post-restart full-scope round, Opus): this parser performed
+        // NO bounds validation at all - unlike GattSyncManager's wire path, ANY startedAt/endedAt from a
+        // backup zip merged in verbatim. Live-verified: a crafted backup with `startedAt = Long.MIN_VALUE`
+        // restored, then crashed the app in an unrecoverable OutOfMemoryError crash-loop the moment
+        // StatsCalculator tried to compute stats from it (only `pm clear` escaped). Same shared validator
+        // GattSyncManager.deserializeSessions uses, so the two paths can't independently drift out of
+        // sync the way they just did.
+        if (!com.ssbmedia.twogether.util.SessionBoundsValidator.isPlausible(
+                startedAt, endedAt, System.currentTimeMillis(),
+                com.ssbmedia.twogether.ble.GattSyncManager.MAX_CLOCK_SKEW_TOLERANCE_MILLIS,
+                com.ssbmedia.twogether.ble.GattSyncManager.MAX_PLAUSIBLE_SESSION_DURATION_MILLIS
+            )
+        ) {
+            Log.w(TAG, "Rejecting implausible session from backup: startedAt=$startedAt endedAt=$endedAt")
+            return@mapNotNull null
+        }
         TogetherSession(
             id = o.getLong("id"),
             startedAt = startedAt,
@@ -887,7 +933,7 @@ object BackupManager {
             // v1/v2 backups (made before this feature existed) have no updatedAt/deleted keys - default
             // to "never tombstoned", same defensive optLong/optBoolean pattern as syncId's backward-compat
             // handling just above.
-            updatedAt = clampBackupUpdatedAt(o.optLong("updatedAt", 0L)),
+            updatedAt = updatedAt,
             deleted = o.optBoolean("deleted", false)
         )
     }

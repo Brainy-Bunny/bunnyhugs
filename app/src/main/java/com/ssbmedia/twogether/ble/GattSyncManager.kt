@@ -174,7 +174,17 @@ class GattSyncManager(
         // before, so replay-resistance (Condition 5) is unaffected - and every entity is stored in a
         // consistent, receiver-anchored frame, so a later LWW comparison against a non-skewed device's
         // own edit isn't permanently biased by this peer's clock error either.
-        val peerClockOffsetMillis = root.optLong("deviceTimestamp", System.currentTimeMillis()) - System.currentTimeMillis()
+        val rawPeerClockOffsetMillis = root.optLong("deviceTimestamp", System.currentTimeMillis()) - System.currentTimeMillis()
+        // MAJOR fix (ultimate-app-review, post-restart full-scope round, Opus): the offset above was
+        // unbounded - a peer reporting a wildly wrong `deviceTimestamp` (e.g. its clock set to 2050)
+        // produced a huge offset that, subtracted from that peer's otherwise-honest CURRENT timestamps,
+        // rewrote its entire history into the distant PAST on the receiving device (live-verified: an
+        // ordinary session synced in as year-2003, silently, no warning). Capped to a generous but sane
+        // window - genuine unsynced-clock drift is minutes to days, never years - so an obviously-broken
+        // peer clock falls back to offset=0 (today's stricter pre-correction behavior: its data is then
+        // judged against OUR clock unmodified, which correctly rejects it as implausible rather than
+        // laundering it into a plausible-looking but wrong moment in the past).
+        val peerClockOffsetMillis = boundPeerClockOffset(rawPeerClockOffsetMillis)
         // Self-heal: a remote idea can arrive pointing at a list that got deleted on the OTHER device
         // while this one was independently adding to it (see DateIdeaRepository.reassignOrphans' doc for
         // the exact race). Both merges + the reassign sweep run as ONE atomic transaction (see
@@ -337,13 +347,22 @@ class GattSyncManager(
             // around now, or an implausibly long duration. A deleted-tombstone row (endedAt still present
             // per the isNull check above) is exempt from the "not in the future" check on startedAt/endedAt
             // individually but still must satisfy end >= start and the duration ceiling.
+            //
+            // BLOCKER fix, round 2 (ultimate-app-review, post-restart full-scope round, Opus): the
+            // original version above only ever checked an UPPER bound - a startedAt near Long.MIN_VALUE
+            // made `endedAt - startedAt` integer-overflow to a small/negative number, silently defeating
+            // the duration ceiling entirely. Live-verified: such a row merged in, then
+            // StatsCalculator.buildDailyMinuteMap (which walks the interval one calendar day at a time)
+            // threw an unrecoverable OutOfMemoryError - a crash-loop escaping even the app's own
+            // exception hardening (OutOfMemoryError is an Error, not an Exception), fixable only by
+            // `pm clear`. Now delegates to SessionBoundsValidator, the SAME validator
+            // BackupManager.parseSessions uses (Opus's own proposal to stop these two paths from
+            // independently drifting out of sync the way they just did) - its lower-bound check makes
+            // the subtraction above structurally overflow-safe.
             val updatedAt = o.optLong("updatedAt", 0L) - peerClockOffsetMillis
-            val maxPlausibleBound = System.currentTimeMillis() + MAX_CLOCK_SKEW_TOLERANCE_MILLIS
-            if (endedAt < startedAt ||
-                startedAt > maxPlausibleBound ||
-                endedAt > maxPlausibleBound ||
-                (endedAt - startedAt) > MAX_PLAUSIBLE_SESSION_DURATION_MILLIS ||
-                !isPlausibleWireUpdatedAt(updatedAt)
+            if (!com.ssbmedia.twogether.util.SessionBoundsValidator.isPlausible(
+                    startedAt, endedAt, System.currentTimeMillis(), MAX_CLOCK_SKEW_TOLERANCE_MILLIS, MAX_PLAUSIBLE_SESSION_DURATION_MILLIS
+                ) || !isPlausibleWireUpdatedAt(updatedAt)
             ) {
                 Log.w(TAG, "Rejecting implausible remote session $syncId: startedAt=$startedAt endedAt=$endedAt updatedAt=$updatedAt")
                 return@mapNotNull null
@@ -370,6 +389,13 @@ class GattSyncManager(
      * it's retransmitted or how much time passes, since it's simply never merged in the first place. */
     private fun isPlausibleWireUpdatedAt(wireUpdatedAt: Long): Boolean =
         wireUpdatedAt <= System.currentTimeMillis() + MAX_CLOCK_SKEW_TOLERANCE_MILLIS
+
+    /** MAJOR fix (ultimate-app-review, post-restart full-scope round, Opus): see applyPayload's own doc
+     * for why an unbounded peer clock offset let an obviously-broken peer clock launder its data into a
+     * plausible-looking but wrong moment in the past. Extracted as its own function purely so it's
+     * independently testable. */
+    private fun boundPeerClockOffset(rawOffsetMillis: Long): Long =
+        if (kotlin.math.abs(rawOffsetMillis) > MAX_PLAUSIBLE_PEER_CLOCK_OFFSET_MILLIS) 0L else rawOffsetMillis
 
     private fun serializeMoments(moments: List<Moment>): JSONArray {
         val arr = JSONArray()
@@ -1720,6 +1746,14 @@ class GattSyncManager(
          * clock-skew window: a poisoned/forged row can still win once, but any subsequent real local edit
          * (stamped with actual current time, which will already exceed the clamped value) wins back. */
         const val MAX_CLOCK_SKEW_TOLERANCE_MILLIS = 5 * 60_000L
+
+        /** MAJOR fix (ultimate-app-review, post-restart full-scope round, Opus): caps how large a
+         * peer-reported clock offset applyPayload's correction will ever act on - see its own doc for
+         * why an unbounded offset let an obviously-broken peer clock (e.g. set to 2050) launder its data
+         * into a plausible-looking but wrong moment in the past instead of being rejected outright. 1
+         * year is far beyond any genuine unsynced-clock drift (minutes to days) while still comfortably
+         * covering a wrong-year mistake in either direction. */
+        const val MAX_PLAUSIBLE_PEER_CLOCK_OFFSET_MILLIS = 365L * 24 * 60 * 60 * 1000
 
         /** BLOCKER fix: an independent testing round found `deserializeSessions` accepted a peer's
          * `startedAt`/`endedAt` verbatim with zero bounds checking - a forged or buggy session (e.g.

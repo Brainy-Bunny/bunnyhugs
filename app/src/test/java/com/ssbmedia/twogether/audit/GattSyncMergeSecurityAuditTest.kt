@@ -128,6 +128,29 @@ class GattSyncMergeSecurityAuditTest {
         assertTrue("a 40-day 'session' must never merge in and inflate all-time stats", result.isEmpty())
     }
 
+    // Below: Blocker 1 (ultimate-app-review, post-restart full-scope round, Opus) - the duration check
+    // above only ever validated an UPPER bound; a startedAt near Long.MIN_VALUE made the subtraction
+    // integer-overflow, silently defeating the ceiling. Live-verified: such a row merged in, then
+    // StatsCalculator.buildDailyMinuteMap threw an unrecoverable OutOfMemoryError crash-loop (only
+    // `pm clear` escaped - OutOfMemoryError is an Error, not caught by the app's own Exception
+    // hardening). Now delegates to SessionBoundsValidator (also used by BackupManager.parseSessions).
+
+    @Test
+    fun `a startedAt near Long-MIN_VALUE is rejected, not accepted and later overflowing the duration check`() {
+        val now = System.currentTimeMillis()
+        val arr = sessionJson("overflow", Long.MIN_VALUE, 0L, now)
+        val result = deserializeSessions(newManager(), arr)
+        assertTrue("an overflow-attack startedAt must never merge in", result.isEmpty())
+    }
+
+    @Test
+    fun `a far-past startedAt well before this app could exist is rejected`() {
+        val now = System.currentTimeMillis()
+        val arr = sessionJson("ancient", 0L, 1_000L, now) // Unix epoch
+        val result = deserializeSessions(newManager(), arr)
+        assertTrue(result.isEmpty())
+    }
+
     @Test
     fun `forged updatedAt on an otherwise-plausible session is still rejected`() {
         val now = System.currentTimeMillis()
@@ -300,6 +323,39 @@ class GattSyncMergeSecurityAuditTest {
             "stored updatedAt ($stored) must be corrected close to our own now ($now), not the raw peer-clock value (${now + peerOffset})",
             kotlin.math.abs(stored - now) < 5_000L
         )
+    }
+
+    // Below: Major 1 (ultimate-app-review, post-restart full-scope round, Opus) - the peer clock
+    // offset correction above was unbounded, so a peer reporting a wildly wrong deviceTimestamp (e.g.
+    // 2050) produced a huge offset that laundered its otherwise-honest CURRENT data into a
+    // plausible-looking but wrong moment in the PAST (live-verified: an ordinary session synced in
+    // dated 2003, silently, no warning). boundPeerClockOffset caps this to a sane window, falling back
+    // to 0 (today's stricter unmodified behavior) for anything more broken than that.
+
+    private fun boundPeerClockOffset(offset: Long): Long = invokePrivate(newManager(), "boundPeerClockOffset", offset)
+
+    @Test
+    fun `a genuine multi-day clock offset passes through uncapped`() {
+        val threeDays = 3L * 24 * 3_600_000L
+        assertEquals(threeDays, boundPeerClockOffset(threeDays))
+    }
+
+    @Test
+    fun `a wildly-broken peer clock (multi-year offset) falls back to zero, not laundering data into the past`() {
+        val twentyFourYears = 24L * 365 * 24 * 3_600_000L // e.g. a clock reading 2050 instead of 2026
+        assertEquals(0L, boundPeerClockOffset(twentyFourYears))
+    }
+
+    @Test
+    fun `a wildly-broken peer clock in the past direction also falls back to zero`() {
+        val twentyFourYears = -24L * 365 * 24 * 3_600_000L
+        assertEquals(0L, boundPeerClockOffset(twentyFourYears))
+    }
+
+    @Test
+    fun `exactly at the cap boundary still passes through`() {
+        val oneYear = 365L * 24 * 3_600_000L
+        assertEquals(oneYear, boundPeerClockOffset(oneYear))
     }
 
     // Below: proposed by the fresh Sonnet reviewer in the post-restart full-scope round (ultimate-app-

@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.ProcessLifecycleOwner
 import com.ssbmedia.twogether.data.backup.BackupManager
 import com.ssbmedia.twogether.data.backup.BackupWorker
+import com.ssbmedia.twogether.data.repo.ClockSkewSelfHeal
 import com.ssbmedia.twogether.data.update.UpdateChecker
 import com.ssbmedia.twogether.data.update.UpdateWorker
 import com.ssbmedia.twogether.lock.AppLockManager
@@ -55,6 +56,13 @@ class TwogetherApp : Application() {
         // normal app start where nothing is pending, which is the overwhelming majority of the time.
         ServiceLocator.applicationScope.launch {
             BackupManager.resumePendingRestoreIfAny(this@TwogetherApp)
+        }
+        // MAJOR fix (ultimate-app-review, post-restart full-scope round, Opus): self-heals any row this
+        // device itself wrote with an implausibly future updatedAt during a past period of genuine clock
+        // error - see ClockSkewSelfHeal's own doc. A no-op on every normal app start where nothing is
+        // stale, which is the overwhelming majority of the time.
+        ServiceLocator.applicationScope.launch {
+            ClockSkewSelfHeal.run()
         }
     }
 }
