@@ -137,6 +137,12 @@ class GattSyncManager(
     private suspend fun buildPayload(): ByteArray {
         val deviceId = settingsStore.getOrCreateLocalDeviceId()
         val obj = JSONObject()
+        // MAJOR fix (ultimate-app-review, Fable F-4): lets the receiver correct every updatedAt/
+        // startedAt/endedAt below into ITS OWN clock's frame instead of trusting our raw wall-clock
+        // value verbatim - see applyPayload's peerClockOffsetMillis doc for why. Missing on an old
+        // build's payload degrades safely (applyPayload's optLong default treats that as "no observed
+        // offset", i.e. today's stricter-but-correct-for-matched-clocks behavior).
+        obj.put("deviceTimestamp", System.currentTimeMillis())
         obj.put("dateIdeas", serializeDateIdeas(dateIdeaRepository.getAll()))
         obj.put("listCategories", serializeListCategories(listCategoryRepository.getAll()))
         obj.put("sessions", serializeSessions(sessionRepository.getAllIncludingDeleted().filter { it.endedAt != null }))
@@ -153,29 +159,75 @@ class GattSyncManager(
     private suspend fun applyPayload(bytes: ByteArray): List<RemoteMomentInfo> {
         val deviceId = settingsStore.getOrCreateLocalDeviceId()
         val root = JSONObject(String(bytes, Charsets.UTF_8))
+        // MAJOR fix (ultimate-app-review, Fable F-4): isPlausibleWireUpdatedAt rejects anything more
+        // than MAX_CLOCK_SKEW_TOLERANCE_MILLIS ahead of OUR OWN clock - but in a serverless two-device
+        // system with no time authority, a peer whose clock is merely wrong (no NTP - this app is
+        // explicitly fully offline) is indistinguishable from a forger by that test alone. Live-verified:
+        // a partner phone just 1 hour fast had every one of its honest edits silently dropped, forever,
+        // on every sync, while the UI still reported "Synced!". Since both devices already completed the
+        // authenticated GATT handshake before any of this runs, the peer's own claimed "now" is no more
+        // trusted than everything else it's about to send (S1) - using it to correct for skew doesn't
+        // weaken the boundary the handshake already enforces. Every timestamp below is corrected into
+        // OUR clock's frame before either the plausibility check or storage, so (a) a real clock
+        // difference no longer causes silent, permanent data loss, and (b) a genuinely forged value
+        // (e.g. year 2050) is still exactly as far outside the peer's OWN reported "now" as it was
+        // before, so replay-resistance (Condition 5) is unaffected - and every entity is stored in a
+        // consistent, receiver-anchored frame, so a later LWW comparison against a non-skewed device's
+        // own edit isn't permanently biased by this peer's clock error either.
+        val peerClockOffsetMillis = root.optLong("deviceTimestamp", System.currentTimeMillis()) - System.currentTimeMillis()
         // Self-heal: a remote idea can arrive pointing at a list that got deleted on the OTHER device
         // while this one was independently adding to it (see DateIdeaRepository.reassignOrphans' doc for
         // the exact race). Both merges + the reassign sweep run as ONE atomic transaction (see
         // ListCategoryRepository.mergeRemoteWithIdeas' doc) so no Flow observer - notably
         // OurListsViewModel's own opportunistic reassignOrphans collector - can ever see an intermediate
         // state where one table's merge has committed but the other's hasn't yet.
-        listCategoryRepository.mergeRemoteWithIdeas(
-            deserializeListCategories(root.optJSONArray("listCategories")),
-            deserializeDateIdeas(root.optJSONArray("dateIdeas"))
-        )
-        sessionRepository.mergeRemoteSessions(deserializeSessions(root.optJSONArray("sessions")))
+        val listCategoriesArr = root.optJSONArray("listCategories")
+        val dateIdeasArr = root.optJSONArray("dateIdeas")
+        val listCategoriesParsed = deserializeListCategories(listCategoriesArr, peerClockOffsetMillis)
+        val dateIdeasParsed = deserializeDateIdeas(dateIdeasArr, peerClockOffsetMillis)
+        listCategoryRepository.mergeRemoteWithIdeas(listCategoriesParsed, dateIdeasParsed)
+        val sessionsArr = root.optJSONArray("sessions")
+        val sessionsParsed = deserializeSessions(sessionsArr, peerClockOffsetMillis)
+        sessionRepository.mergeRemoteSessions(sessionsParsed)
         val momentsArr = root.optJSONArray("moments")
-        momentRepository.mergeRemoteStubs(deserializeMoments(momentsArr))
-        momentNoteRepository.mergeRemote(deserializeNotes(root.optJSONArray("notes")), deviceId)
+        val momentsParsed = deserializeMoments(momentsArr, peerClockOffsetMillis)
+        momentRepository.mergeRemoteStubs(momentsParsed)
+        val notesArr = root.optJSONArray("notes")
+        val notesParsed = deserializeNotes(notesArr, peerClockOffsetMillis)
+        momentNoteRepository.mergeRemote(notesParsed, deviceId)
         // BUG fix: an independent audit round found milestones arriving via sync never got their yearly
         // alarm armed until the next cold start/boot, unlike every other way a Milestone enters the DB
         // (local add, backup restore, app start) - all of which call MilestoneAlarmScheduler right away.
         // Arms only what was actually upserted here, not the whole table, for the same reason
         // BackupManager.scheduleAll is only ever called once per restore rather than on every sync.
-        val upsertedMilestones = milestoneRepository.mergeRemote(deserializeMilestones(root.optJSONArray("milestones")))
+        val milestonesArr = root.optJSONArray("milestones")
+        val milestonesParsed = deserializeMilestones(milestonesArr, peerClockOffsetMillis)
+        val upsertedMilestones = milestoneRepository.mergeRemote(milestonesParsed)
         MilestoneAlarmScheduler.scheduleAll(context, upsertedMilestones.filter { !it.deleted })
+        // MAJOR fix (ultimate-app-review, Fable F-4, assertion 6): even with the correction above, a
+        // row can still be legitimately rejected (e.g. genuinely implausible even once corrected) - the
+        // sync outcome must say so instead of an unqualified "Synced!" that hides real data loss.
+        // Counted as an array-length delta (not inside each deserialize* function) so this stays a
+        // read-only observation with no risk to the merge logic itself.
+        lastSyncDroppedImplausibleCount =
+            (listCategoriesArr?.length() ?: 0) - listCategoriesParsed.size +
+            (dateIdeasArr?.length() ?: 0) - dateIdeasParsed.size +
+            (sessionsArr?.length() ?: 0) - sessionsParsed.size +
+            (momentsArr?.length() ?: 0) - momentsParsed.size +
+            (notesArr?.length() ?: 0) - notesParsed.size +
+            (milestonesArr?.length() ?: 0) - milestonesParsed.size
         return parseRemoteMomentInfo(momentsArr)
     }
+
+    /** MAJOR fix (ultimate-app-review, Fable F-4, assertion 6): set at the end of every [applyPayload]
+     * call to however many incoming rows this device itself rejected as implausible (forged or, now
+     * that peerClockOffsetMillis exists, still-implausible-even-corrected) - read by the sync-completion
+     * callbacks in [ProximityForegroundService] so the UI can say "partial" instead of an unqualified
+     * "Synced!" when something was genuinely dropped. `@Volatile` since it's written on this manager's
+     * own coroutine but read from the completion callback's context. */
+    @Volatile
+    var lastSyncDroppedImplausibleCount: Int = 0
+        private set
 
     private fun serializeDateIdeas(ideas: List<DateIdea>): JSONArray {
         val arr = JSONArray()
@@ -192,12 +244,12 @@ class GattSyncManager(
         return arr
     }
 
-    private fun deserializeDateIdeas(arr: JSONArray?): List<DateIdea> {
+    private fun deserializeDateIdeas(arr: JSONArray?, peerClockOffsetMillis: Long = 0L): List<DateIdea> {
         if (arr == null) return emptyList()
         return (0 until arr.length()).mapNotNull { i ->
             val o = arr.getJSONObject(i)
             val id = o.getString("id")
-            val updatedAt = o.getLong("updatedAt")
+            val updatedAt = o.getLong("updatedAt") - peerClockOffsetMillis
             if (!isPlausibleWireUpdatedAt(updatedAt)) {
                 Log.w(TAG, "Dropping remote dateIdea $id with implausible updatedAt=$updatedAt")
                 return@mapNotNull null
@@ -230,12 +282,12 @@ class GattSyncManager(
         return arr
     }
 
-    private fun deserializeListCategories(arr: JSONArray?): List<ListCategory> {
+    private fun deserializeListCategories(arr: JSONArray?, peerClockOffsetMillis: Long = 0L): List<ListCategory> {
         if (arr == null) return emptyList()
         return (0 until arr.length()).mapNotNull { i ->
             val o = arr.getJSONObject(i)
             val id = o.getString("id")
-            val updatedAt = o.getLong("updatedAt")
+            val updatedAt = o.getLong("updatedAt") - peerClockOffsetMillis
             if (!isPlausibleWireUpdatedAt(updatedAt)) {
                 Log.w(TAG, "Dropping remote listCategory $id with implausible updatedAt=$updatedAt")
                 return@mapNotNull null
@@ -265,14 +317,18 @@ class GattSyncManager(
         return arr
     }
 
-    private fun deserializeSessions(arr: JSONArray?): List<TogetherSession> {
+    private fun deserializeSessions(arr: JSONArray?, peerClockOffsetMillis: Long = 0L): List<TogetherSession> {
         if (arr == null) return emptyList()
         return (0 until arr.length()).mapNotNull { i ->
             val o = arr.getJSONObject(i)
             val syncId = o.optString("syncId", "")
             if (syncId.isBlank() || o.isNull("endedAt")) return@mapNotNull null
-            val startedAt = o.getLong("startedAt")
-            val endedAt = o.getLong("endedAt")
+            // MAJOR fix (ultimate-app-review, Fable F-4): startedAt/endedAt/updatedAt are all wall-clock
+            // stamps from the SENDER's own clock - corrected into the receiver's frame the same way as
+            // every updatedAt below, so a peer whose clock merely differs (not forged) doesn't have its
+            // honest session bounds rejected as implausible either.
+            val startedAt = o.getLong("startedAt") - peerClockOffsetMillis
+            val endedAt = o.getLong("endedAt") - peerClockOffsetMillis
             // BLOCKER fix: an independent testing round found this accepted a peer's session bounds
             // verbatim - a forged/buggy endedAt far in the future (or before startedAt) merges in as a
             // normal closed session and permanently corrupts all-time stats / irreversibly unlocks time
@@ -281,7 +337,7 @@ class GattSyncManager(
             // around now, or an implausibly long duration. A deleted-tombstone row (endedAt still present
             // per the isNull check above) is exempt from the "not in the future" check on startedAt/endedAt
             // individually but still must satisfy end >= start and the duration ceiling.
-            val updatedAt = o.optLong("updatedAt", 0L)
+            val updatedAt = o.optLong("updatedAt", 0L) - peerClockOffsetMillis
             val maxPlausibleBound = System.currentTimeMillis() + MAX_CLOCK_SKEW_TOLERANCE_MILLIS
             if (endedAt < startedAt ||
                 startedAt > maxPlausibleBound ||
@@ -338,13 +394,13 @@ class GattSyncManager(
      * full story of why, and MAX_PHOTO_FRAME_BYTES-style reasoning). The actual local photoUri column is
      * always overwritten by mergeRemoteStubs with a path deterministically derived from [syncId] before
      * this Moment is ever inserted into Room. */
-    private fun deserializeMoments(arr: JSONArray?): List<Moment> {
+    private fun deserializeMoments(arr: JSONArray?, peerClockOffsetMillis: Long = 0L): List<Moment> {
         if (arr == null) return emptyList()
         return (0 until arr.length()).mapNotNull { i ->
             val o = arr.getJSONObject(i)
             val syncId = o.optString("syncId", "")
             if (syncId.isBlank()) return@mapNotNull null
-            val updatedAt = o.optLong("updatedAt", 0L)
+            val updatedAt = o.optLong("updatedAt", 0L) - peerClockOffsetMillis
             if (!isPlausibleWireUpdatedAt(updatedAt)) {
                 Log.w(TAG, "Dropping remote moment $syncId with implausible updatedAt=$updatedAt")
                 return@mapNotNull null
@@ -388,12 +444,12 @@ class GattSyncManager(
         return arr
     }
 
-    private fun deserializeNotes(arr: JSONArray?): List<MomentNote> {
+    private fun deserializeNotes(arr: JSONArray?, peerClockOffsetMillis: Long = 0L): List<MomentNote> {
         if (arr == null) return emptyList()
         return (0 until arr.length()).mapNotNull { i ->
             val o = arr.getJSONObject(i)
             val momentSyncId = o.getString("momentSyncId")
-            val updatedAt = o.getLong("updatedAt")
+            val updatedAt = o.getLong("updatedAt") - peerClockOffsetMillis
             if (!isPlausibleWireUpdatedAt(updatedAt)) {
                 Log.w(TAG, "Dropping remote moment note for $momentSyncId with implausible updatedAt=$updatedAt")
                 return@mapNotNull null
@@ -425,12 +481,12 @@ class GattSyncManager(
         return arr
     }
 
-    private fun deserializeMilestones(arr: JSONArray?): List<Milestone> {
+    private fun deserializeMilestones(arr: JSONArray?, peerClockOffsetMillis: Long = 0L): List<Milestone> {
         if (arr == null) return emptyList()
         return (0 until arr.length()).mapNotNull { i ->
             val o = arr.getJSONObject(i)
             val id = o.getString("id")
-            val updatedAt = o.getLong("updatedAt")
+            val updatedAt = o.getLong("updatedAt") - peerClockOffsetMillis
             if (!isPlausibleWireUpdatedAt(updatedAt)) {
                 Log.w(TAG, "Dropping remote milestone $id with implausible updatedAt=$updatedAt")
                 return@mapNotNull null
@@ -591,6 +647,18 @@ class GattSyncManager(
             Log.w(TAG, "Refusing to save photo for moment $syncId - resolved path $destCanonical is outside $momentsDirCanonical")
             return
         }
+        // MINOR fix (ultimate-app-review, Fable F-1): the destination path was already safe (UUID/
+        // syncId-derived, canonical-parent-checked above), but the CONTENT was never checked at all -
+        // an authenticated peer could stream any of its own local files (live-verified: its own Room DB
+        // and DataStore protobuf arrived and were stored as "photos" with no error). Not an escalation
+        // (a sender can only leak its own data to a partner that already trusts it, and the safe
+        // destination path was never in question), but cheap and worth closing: refuse anything that
+        // doesn't start with a real image's magic bytes, matching the same jpg/jpeg/png/webp allowlist
+        // this class already uses for photoUri's extension hint (S10).
+        if (!looksLikeImage(bytes)) {
+            Log.w(TAG, "Refusing to save photo for moment $syncId - received bytes don't start with a recognized image signature")
+            return
+        }
 
         val tempFile = File(destFile.parentFile ?: context.filesDir, "${destFile.name}.part")
         try {
@@ -622,6 +690,20 @@ class GattSyncManager(
             Log.w(TAG, "Failed to save received photo for moment $syncId", e)
             withContext(Dispatchers.IO) { tempFile.delete() }
         }
+    }
+
+    /** MINOR fix (ultimate-app-review, Fable F-1): magic-byte check for [savePhotoBytes] - matches the
+     * same jpg/jpeg/png/webp allowlist this class already uses for photoUri's extension hint (S10).
+     * Deliberately just a signature check, not a full image decode (this app never renders these bytes
+     * as anything other than an image via Coil, which already fails safe on genuinely malformed image
+     * data - this only needs to stop an obviously-non-image payload from being written at all). */
+    private fun looksLikeImage(bytes: ByteArray): Boolean {
+        if (bytes.size < 12) return false
+        val jpeg = bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() && bytes[2] == 0xFF.toByte()
+        val png = bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() && bytes[2] == 0x4E.toByte() && bytes[3] == 0x47.toByte()
+        val webp = bytes[0] == 'R'.code.toByte() && bytes[1] == 'I'.code.toByte() && bytes[2] == 'F'.code.toByte() && bytes[3] == 'F'.code.toByte() &&
+            bytes[8] == 'W'.code.toByte() && bytes[9] == 'E'.code.toByte() && bytes[10] == 'B'.code.toByte() && bytes[11] == 'P'.code.toByte()
+        return jpeg || png || webp
     }
 
     /** Feature 2: dispatches one fully-reassembled photo-characteristic frame, shared by both the server

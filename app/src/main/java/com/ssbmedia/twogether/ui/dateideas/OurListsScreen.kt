@@ -185,7 +185,17 @@ fun OurListsScreen(onBack: () -> Unit) {
         AppEvents.syncCompleted.collect { success ->
             syncing = false
             isListeningRole = false
-            syncMessage = if (success) "Synced! 💛" else "Couldn't sync — make sure you're together"
+            // MAJOR fix (ultimate-app-review, Fable F-4, assertion 6): a merge can succeed while still
+            // having dropped some incoming rows as implausible (even after the clock-skew correction, a
+            // row can still be genuinely implausible) - say so instead of an unqualified "Synced!" that
+            // would hide real, silent data loss from the person who'd want to know their partner's
+            // clock might be off.
+            val dropped = AppEvents.lastSyncDroppedCount.value
+            syncMessage = when {
+                !success -> "Couldn't sync — make sure you're together"
+                dropped > 0 -> "Synced, but $dropped item${if (dropped == 1) "" else "s"} skipped — check both phones' clocks"
+                else -> "Synced! 💛"
+            }
             if (success) lastSyncAt = ServiceLocator.settingsStore.current().lastSyncAt
         }
     }

@@ -27,7 +27,21 @@ object AppEvents {
     private val _syncCompleted = MutableSharedFlow<Boolean>(extraBufferCapacity = 1)
     val syncCompleted = _syncCompleted.asSharedFlow()
 
-    fun emitSyncCompleted(success: Boolean) {
+    /** MAJOR fix (ultimate-app-review, Fable F-4, assertion 6): how many incoming rows THIS device's
+     * own most recent completed sync rejected as implausible (see GattSyncManager.
+     * lastSyncDroppedImplausibleCount's doc) - set by the service immediately before emitting the
+     * [syncCompleted] event below, so a collector reading it at that moment sees the count for THIS
+     * outcome, not a stale one. A plain property rather than folding into [syncCompleted]'s own emitted
+     * value: keeps every existing `emitSyncCompleted(success)` call site (most of which report a plain
+     * failure with nothing to count) unchanged. Deliberately not `@Volatile`-annotated to a lock - this
+     * event bus is already the established "good enough" cross-thread signaling pattern for the rest of
+     * this object (a plain var here would be inconsistent, so it keeps the same MutableStateFlow shape).
+     */
+    private val _lastSyncDroppedCount = MutableStateFlow(0)
+    val lastSyncDroppedCount: StateFlow<Int> = _lastSyncDroppedCount.asStateFlow()
+
+    fun emitSyncCompleted(success: Boolean, droppedCount: Int = 0) {
+        _lastSyncDroppedCount.value = droppedCount
         _syncCompleted.tryEmit(success)
     }
 

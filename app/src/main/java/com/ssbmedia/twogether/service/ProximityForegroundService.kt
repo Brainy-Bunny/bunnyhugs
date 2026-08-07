@@ -627,7 +627,10 @@ class ProximityForegroundService : LifecycleService() {
                 // "Last synced Xm ago" should refresh after ANY sync that actually completed, including
                 // the 15-minute periodic catch-all, not just a manual "Sync now" tap. Harmless when
                 // nothing is collecting (MutableSharedFlow just buffers/drops).
-                AppEvents.emitSyncCompleted(success)
+                // MAJOR fix (ultimate-app-review, Fable F-4, assertion 6): a successful merge can still
+                // have dropped rows as implausible - report the count so the UI doesn't say an
+                // unqualified "Synced!" over real, silent data loss.
+                AppEvents.emitSyncCompleted(success, if (success) gattSync.lastSyncDroppedImplausibleCount else 0)
             }
         }
 

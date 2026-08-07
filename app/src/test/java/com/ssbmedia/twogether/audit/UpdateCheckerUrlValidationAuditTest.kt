@@ -103,4 +103,24 @@ class UpdateCheckerUrlValidationAuditTest {
     fun `uppercase scheme is still accepted`() {
         assertTrue(isTrusted("HTTPS://github.com/Twogether-2.5.apk"))
     }
+
+    // Below: Fable's F-3 finding (ultimate-app-review Step 4) - the original `.githubusercontent.com`
+    // SUFFIX match covered `raw.` and `gist.`, where any GitHub user can host arbitrary bytes under
+    // their own account; under this fix's own threat model (a tampered API response), that's a real
+    // bypass. Narrowed to the exact `objects.githubusercontent.com` host.
+
+    @Test
+    fun `raw-githubusercontent-com is no longer trusted - any GitHub user can host bytes there`() {
+        assertFalse(isTrusted("https://raw.githubusercontent.com/attacker/anyrepo/main/evil.apk"))
+    }
+
+    @Test
+    fun `gist-githubusercontent-com is no longer trusted - any GitHub user can host bytes there`() {
+        assertFalse(isTrusted("https://gist.githubusercontent.com/attacker/id/raw/evil.apk"))
+    }
+
+    @Test
+    fun `the exact release-asset CDN host is still trusted`() {
+        assertTrue(isTrusted("https://objects.githubusercontent.com/some/signed/path/Twogether-2.5.apk"))
+    }
 }

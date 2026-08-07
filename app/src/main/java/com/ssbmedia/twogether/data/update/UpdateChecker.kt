@@ -176,9 +176,16 @@ object UpdateChecker {
         // REJECTED (fails safe, never a security hole - just an over-broad rejection) since neither
         // equals() nor endsWith() strip it. Normalized away before comparing.
         val host = (uri.host ?: return false).removeSuffix(".")
+        // MINOR fix (ultimate-app-review, Fable F-3): the broad `.githubusercontent.com` suffix this
+        // fix originally used doesn't mean "GitHub's release CDN" - it also covers `raw.` and `gist.`,
+        // where ANY GitHub user can host arbitrary bytes under their own account. Under this fix's own
+        // stated threat model (a tampered API response), an attacker just points `browser_download_url`
+        // at `raw.githubusercontent.com/<their account>/.../evil.apk` and the old broad suffix accepted
+        // it. Narrowed to the EXACT host `objects.githubusercontent.com` - the specific redirect-signing
+        // CDN GitHub itself returns for a genuine release asset, never user-populated.
         return uri.scheme.equals("https", ignoreCase = true) &&
             (host.equals("github.com", ignoreCase = true) ||
-                host.endsWith(".githubusercontent.com", ignoreCase = true))
+                host.equals("objects.githubusercontent.com", ignoreCase = true))
     }
 
     private fun httpGetJson(urlString: String): JSONObject? {
@@ -226,12 +233,41 @@ object UpdateChecker {
         val outFile = File(dir, APK_FILE_NAME)
         val tempFile = File(dir, "$APK_FILE_NAME.part")
         return try {
-            connection = (URL(downloadUrl).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 15_000
-                readTimeout = 30_000
-                instanceFollowRedirects = true
+            // MINOR fix (ultimate-app-review, Fable F-3): instanceFollowRedirects=true let a strictly
+            // github.com/objects.githubusercontent.com URL redirect to ANY other https host with no
+            // re-check - the isTrustedReleaseAssetUrl gate above only ever saw the ORIGINAL URL. Redirects
+            // are now followed manually, re-validating every hop against the same trusted-host check
+            // before following it, capped at a small number of hops as a sanity bound (GitHub's own
+            // redirect chain for a release asset is 1-2 hops).
+            var currentUrl = downloadUrl
+            var hops = 0
+            while (true) {
+                connection = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 15_000
+                    readTimeout = 30_000
+                    instanceFollowRedirects = false
+                }
+                connection.connect()
+                val code = connection.responseCode
+                if (code in setOf(HttpURLConnection.HTTP_MOVED_PERM, HttpURLConnection.HTTP_MOVED_TEMP, HttpURLConnection.HTTP_SEE_OTHER, 307, 308)) {
+                    val location = connection.getHeaderField("Location")
+                    connection.disconnect()
+                    if (location == null || !isTrustedReleaseAssetUrl(location)) {
+                        Log.w(TAG, "Refusing to follow update redirect to an untrusted host")
+                        tempFile.delete()
+                        return null
+                    }
+                    hops++
+                    if (hops > 5) {
+                        Log.w(TAG, "Too many update redirects")
+                        tempFile.delete()
+                        return null
+                    }
+                    currentUrl = location
+                    continue
+                }
+                break
             }
-            connection.connect()
             if (connection.responseCode !in 200..299) {
                 tempFile.delete()
                 return null

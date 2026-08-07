@@ -316,7 +316,20 @@ object BackupManager {
         })
 
         put("sessions", JSONArray().apply {
-            sessions.forEach { s ->
+            // BLOCKER fix (ultimate-app-review, Fable F-2): an OPEN session (endedAt == null) must
+            // never be serialized into a backup. StatsCalculator.effectiveOpenSessionEnd bounds an open
+            // session against the RESTORING device's own live lastSeenAt, not against anything in the
+            // backup itself - so restoring while genuinely together with a partner (lastSeenAt ~ now)
+            // credited the WHOLE backup-to-restore gap (live-verified: a 30-day-old open session
+            // restored ~30 days of credit and irreversibly unlocked every time capsule up to 500h,
+            // reproducing the exact B63 disaster its own fix was meant to close). This mirrors the
+            // policy GattSyncManager.buildPayload already enforces for the identical reason (S19: open
+            // sessions are never put on the wire) - a backup and a sync are both "this session data is
+            // about to be read as truth by a device with its own independent live proximity state",
+            // and an open session's remaining duration is exactly the part that state can't safely
+            // vouch for. The device's own proximity tracking re-establishes any currently-open session
+            // itself, live, right after restore - nothing real is lost by not backing this up.
+            sessions.filter { it.endedAt != null }.forEach { s ->
                 put(JSONObject().apply {
                     put("id", s.id)
                     put("startedAt", s.startedAt)
@@ -665,7 +678,7 @@ object BackupManager {
 
             val parsed = try {
                 ParsedBackup(
-                    sessions = parseSessions(root.getJSONArray("sessions")),
+                    sessions = parseSessions(root.getJSONArray("sessions"), root.optLong("createdAt", System.currentTimeMillis())),
                     dateIdeas = parseDateIdeas(root.getJSONArray("dateIdeas")),
                     timeCapsules = parseTimeCapsules(root.getJSONArray("timeCapsules")),
                     moments = parseMoments(root.getJSONArray("moments"), context),
@@ -850,15 +863,25 @@ object BackupManager {
         val photoUri get() = moment.photoUri
     }
 
-    private fun parseSessions(arr: JSONArray): List<TogetherSession> = (0 until arr.length()).map { i ->
+    private fun parseSessions(arr: JSONArray, backupCreatedAt: Long): List<TogetherSession> = (0 until arr.length()).map { i ->
         val o = arr.getJSONObject(i)
         // syncId defaults to a fresh random UUID for a v1 backup (made before Feature A existed) - safe
         // to backfill independently here, same reasoning as AppDatabase.MIGRATION_2_3's backfill.
         val syncId = o.optStringOrNull("syncId")?.takeIf { it.isNotBlank() } ?: java.util.UUID.randomUUID().toString()
+        val startedAt = o.getLong("startedAt")
+        // BLOCKER fix, defense-in-depth (ultimate-app-review, Fable F-2): buildManifest no longer
+        // writes an open session at all (see its own doc), but a backup from an older build, or a
+        // hand-crafted/corrupted one, could still carry endedAt==null. Rather than trust the
+        // RESTORING device's own live lastSeenAt to bound it (that's the bug - it measures the gap
+        // between two unrelated observations instead of elapsed togetherness), close it here using the
+        // BACKUP's own createdAt - a timestamp from the same snapshot as startedAt, not the restoring
+        // device's current moment. Clamped to never be before startedAt (a backup taken instantly after
+        // the session opened must credit ~0, never negative).
+        val endedAt = if (o.isNull("endedAt")) maxOf(startedAt, backupCreatedAt) else o.getLong("endedAt")
         TogetherSession(
             id = o.getLong("id"),
-            startedAt = o.getLong("startedAt"),
-            endedAt = if (o.isNull("endedAt")) null else o.getLong("endedAt"),
+            startedAt = startedAt,
+            endedAt = endedAt,
             isManual = o.optBoolean("isManual", false),
             syncId = syncId,
             // v1/v2 backups (made before this feature existed) have no updatedAt/deleted keys - default
