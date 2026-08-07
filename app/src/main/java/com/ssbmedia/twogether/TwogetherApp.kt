@@ -4,7 +4,6 @@ import android.app.Application
 import androidx.lifecycle.ProcessLifecycleOwner
 import com.ssbmedia.twogether.data.backup.BackupManager
 import com.ssbmedia.twogether.data.backup.BackupWorker
-import com.ssbmedia.twogether.data.repo.ClockSkewSelfHeal
 import com.ssbmedia.twogether.data.update.UpdateChecker
 import com.ssbmedia.twogether.data.update.UpdateWorker
 import com.ssbmedia.twogether.lock.AppLockManager
@@ -54,21 +53,31 @@ class TwogetherApp : Application() {
         // Resumes a backup restore that got interrupted before completing (process death mid-restore) -
         // see BackupManager.restoreBackupDurable/resumePendingRestoreIfAny's docs. A no-op on every
         // normal app start where nothing is pending, which is the overwhelming majority of the time.
-        //
-        // MINOR fix (ultimate-app-review, round-2 re-verification, Opus): ClockSkewSelfHeal.run() used
-        // to be its own independent launch{} here, racing this one - a resumed restore's clearAll() +
-        // repopulate transaction could interleave with the self-heal's own read-filter-upsertAll sweep
-        // and resurrect a row (including a moment whose photo file the restore had already deleted) the
-        // restore was in the middle of legitimately discarding. Sequenced into this same coroutine,
-        // AFTER any pending restore resumes, so the self-heal only ever runs against a database that's
-        // either fully restored or was never touched by a restore at all this session.
         ServiceLocator.applicationScope.launch {
             BackupManager.resumePendingRestoreIfAny(this@TwogetherApp)
-            // MAJOR fix (ultimate-app-review, post-restart full-scope round, Opus): self-heals any row
-            // this device itself wrote with an implausibly future updatedAt during a past period of
-            // genuine clock error - see ClockSkewSelfHeal's own doc. A no-op on every normal app start
-            // where nothing is stale, which is the overwhelming majority of the time.
-            ClockSkewSelfHeal.run()
         }
+        // DISABLED (ultimate-app-review, Fable's post-restart adversarial pass, 2026-08-08): this call
+        // used to self-heal a row this device itself wrote with an implausibly future updatedAt during a
+        // past period of genuine clock error (ClockSkewSelfHeal.run(), added to fix a MAJOR from this
+        // same review round). Fable then live-reproduced a BLOCKER-severity regression in it: the
+        // function trusts `System.currentTimeMillis()` as ground truth for judging already-stored data,
+        // but if THIS device's clock is instead currently BEHIND real time (a different clock fault, not
+        // the one the fix targeted), it re-stamps perfectly correct, recent local edits - including a
+        // tombstone from a user-confirmed delete - back to the stale "now", silently undoing them once
+        // the clock is corrected and a sync runs; the poisoned stamp then propagates to the partner.
+        // This is the SECOND systemic clock-trust finding this review round (see BackupManager.
+        // parseSessions' own history, which had the mirror-image bug on the restore path) - per this
+        // review process's own one-restart cap, that means stop and get this in front of a human rather
+        // than attempt a third hasty timestamp-trust patch overnight. The correct fix (Fable's own
+        // proposal) is a single persisted, monotonically-non-decreasing "highest updatedAt ever
+        // legitimately observed" high-water mark - fed by every local write AND every successful sync
+        // merge - used here instead of raw `now`, so a temporarily-backward device clock can't regress
+        // the ceiling. That's a real feature addition (new persisted state, new write-site integration
+        // across every local write path), not a one-line fix, and deserves its own reviewed round rather
+        // than being rushed in now. Until then, this call stays disabled and Major 2 (rows written during
+        // a past clock-error period staying un-syncable until manually retyped) is deliberately back to
+        // being an accepted, deferred annoyance rather than a "fixed" feature that can itself destroy
+        // data. ClockSkewSelfHeal.kt is left in place, unused, as the documented starting point.
+        // ServiceLocator.applicationScope.launch { ClockSkewSelfHeal.run() }
     }
 }
