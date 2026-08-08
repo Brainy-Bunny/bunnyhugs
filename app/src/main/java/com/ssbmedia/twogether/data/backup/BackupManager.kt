@@ -1082,7 +1082,21 @@ object BackupManager {
      * file has no cryptographic signature, so any bound here is inherently a trust judgment call, not a
      * fully closeable gap; recording the trade-off explicitly rather than treating it as fully solved. */
     private fun isPlausibleBackupUpdatedAt(wireUpdatedAt: Long, backupCreatedAt: Long): Boolean {
-        if (wireUpdatedAt > backupCreatedAt + 5 * 60_000L) return false
+        // MINOR fix (code-review, independently confirmed exploitable): check (1) used to add the raw,
+        // attacker-controlled backupCreatedAt to a constant with no overflow guard - Kotlin's Long
+        // arithmetic wraps silently rather than throwing, so isPlausibleBackupUpdatedAt(Long.MIN_VALUE,
+        // Long.MAX_VALUE) wrapped `backupCreatedAt + 5min` around to a huge negative number that
+        // Long.MIN_VALUE was still <= to, letting check (1) pass when it should reject. Practical impact
+        // was low (an accepted row with an absurd updatedAt like Long.MIN_VALUE would still lose every
+        // real LWW comparison), but the guard was "correct by luck" for realistic inputs, not by
+        // construction - Math.addExact fails closed (rejects) on the overflow itself, same direction as
+        // every other reject-gate in this function.
+        val backupCreatedAtPlusTolerance = try {
+            Math.addExact(backupCreatedAt, 5 * 60_000L)
+        } catch (e: ArithmeticException) {
+            return false
+        }
+        if (wireUpdatedAt > backupCreatedAtPlusTolerance) return false
         return wireUpdatedAt <= trustedBackupCeiling(backupCreatedAt) + 5 * 60_000L
     }
 

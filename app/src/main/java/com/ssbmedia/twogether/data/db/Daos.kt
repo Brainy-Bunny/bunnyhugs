@@ -94,6 +94,18 @@ interface TimeCapsuleDao {
     @Query("UPDATE time_capsules SET unlockedAt = :unlockedAt, updatedAt = :updatedAt WHERE id = :id AND deleted = 0")
     suspend fun unlockIfNotDeleted(id: Long, unlockedAt: Long, updatedAt: Long)
 
+    /** MINOR fix (code-review, Sonnet - same race class as [unlockIfNotDeleted], one call site over):
+     * TimeCapsuleRepository.delete()/mergeRemote's tombstone-apply branch used to read a capsule then
+     * write it back with a plain [update] carrying the WHOLE row, including whatever `unlockedAt` the
+     * read snapshot happened to have. If a concurrent `unlockEligible` pass committed a real unlock on
+     * that exact row between the read and this write, the stale-snapshot [update] would silently null it
+     * back out - the mirror-image of the resurrection race [unlockIfNotDeleted] closes, this time
+     * clobbering a just-set unlock instead of reviving a just-deleted row. This targeted query only ever
+     * touches `deleted`/`updatedAt`, never `unlockedAt`, so it structurally cannot carry a stale
+     * unlockedAt snapshot forward regardless of timing - no read-before-write needed at all. */
+    @Query("UPDATE time_capsules SET deleted = 1, updatedAt = :updatedAt WHERE id = :id")
+    suspend fun tombstone(id: Long, updatedAt: Long)
+
     /** Raw/unfiltered - includes soft-deleted (tombstoned) rows. Used by BackupManager (so backups
      * round-trip tombstones) and by TimeCapsuleRepository.mergeRemote (needs to see already-tombstoned
      * local rows to match syncIds regardless of deletion state), same pattern as every other synced

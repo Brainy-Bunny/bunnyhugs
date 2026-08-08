@@ -259,7 +259,20 @@ class ProximityForegroundService : LifecycleService() {
                         // detection stays permanently dark until the whole service process restarts.
                         Log.i(TAG, "Bluetooth turned back on - resetting BLE state and retrying")
                         bleStarted = false
-                        lifecycleScope.launch { ensureBleRunning() }
+                        // MINOR fix (test-code-allmodels round 2, Opus - unfixed twin of GattSyncManager's
+                        // buildPayload crash-loop fix): this was the one lifecycleScope.launch in this file
+                        // with no try/catch, unlike every sibling launch (tick, restoreState, manualSyncRequests,
+                        // unpaired, onPartnerSeen, periodic sync). ensureBleRunning() touches DataStore
+                        // (pairingStore/settingsStore) - a plain IOException there (disk full, transient FS
+                        // error) would otherwise crash this START_STICKY service, which Android would then
+                        // restart only to hit the same condition again on the next Bluetooth toggle.
+                        lifecycleScope.launch {
+                            try {
+                                ensureBleRunning()
+                            } catch (e: Exception) {
+                                Log.e(TAG, "ensureBleRunning failed after Bluetooth turned back on - will retry on the next tick", e)
+                            }
+                        }
                     }
                     BluetoothAdapter.STATE_OFF -> {
                         // Explicitly tear down advertiser/scanner here, not just this service's own

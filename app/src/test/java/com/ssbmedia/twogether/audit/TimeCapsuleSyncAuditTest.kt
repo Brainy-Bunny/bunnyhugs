@@ -169,6 +169,13 @@ class TimeCapsuleSyncAuditTest {
         override fun observeActive(): Flow<List<TimeCapsule>> = throw NotImplementedError("not used by mergeRemote")
         override suspend fun getLocked(): List<TimeCapsule> = throw NotImplementedError("not used by mergeRemote")
         override suspend fun unlockIfNotDeleted(id: Long, unlockedAt: Long, updatedAt: Long) = throw NotImplementedError("not used by mergeRemote")
+        override suspend fun tombstone(id: Long, updatedAt: Long) {
+            localRows.firstOrNull { it.id == id }?.let { row ->
+                val tombstoned = row.copy(deleted = true, updatedAt = updatedAt)
+                updated.add(tombstoned)
+                localRows = localRows.map { if (it.id == id) tombstoned else it }
+            }
+        }
         override suspend fun getAll(): List<TimeCapsule> = localRows
         override suspend fun clearAll() { localRows = emptyList() }
     }

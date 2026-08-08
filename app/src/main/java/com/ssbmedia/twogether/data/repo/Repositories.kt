@@ -206,6 +206,18 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
          * for the full anti-cheat derivation and why the `maxOf(0f, ...)` clamp is there. */
         fun effectiveThreshold(capsule: TimeCapsule, currentManualHoursCredit: Float): Float =
             capsule.unlockAtHours + maxOf(0f, currentManualHoursCredit - capsule.manualHoursAtCreation)
+
+        /** MINOR fix (code-review): the "typo guardrail" bound check itself (not just the two constants
+         * above it) used to be duplicated verbatim as inline predicate logic in both
+         * GattSyncManager.deserializeTimeCapsules and BackupManager.parseTimeCapsules - a future change to
+         * either predicate applied to one copy and forgotten in the other would silently reintroduce the
+         * exact drift the shared constants were meant to prevent, one level too shallow. Both untrusted
+         * ingestion paths now call these two functions instead of hand-writing the check. */
+        fun isPlausibleUnlockAtHours(hours: Float): Boolean =
+            hours.isFinite() && hours > 0f && hours <= MAX_UNLOCK_AT_HOURS
+
+        fun isPlausibleManualHoursAtCreation(hours: Float): Boolean =
+            hours.isFinite() && hours >= 0f && hours <= MAX_MANUAL_HOURS_AT_CREATION
     }
 
     fun observeAll(): Flow<List<TimeCapsule>> = dao.observeActive()
@@ -217,8 +229,18 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
 
     /** [manualHoursAtCreation] is the couple's CURRENT manual-hours credit (StatsCalculator.
      * manualHoursCredit) at the moment this capsule is created - see TimeCapsule's own doc for why this
-     * snapshot is what lets the anti-cheat math in [unlockEligible] work. */
+     * snapshot is what lets the anti-cheat math in [unlockEligible] work.
+     *
+     * MINOR fix (code-review): this is the ONE local writer of unlockAtHours/manualHoursAtCreation - the
+     * wire path, the backup path, and effectiveThreshold's own clamp all treat these fields as
+     * security-critical and validate/bound them, but this origin point had zero validation of its own.
+     * Not exploitable today (the only caller, CapsulesViewModel.add, is fed UI-validated input via
+     * AddCapsuleDialog's own bound check), but leaving the one local writer unguarded was inconsistent
+     * with this whole feature's own stated design goal of enforcing these bounds structurally rather than
+     * by convention. No-ops (silently drops the request) on an invalid value, same "reject, don't clamp"
+     * shape every untrusted ingestion path already uses. */
     suspend fun add(text: String, unlockAtHours: Float, manualHoursAtCreation: Float) {
+        if (!isPlausibleUnlockAtHours(unlockAtHours) || !isPlausibleManualHoursAtCreation(manualHoursAtCreation)) return
         val now = System.currentTimeMillis()
         dao.insert(
             TimeCapsule(
@@ -232,9 +254,12 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
     }
 
     /** Feature: Time Capsule sync. Soft-delete (tombstone) - same pattern as every other synced entity's
-     * delete, so removing a capsule you created by mistake propagates to your partner's phone too. */
+     * delete, so removing a capsule you created by mistake propagates to your partner's phone too.
+     *
+     * MINOR fix (code-review, Sonnet): used to be a stale-read-shaped `dao.update(capsule.copy(...))`
+     * that could clobber a concurrent unlock - see [TimeCapsuleDao.tombstone]'s own doc. */
     suspend fun delete(capsule: TimeCapsule) {
-        dao.update(capsule.copy(deleted = true, updatedAt = System.currentTimeMillis()))
+        dao.tombstone(capsule.id, System.currentTimeMillis())
     }
 
     /**
@@ -330,15 +355,33 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
     suspend fun mergeRemote(remote: List<TimeCapsule>): List<TimeCapsule> {
         val localBySyncId = dao.getAll().filter { it.syncId.isNotBlank() }.associateBy { it.syncId }
         val changed = mutableListOf<TimeCapsule>()
-        remote.filter { it.syncId.isNotBlank() }.forEach { r ->
+        // MINOR fix (code-review, independently found twice - Opus in test-code-allmodels round 1 and a
+        // separate code-review pass): localBySyncId above is a snapshot taken ONCE before this loop, so
+        // two remote rows sharing the same syncId in one malformed/buggy payload would BOTH see
+        // local == null and BOTH get inserted, creating duplicate local rows for one syncId - a later
+        // delete would only tombstone whichever copy dao.getAll() happens to return last, leaving the
+        // other undeletable from the partner's side. Deduped within this one payload first (LWW by
+        // updatedAt, same rule already applied against local state two lines down) so at most one row per
+        // syncId is ever considered per call.
+        val dedupedRemote = remote.filter { it.syncId.isNotBlank() }
+            .groupBy { it.syncId }
+            .mapValues { (_, rows) -> rows.maxBy { it.updatedAt } }
+            .values
+        dedupedRemote.forEach { r ->
             val local = localBySyncId[r.syncId]
             if (local == null) {
                 val toInsert = r.copy(id = 0, unlockedAt = null)
                 dao.insert(toInsert)
                 changed.add(toInsert)
             } else if (r.deleted && !local.deleted) {
-                val merged = local.copy(deleted = true, updatedAt = maxOf(local.updatedAt, r.updatedAt))
-                dao.update(merged)
+                // MINOR fix (code-review, Sonnet): used to be dao.update(local.copy(...)), a stale-read
+                // full-row write that could clobber a concurrent unlockEligible commit - see
+                // TimeCapsuleDao.tombstone's own doc. The write itself now only ever touches deleted/
+                // updatedAt; `merged` below is constructed purely for this function's own return value
+                // (still unread by any production caller today, per A1), not used as the DB write.
+                val newUpdatedAt = maxOf(local.updatedAt, r.updatedAt)
+                dao.tombstone(local.id, newUpdatedAt)
+                val merged = local.copy(deleted = true, updatedAt = newUpdatedAt)
                 changed.add(merged)
             }
         }

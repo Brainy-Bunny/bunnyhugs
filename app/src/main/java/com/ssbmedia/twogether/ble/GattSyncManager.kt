@@ -591,7 +591,7 @@ class GattSyncManager(
             // creation, re-applied here since this value arrives from a peer, not this device's own
             // validated UI input.
             val unlockAtHours = o.getDouble("unlockAtHours").toFloat()
-            if (!unlockAtHours.isFinite() || unlockAtHours <= 0f || unlockAtHours > com.ssbmedia.twogether.data.repo.TimeCapsuleRepository.MAX_UNLOCK_AT_HOURS) {
+            if (!com.ssbmedia.twogether.data.repo.TimeCapsuleRepository.isPlausibleUnlockAtHours(unlockAtHours)) {
                 Log.w(TAG, "Dropping remote timeCapsule $syncId with implausible unlockAtHours=$unlockAtHours")
                 return@mapNotNull null
             }
@@ -610,7 +610,7 @@ class GattSyncManager(
             // plausible real "manual hours credit" - the largest value either reviewer's live exploit used
             // was ~1e6/1e9/1e39, all comfortably rejected here).
             val manualHoursAtCreation = o.optDouble("manualHoursAtCreation", 0.0).toFloat()
-            if (!manualHoursAtCreation.isFinite() || manualHoursAtCreation < 0f || manualHoursAtCreation > com.ssbmedia.twogether.data.repo.TimeCapsuleRepository.MAX_MANUAL_HOURS_AT_CREATION) {
+            if (!com.ssbmedia.twogether.data.repo.TimeCapsuleRepository.isPlausibleManualHoursAtCreation(manualHoursAtCreation)) {
                 Log.w(TAG, "Dropping remote timeCapsule $syncId with implausible manualHoursAtCreation=$manualHoursAtCreation")
                 return@mapNotNull null
             }
