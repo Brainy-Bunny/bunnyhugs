@@ -178,20 +178,33 @@ class DateIdeaRepository(private val dao: DateIdeaDao) {
 }
 
 class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
-    fun observeAll(): Flow<List<TimeCapsule>> = dao.observeAll()
+    fun observeAll(): Flow<List<TimeCapsule>> = dao.observeActive()
+
+    /** Raw/unfiltered - includes soft-deleted (tombstoned) rows. Used by BackupManager and by
+     * GattSyncManager's payload builder, which must send deleted capsules too so the deletion itself
+     * propagates to the partner's phone - same pattern as every other synced entity. */
+    suspend fun getAllIncludingDeleted(): List<TimeCapsule> = dao.getAll()
 
     /** [manualHoursAtCreation] is the couple's CURRENT manual-hours credit (StatsCalculator.
      * manualHoursCredit) at the moment this capsule is created - see TimeCapsule's own doc for why this
      * snapshot is what lets the anti-cheat math in [unlockEligible] work. */
     suspend fun add(text: String, unlockAtHours: Float, manualHoursAtCreation: Float) {
+        val now = System.currentTimeMillis()
         dao.insert(
             TimeCapsule(
                 text = text,
                 unlockAtHours = unlockAtHours,
-                createdAt = System.currentTimeMillis(),
-                manualHoursAtCreation = manualHoursAtCreation
+                createdAt = now,
+                manualHoursAtCreation = manualHoursAtCreation,
+                updatedAt = now
             )
         )
+    }
+
+    /** Feature: Time Capsule sync. Soft-delete (tombstone) - same pattern as every other synced entity's
+     * delete, so removing a capsule you created by mistake propagates to your partner's phone too. */
+    suspend fun delete(capsule: TimeCapsule) {
+        dao.update(capsule.copy(deleted = true, updatedAt = System.currentTimeMillis()))
     }
 
     /**
@@ -219,9 +232,48 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
         locked.forEach { capsule ->
             val effectiveThreshold = capsule.unlockAtHours + (currentManualHoursCredit - capsule.manualHoursAtCreation)
             if (effectiveThreshold <= totalHours) {
-                dao.update(capsule.copy(unlockedAt = now))
+                // updatedAt bumped too (Feature: Time Capsule sync) - otherwise a local-only unlock would
+                // never itself be a reason to re-send this capsule's row, though in practice the initial
+                // add() sync (or any later local edit) already covers propagating the definition; bumping
+                // here is just consistent with "every real local write touches updatedAt."
+                dao.update(capsule.copy(unlockedAt = now, updatedAt = now))
             }
         }
+    }
+
+    /** Feature: Time Capsule sync. Union+tombstone LWW merge by [TimeCapsule.syncId], mirroring
+     * SessionRepository.mergeRemoteSessions' shape (TimeCapsule uses the same local-autoincrement-[id] +
+     * separate-syncId identity those do, unlike Milestone/DateIdea's single-UUID-primary-key shape) - a
+     * genuinely new remote row inserts with `id = 0` (Room autogenerates); an already-known syncId
+     * preserves this device's own local [TimeCapsule.id] and only takes the remote's OTHER fields when
+     * the remote is LWW-newer.
+     *
+     * SECURITY: [TimeCapsule.unlockedAt] is NEVER taken from the remote side, even when the remote row
+     * otherwise wins the comparison - only this device's OWN [unlockEligible], computed from its own
+     * already-validated session data, may ever set it. Without this, a compromised or buggy peer could
+     * claim `unlockedAt` in its payload and falsely reveal a capsule's contents on the receiving device
+     * without that device's own total hours having actually crossed the threshold - the exact "never
+     * trust a peer's claim about high-stakes, irreversible state" principle this whole review applied to
+     * every timestamp in the app. Both devices still converge on the same real unlock moment naturally,
+     * since totalHours is derived from the SAME (already-synced) session data on both sides - nothing is
+     * lost by keeping this one field strictly local.
+     */
+    suspend fun mergeRemote(remote: List<TimeCapsule>): List<TimeCapsule> {
+        val localBySyncId = dao.getAll().filter { it.syncId.isNotBlank() }.associateBy { it.syncId }
+        val changed = mutableListOf<TimeCapsule>()
+        remote.filter { it.syncId.isNotBlank() }.forEach { r ->
+            val local = localBySyncId[r.syncId]
+            if (local == null) {
+                val toInsert = r.copy(id = 0, unlockedAt = null)
+                dao.insert(toInsert)
+                changed.add(toInsert)
+            } else if (r.updatedAt > local.updatedAt) {
+                val merged = r.copy(id = local.id, unlockedAt = local.unlockedAt)
+                dao.update(merged)
+                changed.add(merged)
+            }
+        }
+        return changed
     }
 }
 

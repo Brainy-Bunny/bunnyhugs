@@ -382,6 +382,11 @@ object BackupManager {
                     // scenario (a restored capsule's anti-cheat effective threshold silently drifts
                     // upward by the couple's full current manual-hours credit).
                     put("manualHoursAtCreation", c.manualHoursAtCreation.toDouble())
+                    // Feature: Time Capsule sync (AppDatabase.MIGRATION_8_9) - same shape every other
+                    // synced entity's backup manifest already carries.
+                    put("syncId", c.syncId)
+                    put("updatedAt", c.updatedAt)
+                    put("deleted", c.deleted)
                 })
             }
         })
@@ -997,15 +1002,33 @@ object BackupManager {
      * older backups (there's no better value to fall back to) - only the round-trip through a
      * current-format backup needed fixing.
      */
-    private fun parseTimeCapsules(arr: JSONArray): List<TimeCapsule> = (0 until arr.length()).map { i ->
+    /** BLOCKER fix, defense-in-depth (Feature: Time Capsule sync, AppDatabase.MIGRATION_8_9): this
+     * parser used to accept any `unlockAtHours` verbatim with zero validation (unlike every other
+     * synced entity's `parse*`) - a corrupted or hand-crafted backup with a negative/NaN/absurd value
+     * could reach CapsulesScreen's threshold math (division/comparison against it) with unpredictable
+     * results. Same "typo guardrail" bound CapsulesScreen's own MAX_CAPSULE_UNLOCK_HOURS and
+     * GattSyncManager.deserializeTimeCapsules both already enforce. `syncId`/`updatedAt`/`deleted`
+     * default safely for a v1..v8-format backup (made before this feature existed): a fresh UUID, this
+     * device's own restore-time clamp of `createdAt`, and "never tombstoned" respectively - same
+     * backward-compat pattern `manualHoursAtCreation`'s own fix above already established. */
+    private fun parseTimeCapsules(arr: JSONArray): List<TimeCapsule> = (0 until arr.length()).mapNotNull { i ->
         val o = arr.getJSONObject(i)
+        val unlockAtHours = o.getDouble("unlockAtHours").toFloat()
+        if (!unlockAtHours.isFinite() || unlockAtHours <= 0f || unlockAtHours > 5000f) {
+            Log.w(TAG, "Rejecting implausible time capsule from backup: unlockAtHours=$unlockAtHours")
+            return@mapNotNull null
+        }
+        val createdAt = o.getLong("createdAt")
         TimeCapsule(
             id = o.getLong("id"),
             text = o.getString("text"),
-            unlockAtHours = o.getDouble("unlockAtHours").toFloat(),
-            createdAt = o.getLong("createdAt"),
+            unlockAtHours = unlockAtHours,
+            createdAt = createdAt,
             unlockedAt = if (o.isNull("unlockedAt")) null else o.getLong("unlockedAt"),
-            manualHoursAtCreation = o.optDouble("manualHoursAtCreation", 0.0).toFloat()
+            manualHoursAtCreation = o.optDouble("manualHoursAtCreation", 0.0).toFloat(),
+            syncId = o.optStringOrNull("syncId")?.takeIf { it.isNotBlank() } ?: java.util.UUID.randomUUID().toString(),
+            updatedAt = clampBackupUpdatedAt(o.optLong("updatedAt", createdAt)),
+            deleted = o.optBoolean("deleted", false)
         )
     }
 

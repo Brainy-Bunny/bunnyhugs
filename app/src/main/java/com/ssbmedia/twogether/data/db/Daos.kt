@@ -72,12 +72,18 @@ interface TimeCapsuleDao {
     @Update
     suspend fun update(capsule: TimeCapsule)
 
-    @Query("SELECT * FROM time_capsules ORDER BY unlockAtHours ASC")
-    fun observeAll(): Flow<List<TimeCapsule>>
+    /** Feature: Time Capsule sync. Excludes soft-deleted (tombstoned) rows - what the UI should always
+     * see. */
+    @Query("SELECT * FROM time_capsules WHERE deleted = 0 ORDER BY unlockAtHours ASC")
+    fun observeActive(): Flow<List<TimeCapsule>>
 
-    @Query("SELECT * FROM time_capsules WHERE unlockedAt IS NULL")
+    @Query("SELECT * FROM time_capsules WHERE unlockedAt IS NULL AND deleted = 0")
     suspend fun getLocked(): List<TimeCapsule>
 
+    /** Raw/unfiltered - includes soft-deleted (tombstoned) rows. Used by BackupManager (so backups
+     * round-trip tombstones) and by TimeCapsuleRepository.mergeRemote (needs to see already-tombstoned
+     * local rows to match syncIds regardless of deletion state), same pattern as every other synced
+     * entity's DAO. */
     @Query("SELECT * FROM time_capsules ORDER BY unlockAtHours ASC")
     suspend fun getAll(): List<TimeCapsule>
 

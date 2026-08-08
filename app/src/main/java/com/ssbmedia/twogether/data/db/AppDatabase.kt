@@ -10,7 +10,7 @@ import java.util.UUID
 
 @Database(
     entities = [TogetherSession::class, DateIdea::class, TimeCapsule::class, Moment::class, MomentNote::class, Milestone::class, ListCategory::class],
-    version = 8,
+    version = 9,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -247,6 +247,38 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         /**
+         * v8 -> v9, Time Capsule sync: adds time_capsules.syncId/updatedAt/deleted, the same
+         * cross-device-identity + LWW-merge + tombstone shape every other synced entity already has -
+         * see TimeCapsule's own doc and TimeCapsuleRepository.mergeRemote for why a capsule made for
+         * your partner never reached them until now. syncId backfilled per-row with a fresh UUID (same
+         * recipe as MIGRATION_2_3's backfillSyncIds, duplicated inline here since that helper is a
+         * private member of MIGRATION_2_3's own anonymous Migration instance, not shared state) -
+         * pre-existing capsules predate sync entirely and can never collide with whatever a partner's
+         * device independently backfills for its own. updatedAt backfilled from createdAt, same
+         * reasoning as MIGRATION_4_5/5_6's startedAt/takenAt backfills. deleted defaults to 0 - nothing
+         * was ever deletable before this feature existed, so no pre-migration row can possibly be a
+         * tombstone.
+         */
+        val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE time_capsules ADD COLUMN syncId TEXT NOT NULL DEFAULT ''")
+                val cursor = db.query("SELECT id FROM time_capsules WHERE syncId = ''")
+                cursor.use {
+                    val idIndex = it.getColumnIndexOrThrow("id")
+                    while (it.moveToNext()) {
+                        val rowId = it.getLong(idIndex)
+                        db.execSQL("UPDATE time_capsules SET syncId = ? WHERE id = ?", arrayOf(UUID.randomUUID().toString(), rowId))
+                    }
+                }
+
+                db.execSQL("ALTER TABLE time_capsules ADD COLUMN updatedAt INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("UPDATE time_capsules SET updatedAt = createdAt")
+
+                db.execSQL("ALTER TABLE time_capsules ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        /**
          * Seeds the default "Date Ideas" list (id == DEFAULT_LIST_ID) for a genuinely BRAND-NEW install -
          * i.e. no pre-existing database file at all, so Room creates the schema fresh at the CURRENT
          * version and none of MIGRATION_1_2..MIGRATION_7_8 ever run (migrations only fire when upgrading
@@ -276,7 +308,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "twogether.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9)
                     .addCallback(SEED_DEFAULT_LIST_CALLBACK)
                     // Safety net only for a FUTURE schema version we didn't write a real migration for -
                     // the 1->2 and 2->3 paths above are always handled for real, so existing users'

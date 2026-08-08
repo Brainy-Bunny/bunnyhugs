@@ -103,6 +103,7 @@ class GattSyncManager(
     private val momentRepository: MomentRepository,
     private val momentNoteRepository: MomentNoteRepository,
     private val milestoneRepository: MilestoneRepository,
+    private val timeCapsuleRepository: com.ssbmedia.twogether.data.repo.TimeCapsuleRepository,
     private val settingsStore: SettingsStore,
     private val scope: CoroutineScope
 ) {
@@ -149,6 +150,10 @@ class GattSyncManager(
         obj.put("moments", serializeMoments(momentRepository.getAllIncludingDeleted()))
         obj.put("notes", serializeNotes(momentNoteRepository.getAllForAuthor(deviceId)))
         obj.put("milestones", serializeMilestones(milestoneRepository.getAll()))
+        // Feature: Time Capsule sync - full table including tombstones, same reasoning as
+        // sessions/moments/milestones above (a capsule deleted on this device must propagate that
+        // deletion, not just live capsules).
+        obj.put("timeCapsules", serializeTimeCapsules(timeCapsuleRepository.getAllIncludingDeleted()))
         return obj.toString().toByteArray(Charsets.UTF_8)
     }
 
@@ -214,6 +219,11 @@ class GattSyncManager(
         val milestonesParsed = deserializeMilestones(milestonesArr, peerClockOffsetMillis)
         val upsertedMilestones = milestoneRepository.mergeRemote(milestonesParsed)
         MilestoneAlarmScheduler.scheduleAll(context, upsertedMilestones.filter { !it.deleted })
+        // Feature: Time Capsule sync. See TimeCapsuleRepository.mergeRemote's doc for why unlockedAt is
+        // never trusted from this parsed data even though the definitional fields are.
+        val timeCapsulesArr = root.optJSONArray("timeCapsules")
+        val timeCapsulesParsed = deserializeTimeCapsules(timeCapsulesArr, peerClockOffsetMillis)
+        timeCapsuleRepository.mergeRemote(timeCapsulesParsed)
         // MAJOR fix (ultimate-app-review, Fable F-4, assertion 6): even with the correction above, a
         // row can still be legitimately rejected (e.g. genuinely implausible even once corrected) - the
         // sync outcome must say so instead of an unqualified "Synced!" that hides real data loss.
@@ -225,7 +235,8 @@ class GattSyncManager(
             (sessionsArr?.length() ?: 0) - sessionsParsed.size +
             (momentsArr?.length() ?: 0) - momentsParsed.size +
             (notesArr?.length() ?: 0) - notesParsed.size +
-            (milestonesArr?.length() ?: 0) - milestonesParsed.size
+            (milestonesArr?.length() ?: 0) - milestonesParsed.size +
+            (timeCapsulesArr?.length() ?: 0) - timeCapsulesParsed.size
         return parseRemoteMomentInfo(momentsArr)
     }
 
@@ -532,6 +543,65 @@ class GattSyncManager(
                 day = o.getInt("day").coerceIn(1, 31),
                 year = if (o.isNull("year")) null else o.getInt("year"),
                 createdAt = o.getLong("createdAt"),
+                updatedAt = updatedAt,
+                deleted = o.optBoolean("deleted", false)
+            )
+        }
+    }
+
+    /** Feature: Time Capsule sync. `unlockedAt` is included on the wire purely for forward-compat/
+     * debuggability - see TimeCapsuleRepository.mergeRemote's doc for why it's deliberately never
+     * trusted on the receiving end regardless of what's sent here. */
+    private fun serializeTimeCapsules(capsules: List<com.ssbmedia.twogether.data.db.TimeCapsule>): JSONArray {
+        val arr = JSONArray()
+        for (c in capsules) {
+            arr.put(JSONObject().apply {
+                put("syncId", c.syncId)
+                put("text", c.text)
+                put("unlockAtHours", c.unlockAtHours.toDouble())
+                put("createdAt", c.createdAt)
+                put("unlockedAt", c.unlockedAt ?: JSONObject.NULL)
+                put("manualHoursAtCreation", c.manualHoursAtCreation.toDouble())
+                put("updatedAt", c.updatedAt)
+                put("deleted", c.deleted)
+            })
+        }
+        return arr
+    }
+
+    private fun deserializeTimeCapsules(arr: JSONArray?, peerClockOffsetMillis: Long = 0L): List<com.ssbmedia.twogether.data.db.TimeCapsule> {
+        if (arr == null) return emptyList()
+        return (0 until arr.length()).mapNotNull { i ->
+            val o = arr.getJSONObject(i)
+            val syncId = o.optString("syncId", "")
+            if (syncId.isBlank()) return@mapNotNull null
+            val updatedAt = o.getLong("updatedAt") - peerClockOffsetMillis
+            if (!isPlausibleWireUpdatedAt(updatedAt)) {
+                Log.w(TAG, "Dropping remote timeCapsule $syncId with implausible updatedAt=$updatedAt")
+                return@mapNotNull null
+            }
+            // Defensive: an unlockAtHours that's negative, zero, non-finite (NaN/Infinity - both
+            // representable in a JSON double despite not being valid JSON per spec, and org.json parses
+            // them anyway), or absurdly large would either never unlock or trivially always-unlock -
+            // same "typo guardrail" CapsulesScreen's own MAX_CAPSULE_UNLOCK_HOURS enforces on local
+            // creation, re-applied here since this value arrives from a peer, not this device's own
+            // validated UI input.
+            val unlockAtHours = o.getDouble("unlockAtHours").toFloat()
+            if (!unlockAtHours.isFinite() || unlockAtHours <= 0f || unlockAtHours > 5000f) {
+                Log.w(TAG, "Dropping remote timeCapsule $syncId with implausible unlockAtHours=$unlockAtHours")
+                return@mapNotNull null
+            }
+            com.ssbmedia.twogether.data.db.TimeCapsule(
+                text = o.optString("text", ""),
+                unlockAtHours = unlockAtHours,
+                createdAt = o.getLong("createdAt"),
+                // SECURITY: deliberately NOT read from the wire here - always null on a freshly-
+                // deserialized row. TimeCapsuleRepository.mergeRemote is what actually enforces this
+                // never overwrites a local unlock either; this is defense-in-depth at the parse layer
+                // too, so no future caller of this function could accidentally trust it.
+                unlockedAt = null,
+                manualHoursAtCreation = o.optDouble("manualHoursAtCreation", 0.0).toFloat(),
+                syncId = syncId,
                 updatedAt = updatedAt,
                 deleted = o.optBoolean("deleted", false)
             )

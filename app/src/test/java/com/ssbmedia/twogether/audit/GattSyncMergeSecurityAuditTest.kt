@@ -9,6 +9,7 @@ import com.ssbmedia.twogether.data.db.ListCategoryDao
 import com.ssbmedia.twogether.data.db.MilestoneDao
 import com.ssbmedia.twogether.data.db.MomentDao
 import com.ssbmedia.twogether.data.db.MomentNoteDao
+import com.ssbmedia.twogether.data.db.TimeCapsuleDao
 import com.ssbmedia.twogether.data.db.TogetherSessionDao
 import com.ssbmedia.twogether.data.repo.DateIdeaRepository
 import com.ssbmedia.twogether.data.repo.ListCategoryRepository
@@ -16,6 +17,7 @@ import com.ssbmedia.twogether.data.repo.MilestoneRepository
 import com.ssbmedia.twogether.data.repo.MomentNoteRepository
 import com.ssbmedia.twogether.data.repo.MomentRepository
 import com.ssbmedia.twogether.data.repo.SessionRepository
+import com.ssbmedia.twogether.data.repo.TimeCapsuleRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import org.json.JSONArray
@@ -52,6 +54,7 @@ class GattSyncMergeSecurityAuditTest {
         val momentRepo = MomentRepository(mock(MomentDao::class.java), context)
         val momentNoteRepo = MomentNoteRepository(mock(MomentNoteDao::class.java))
         val milestoneRepo = MilestoneRepository(mock(MilestoneDao::class.java))
+        val timeCapsuleRepo = TimeCapsuleRepository(mock(TimeCapsuleDao::class.java))
         // Mocked, not constructed for real: SettingsStore's `settings` property initializer eagerly
         // touches context.settingsDs (a DataStore-backed extension property) at construction time,
         // which needs a real Context - irrelevant here since none of the merge functions under test
@@ -59,7 +62,7 @@ class GattSyncMergeSecurityAuditTest {
         val settingsStore = mock(SettingsStore::class.java)
         return GattSyncManager(
             context, dateIdeaRepo, listCategoryRepo, sessionRepo, momentRepo,
-            momentNoteRepo, milestoneRepo, settingsStore, CoroutineScope(Dispatchers.Unconfined)
+            momentNoteRepo, milestoneRepo, timeCapsuleRepo, settingsStore, CoroutineScope(Dispatchers.Unconfined)
         )
     }
 

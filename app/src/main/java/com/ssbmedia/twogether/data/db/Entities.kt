@@ -70,6 +70,11 @@ data class TimeCapsule(
     val text: String,
     val unlockAtHours: Float,
     val createdAt: Long,
+    /** SECURITY: deliberately never trusted from a peer's payload during sync merge, even when the
+     * remote row otherwise wins the LWW comparison on [updatedAt] - see
+     * TimeCapsuleRepository.mergeRemote's doc for the full reasoning. Only this device's own
+     * TimeCapsuleRepository.unlockEligible, computed from its own already-validated session data, may
+     * ever set this field to non-null. */
     val unlockedAt: Long? = null,
     /** Anti-cheat snapshot: how much of the couple's total hours were already attributable to manual
      * (hand-entered) backfill at the moment this capsule was created - see
@@ -79,7 +84,14 @@ data class TimeCapsule(
      * hours moves - the two changes cancel out, so backfill activity (past or future) can never change
      * how many genuine BLE-detected hours are actually required to unlock. Defaults to 0 for capsules
      * that predate this field (AppDatabase.MIGRATION_6_7 backfills a real value for those instead). */
-    val manualHoursAtCreation: Float = 0f
+    val manualHoursAtCreation: Float = 0f,
+    /** Feature: Time Capsule sync (AppDatabase.MIGRATION_8_9). Stable cross-device identity, same
+     * reasoning as TogetherSession.syncId/Moment.syncId - the local auto-increment [id] is NOT safe to
+     * compare across two independent devices. Defaults to a fresh UUID for any newly-constructed row;
+     * pre-migration rows are backfilled a real one by MIGRATION_8_9 itself. */
+    val syncId: String = UUID.randomUUID().toString(),
+    val updatedAt: Long = System.currentTimeMillis(),
+    val deleted: Boolean = false
 )
 
 @Entity(tableName = "moments")

@@ -9,9 +9,11 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.Box
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -31,6 +33,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -39,6 +42,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.data.datastore.ProximityPersistedState
+import com.ssbmedia.twogether.data.db.TimeCapsule
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.EmptyState
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
@@ -90,6 +94,12 @@ class CapsulesViewModel : ViewModel() {
             ServiceLocator.timeCapsuleRepository.add(text.trim(), unlockHours, manualCredit)
         }
     }
+
+    fun delete(capsule: TimeCapsule) {
+        viewModelScope.launch {
+            ServiceLocator.timeCapsuleRepository.delete(capsule)
+        }
+    }
 }
 
 @Composable
@@ -108,6 +118,7 @@ fun CapsulesScreen(onBack: () -> Unit) {
         StatsCalculator.manualHoursCredit(sessions, lastSeenAt = proximityState.lastSeenAt)
     }
     var showAddDialog by remember { mutableStateOf(false) }
+    var pendingDelete by remember { mutableStateOf<TimeCapsule?>(null) }
 
     Scaffold(
         topBar = {
@@ -141,7 +152,14 @@ fun CapsulesScreen(onBack: () -> Unit) {
                             containerColor = if (unlocked) MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.surfaceVariant
                         )
                     ) {
-                        Column(modifier = Modifier.padding(16.dp)) {
+                        Box {
+                        IconButton(
+                            onClick = { pendingDelete = capsule },
+                            modifier = Modifier.align(Alignment.TopEnd)
+                        ) {
+                            Icon(Icons.Filled.Delete, contentDescription = "Delete capsule")
+                        }
+                        Column(modifier = Modifier.padding(16.dp).padding(end = 40.dp)) {
                             if (unlocked) {
                                 Text("💌 Unlocked", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
                                 Text(capsule.text, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.padding(top = 4.dp))
@@ -176,10 +194,21 @@ fun CapsulesScreen(onBack: () -> Unit) {
                                 }
                             }
                         }
+                        }
                     }
                 }
             }
         }
+    }
+
+    pendingDelete?.let { capsule ->
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("Delete this time capsule?") },
+            text = { Text(if (capsule.unlockedAt != null) "This will remove it for both of you once you next sync." else "It'll be gone before it ever unlocks.") },
+            confirmButton = { TextButton(onClick = { vm.delete(capsule); pendingDelete = null }) { Text("Delete") } },
+            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Cancel") } }
+        )
     }
 
     if (showAddDialog) {
