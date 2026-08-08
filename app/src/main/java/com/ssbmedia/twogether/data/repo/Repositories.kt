@@ -225,12 +225,32 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
      * TRUE total hours), which read as a confusing regression to anyone who'd used manual backfill
      * before. This version keeps totalHours as the one true number shown everywhere, and instead moves
      * the goalpost by the same amount as the backfill - transparent, and provably ungameable either way.
+     *
+     * BLOCKER fix (ultimate-app-review round 2, Opus live-reproduced against round 1's own fix): the
+     * `(currentManualHoursCredit - manualHoursAtCreation)` delta is now clamped to never go BELOW zero.
+     * Bounding manualHoursAtCreation on ingestion (GattSyncManager.deserializeTimeCapsules,
+     * BackupManager.parseTimeCapsules) closed the exploit for the specific magnitudes round 1 happened to
+     * test, but any forged value still above `unlockAtHours + currentManualHoursCredit` (up to the
+     * ingestion bound) drove this delta deeply negative and the capsule open regardless of real
+     * togetherness - a peer/backup could still force an instant false unlock of a capsule it introduced,
+     * just needing a slightly less extreme number than round 1's live repro used. Clamping the delta at 0
+     * means `effectiveThreshold` can now NEVER fall below the capsule's own stated `unlockAtHours` (itself
+     * already bounded to (0, 5000] on every untrusted path) - closing this structurally, independent of
+     * whatever bound ingestion happens to enforce, rather than by picking a tighter magic number that the
+     * next review round would just need to re-litigate. In the normal (non-adversarial) case where manual
+     * credit only grows after a capsule's creation, `currentManualHoursCredit >= manualHoursAtCreation`
+     * already, so the clamp is a no-op and the derivation above (currentManualHoursCredit cancels out
+     * completely) holds exactly as documented. Side effect, also a genuine fix: previously, deleting a
+     * manual session after a capsule's creation could shrink currentManualHoursCredit below
+     * manualHoursAtCreation, silently pulling effectiveThreshold BELOW the capsule's own stated
+     * unlockAtHours - an honest-case bug (unlock arriving early) with the same root cause, closed by the
+     * same clamp.
      */
     suspend fun unlockEligible(totalHours: Float, currentManualHoursCredit: Float) {
         val locked = dao.getLocked()
         val now = System.currentTimeMillis()
         locked.forEach { capsule ->
-            val effectiveThreshold = capsule.unlockAtHours + (currentManualHoursCredit - capsule.manualHoursAtCreation)
+            val effectiveThreshold = capsule.unlockAtHours + maxOf(0f, currentManualHoursCredit - capsule.manualHoursAtCreation)
             if (effectiveThreshold <= totalHours) {
                 // updatedAt bumped too (Feature: Time Capsule sync) - otherwise a local-only unlock would
                 // never itself be a reason to re-send this capsule's row, though in practice the initial

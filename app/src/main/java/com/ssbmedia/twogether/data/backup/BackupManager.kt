@@ -1033,9 +1033,41 @@ object BackupManager {
      * restore's core scenario. `backupCreatedAt` is always >= every legitimate timestamp the backup
      * contains (it was taken after them), so flooring the ceiling at it preserves the exact same
      * rejection of a genuinely-poisoned far-future value while no longer punishing an honestly-slow
-     * restoring clock - same anchor, same reasoning, as parseSessions' existing bound. */
-    private fun isPlausibleBackupUpdatedAt(wireUpdatedAt: Long, backupCreatedAt: Long): Boolean =
-        wireUpdatedAt <= maxOf(System.currentTimeMillis(), backupCreatedAt) + 5 * 60_000L
+     * restoring clock - same anchor, same reasoning, as parseSessions' existing bound.
+     *
+     * BLOCKER fix, round 2 of round 2 (Opus live-reproduced this fix's OWN gap immediately after it
+     * shipped): `backupCreatedAt` itself is `root.optLong("createdAt", ...)` - read straight out of the
+     * SAME untrusted manifest.json being restored, with no bound of its own. Using it as an unbounded
+     * floor made the whole gate self-defeating: a crafted backup that simply stamps its OWN `createdAt`
+     * far in the future (e.g. year 2030) raised the ceiling for every row right along with it, and the
+     * fix above accepted every poisoned row with zero rejections. Live-reproduced: such a backup restored
+     * with no skipped rows at all, after which the restored device's plain-LWW merges for every entity
+     * without a sticky-tombstone gate (DateIdea, Milestone, ListCategory) could never again accept the
+     * partner's legitimate edits, since the poisoned rows now permanently won every future comparison -
+     * while the WIRE path correctly rejected those same rows the moment they tried to sync onward,
+     * leaving the two devices silently, permanently diverged. Two independent checks close this without
+     * reopening the original clock-behind bug: (1) a row can never be newer than the backup that
+     * contains it by more than the same tolerance, regardless of any clock - a row's updatedAt is by
+     * definition written before the backup that bundles it, so this is a free, clock-independent
+     * internal-consistency check that alone kills a poisoned row inside an otherwise-honestly-dated
+     * backup; (2) `backupCreatedAt` itself is capped at `now + MAX_BACKUP_CREATED_AT_FUTURE_SKEW_MILLIS`
+     * before ever being used as a floor - generous enough (2 years) that it can never reject a genuinely
+     * clock-behind restoring device (a real `backupCreatedAt`, written by a working device at backup
+     * time, is never more than a normal clock-skew window away from real "now," nowhere near this cap),
+     * while bounding exactly how far a crafted backup's own claimed creation time can drag the ceiling
+     * into the future - closing the unbounded-slide exploit outright instead of picking a tighter number
+     * that would just move the same class of bug to a different magnitude. */
+    private fun isPlausibleBackupUpdatedAt(wireUpdatedAt: Long, backupCreatedAt: Long): Boolean {
+        if (wireUpdatedAt > backupCreatedAt + 5 * 60_000L) return false
+        val cappedBackupCreatedAt = minOf(backupCreatedAt, System.currentTimeMillis() + MAX_BACKUP_CREATED_AT_FUTURE_SKEW_MILLIS)
+        return wireUpdatedAt <= maxOf(System.currentTimeMillis(), cappedBackupCreatedAt) + 5 * 60_000L
+    }
+
+    /** How far a backup's own claimed `createdAt` may be trusted to push [isPlausibleBackupUpdatedAt]'s
+     * ceiling beyond this device's real clock - generous enough to never punish a genuinely long-idle
+     * restoring device, while bounding a crafted backup's ability to neutralize the reject-gate by simply
+     * claiming a far-future creation time (see that function's own doc). */
+    private const val MAX_BACKUP_CREATED_AT_FUTURE_SKEW_MILLIS = 730L * 24 * 60 * 60 * 1000
 
     /**
      * BUG fix: manualHoursAtCreation used to be omitted entirely from the manifest, so every restored
@@ -1060,15 +1092,19 @@ object BackupManager {
      * backward-compat pattern `manualHoursAtCreation`'s own fix above already established. */
     private fun parseTimeCapsules(arr: JSONArray, backupCreatedAt: Long): List<TimeCapsule> = (0 until arr.length()).mapNotNull { i ->
         val o = arr.getJSONObject(i)
+        // MINOR fix (ultimate-app-review round 2, Opus): read once up front so every rejection line below
+        // can identify which row was dropped, matching every sibling parser's D6 log convention (was
+        // previously indistinguishable when multiple capsules were rejected from the same restore).
+        val syncIdForLogging = o.optStringOrNull("syncId")?.takeIf { it.isNotBlank() } ?: "(no syncId)"
         val unlockAtHours = o.getDouble("unlockAtHours").toFloat()
         if (!unlockAtHours.isFinite() || unlockAtHours <= 0f || unlockAtHours > 5000f) {
-            Log.w(TAG, "Rejecting implausible time capsule from backup: unlockAtHours=$unlockAtHours")
+            Log.w(TAG, "Rejecting implausible time capsule from backup: $syncIdForLogging unlockAtHours=$unlockAtHours")
             return@mapNotNull null
         }
         val createdAt = o.getLong("createdAt")
         val updatedAt = o.optLong("updatedAt", createdAt)
         if (!isPlausibleBackupUpdatedAt(updatedAt, backupCreatedAt)) {
-            Log.w(TAG, "Rejecting implausible time capsule from backup: updatedAt=$updatedAt")
+            Log.w(TAG, "Rejecting implausible time capsule from backup: $syncIdForLogging updatedAt=$updatedAt")
             return@mapNotNull null
         }
         // BLOCKER fix (ultimate-app-review round 2, Opus+Sonnet both independently live-reproduced): same
@@ -1079,7 +1115,7 @@ object BackupManager {
         // that then makes every future serializeTimeCapsules() call throw and crash-loop the sync path.
         val manualHoursAtCreation = o.optDouble("manualHoursAtCreation", 0.0).toFloat()
         if (!manualHoursAtCreation.isFinite() || manualHoursAtCreation < 0f || manualHoursAtCreation > 100_000f) {
-            Log.w(TAG, "Rejecting implausible time capsule from backup: manualHoursAtCreation=$manualHoursAtCreation")
+            Log.w(TAG, "Rejecting implausible time capsule from backup: $syncIdForLogging manualHoursAtCreation=$manualHoursAtCreation")
             return@mapNotNull null
         }
         TimeCapsule(

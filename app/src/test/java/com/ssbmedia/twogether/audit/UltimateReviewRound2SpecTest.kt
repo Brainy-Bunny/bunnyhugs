@@ -202,4 +202,90 @@ class UltimateReviewRound2SpecTest {
         val backupCreatedAt = System.currentTimeMillis()
         assertTrue(!isPlausibleBackupUpdatedAt(backupCreatedAt + 6 * 60_000L, backupCreatedAt))
     }
+
+    // ---- Round-2-of-round-2 (Opus live-reproduced these gaps in round 2's own fixes) ----
+
+    @Test
+    fun `B8-followup internal consistency - a row newer than its own backup's createdAt is rejected regardless of clock`() {
+        val backupCreatedAt = System.currentTimeMillis()
+        // A row can never legitimately postdate the backup that bundles it - this check is clock-
+        // independent and alone kills a poisoned row hidden inside an otherwise honestly-dated backup.
+        assertTrue(!isPlausibleBackupUpdatedAt(backupCreatedAt + 24 * 60 * 60 * 1000L, backupCreatedAt))
+    }
+
+    @Test
+    fun `B8-followup - a crafted backup cannot neutralize the reject-gate by claiming a far-future backupCreatedAt`() {
+        val now = System.currentTimeMillis()
+        val forgedBackupCreatedAt = now + 4L * 365 * 24 * 60 * 60 * 1000 // ~4 years out
+        val forgedRowUpdatedAt = forgedBackupCreatedAt // internally "consistent" with the forged backupCreatedAt
+        // Opus's live repro: before this fix, a backup that stamped its OWN createdAt far in the future
+        // raised the ceiling for every row right along with it, and every row in such a backup was
+        // accepted with zero rejections - permanently poisoning the restored device's LWW merges.
+        assertTrue(
+            "backupCreatedAt's own claimed future value must be capped, not trusted as an unbounded floor",
+            !isPlausibleBackupUpdatedAt(forgedRowUpdatedAt, forgedBackupCreatedAt)
+        )
+    }
+
+    @Test
+    fun `B8-followup - a moderately future backupCreatedAt (within the cap) still correctly floors legitimate rows`() {
+        // A backup created slightly in the future relative to a clock-behind restoring device (the
+        // original, legitimate disaster-recovery scenario) must still work - the cap must not be so tight
+        // it reintroduces the very bug this whole fix exists to prevent.
+        val backupCreatedAt = System.currentTimeMillis() + 24 * 60 * 60 * 1000L // backup device's clock 1 day ahead of restoring device
+        assertTrue(isPlausibleBackupUpdatedAt(backupCreatedAt, backupCreatedAt))
+    }
+
+    // ---- unlockEligible structural clamp (Opus live-reproduced round 2's own manualHoursAtCreation bound as insufficient) ----
+
+    private fun unlockEligibleThresholdHolds(unlockAtHours: Float, manualHoursAtCreation: Float, currentManualHoursCredit: Float, totalHours: Float): Boolean {
+        // Mirrors TimeCapsuleRepository.unlockEligible's own effectiveThreshold formula via reflection on
+        // the private method, so this test breaks (loudly) if the two ever drift apart instead of quietly
+        // testing a stale copy of the formula.
+        val dao = object : TimeCapsuleDao {
+            var row = com.ssbmedia.twogether.data.db.TimeCapsule(
+                id = 1L, text = "t", unlockAtHours = unlockAtHours, createdAt = 0L,
+                manualHoursAtCreation = manualHoursAtCreation, syncId = "s", updatedAt = 0L
+            )
+            override suspend fun insert(capsule: com.ssbmedia.twogether.data.db.TimeCapsule) = 1L
+            override suspend fun update(capsule: com.ssbmedia.twogether.data.db.TimeCapsule) { row = capsule }
+            override fun observeActive() = throw NotImplementedError()
+            override suspend fun getLocked() = listOf(row)
+            override suspend fun getAll() = listOf(row)
+            override suspend fun clearAll() {}
+        }
+        val repo = TimeCapsuleRepository(dao)
+        kotlinx.coroutines.runBlocking { repo.unlockEligible(totalHours, currentManualHoursCredit) }
+        return dao.row.unlockedAt != null
+    }
+
+    @Test
+    fun `unlockEligible never unlocks a capsule below its own stated unlockAtHours, no matter how large manualHoursAtCreation is forged to be`() {
+        // Opus's round-2 live repro: round 2's own ingestion bound (0f..100_000f) still let ANY value
+        // above unlockAtHours + currentCredit through, forcing an instant false unlock. This is the
+        // structural fix - the effective threshold can never fall below unlockAtHours regardless of the
+        // ingestion bound's exact magnitude.
+        assertTrue(
+            "a real 0.2h-together couple must not unlock a 5000h capsule via a forged manualHoursAtCreation",
+            !unlockEligibleThresholdHolds(unlockAtHours = 5000f, manualHoursAtCreation = 50_000f, currentManualHoursCredit = 0f, totalHours = 0.2f)
+        )
+    }
+
+    @Test
+    fun `unlockEligible still unlocks normally once real totalHours crosses unlockAtHours with no manual credit involved`() {
+        assertTrue(
+            unlockEligibleThresholdHolds(unlockAtHours = 10f, manualHoursAtCreation = 0f, currentManualHoursCredit = 0f, totalHours = 10f)
+        )
+    }
+
+    @Test
+    fun `unlockEligible - deleting a manual session after creation cannot pull the threshold below unlockAtHours (honest-case fix)`() {
+        // currentManualHoursCredit dropping below manualHoursAtCreation (a manual entry deleted after the
+        // capsule was created) used to silently LOWER effectiveThreshold below the capsule's own stated
+        // unlockAtHours - an honest-case early-unlock bug with the same root cause, closed by the same clamp.
+        assertTrue(
+            "totalHours just short of unlockAtHours must still be locked, even though manual credit shrank since creation",
+            !unlockEligibleThresholdHolds(unlockAtHours = 100f, manualHoursAtCreation = 50f, currentManualHoursCredit = 0f, totalHours = 99f)
+        )
+    }
 }
