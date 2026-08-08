@@ -12,6 +12,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 /**
@@ -40,7 +41,8 @@ object UpdateChecker {
     data class UpdateInfo(
         val versionCode: Int,
         val versionName: String,
-        val downloadUrl: String
+        val downloadUrl: String,
+        val expectedSha256: String
     )
 
     sealed class CheckOutcome {
@@ -71,7 +73,7 @@ object UpdateChecker {
             return@withContext CheckOutcome.UpToDate
         }
 
-        val apkFile = downloadApk(context, info.downloadUrl)
+        val apkFile = downloadApk(context, info.downloadUrl, info.expectedSha256)
             ?: return@withContext CheckOutcome.DownloadFailed
 
         Notifications.showUpdateAvailableNotification(context, apkFile, info.versionName)
@@ -92,6 +94,7 @@ object UpdateChecker {
             val assets = json.optJSONArray("assets") ?: return null
             var apkUrl: String? = null
             var apkAssetName: String? = null
+            var apkDigest: String? = null
             for (i in 0 until assets.length()) {
                 val asset = assets.optJSONObject(i) ?: continue
                 val name = asset.optString("name", "")
@@ -100,6 +103,7 @@ object UpdateChecker {
                     if (url.isNotBlank()) {
                         apkUrl = url
                         apkAssetName = name
+                        apkDigest = asset.optString("digest", "").takeIf { it.isNotBlank() }
                         break
                     }
                 }
@@ -108,6 +112,19 @@ object UpdateChecker {
                 if (apkUrl != null) Log.w(TAG, "Rejecting update: asset URL host is not a trusted GitHub host: $apkUrl")
                 return null
             }
+            // SECURITY: the downloaded bytes are verified against this hash before ever being handed to
+            // the install intent (see downloadApk's sha256Hex check) - Android's own same-signing-key
+            // enforcement on install is still the real backstop (see isTrustedReleaseAssetUrl's own doc),
+            // but that check only runs at install time, after the file has already sat on disk with an
+            // "Update available" notification pointing at it. GitHub computes and returns this digest for
+            // every uploaded release asset unconditionally - a real release response missing it would be
+            // anomalous, not a normal degraded case, so this fails closed (rejects the update rather than
+            // silently skipping verification) rather than clamping/tolerating a missing value.
+            val expectedSha256 = apkDigest?.removePrefix("sha256:")?.lowercase()?.takeIf { it.length == 64 && it.all { c -> c.isDigit() || c in 'a'..'f' } }
+                ?: run {
+                    Log.w(TAG, "Rejecting update: release asset has no usable sha256 digest")
+                    return null
+                }
 
             // BUG fix: this used to be the raw tag (e.g. "v11") - which is deliberately versionCode, not
             // a human-readable version, so the update notification/dialog read "Twogether v11 is ready"
@@ -146,7 +163,8 @@ object UpdateChecker {
             UpdateInfo(
                 versionCode = versionCode,
                 versionName = versionName,
-                downloadUrl = downloadUrl
+                downloadUrl = downloadUrl,
+                expectedSha256 = expectedSha256
             )
         } catch (e: Exception) {
             Log.w(TAG, "Update check failed", e)
@@ -226,8 +244,18 @@ object UpdateChecker {
      * un-installed, and then fails partway (network drop), left the file corrupted while the "Update
      * available" notification still pointed at it. Now only a fully successful download ever touches the
      * real path, so an already-good, notification-linked APK can never be clobbered by a failed re-try.
+     *
+     * SECURITY: [expectedSha256] (from the release asset's own GitHub-computed digest, see
+     * fetchLatestRelease) is checked against the fully-downloaded temp file BEFORE it's ever renamed onto
+     * the real, notification-linked path - closing the gap between "a trusted-host URL returned 200" and
+     * "these exact bytes are the release GitHub actually published." Android's own same-signing-key
+     * enforcement at install time is still the ultimate backstop (an attacker can't get a
+     * differently-signed APK to actually replace this app), but that check only fires after this file has
+     * already sat on disk with an "Update available" notification pointing at it, and only if the user
+     * still goes on to tap install - this check means a corrupted-in-transit or host-compromised download
+     * never reaches that point at all.
      */
-    private fun downloadApk(context: Context, downloadUrl: String): File? {
+    private fun downloadApk(context: Context, downloadUrl: String, expectedSha256: String): File? {
         var connection: HttpURLConnection? = null
         val dir = context.getExternalFilesDir(null) ?: context.cacheDir
         val outFile = File(dir, APK_FILE_NAME)
@@ -275,6 +303,12 @@ object UpdateChecker {
             connection.inputStream.use { input ->
                 FileOutputStream(tempFile).use { output -> input.copyTo(output) }
             }
+            val actualSha256 = sha256HexOfFile(tempFile)
+            if (!actualSha256.equals(expectedSha256, ignoreCase = true)) {
+                Log.w(TAG, "Rejecting downloaded update: sha256 mismatch (expected $expectedSha256, got $actualSha256)")
+                tempFile.delete()
+                return null
+            }
             if (!tempFile.renameTo(outFile)) {
                 tempFile.copyTo(outFile, overwrite = true)
                 tempFile.delete()
@@ -287,5 +321,23 @@ object UpdateChecker {
         } finally {
             connection?.disconnect()
         }
+    }
+
+    /** Streams [file] through SHA-256 rather than loading it whole into memory - an ~15MB+ APK is small
+     * enough either way, but streaming is the correct habit for a file-sized digest regardless. Deliberately
+     * not util.Hashing.sha256Hex(String) here - that function operates on a String's UTF-8 bytes for the
+     * app's own password/pairing-code hashing, which would corrupt/misrepresent arbitrary binary file
+     * content run through the same charset conversion. */
+    private fun sha256HexOfFile(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(8192)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 }

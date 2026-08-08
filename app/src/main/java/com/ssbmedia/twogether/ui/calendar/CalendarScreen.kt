@@ -198,7 +198,12 @@ fun CalendarScreen(
                 ) {
                     Column(Modifier.padding(14.dp)) {
                         Text("$totalDaysTogether", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                        Text("days together ever", style = MaterialTheme.typography.bodySmall)
+                        // MINOR fix (deferred-minors, fixed per explicit user request): was a static
+                        // "days" label, reading "1 days together ever" - singular for exactly 1.
+                        Text(
+                            if (totalDaysTogether == 1) "day together ever" else "days together ever",
+                            style = MaterialTheme.typography.bodySmall
+                        )
                     }
                 }
                 Card(

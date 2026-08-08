@@ -695,21 +695,28 @@ object BackupManager {
                 return@withContext BackupResult(false, null, "This backup was made by an incompatible version of Twogether.", permanent = true)
             }
 
-            // MINOR fix (ultimate-app-review, round-2 re-verification, Opus): parseSessions can now
-            // silently drop a row as implausible (same as the wire sync path already can) - the restore-
-            // complete dialog below reports this, mirroring the "N items skipped" signal
+            // MINOR fix (ultimate-app-review, round-2 re-verification, Opus; extended to every table per
+            // explicit user request now that every parse* function can reject a row): every parser can
+            // now silently drop a row as implausible (same as the wire sync path already can) - the
+            // restore-complete dialog below reports the total, mirroring the "N items skipped" signal
             // GattSyncManager/OurListsScreen already show for sync (F-4 assertion 6), so a rejection is
-            // never silent regardless of which path it happens on.
-            val rawSessionCount = root.getJSONArray("sessions").length()
+            // never silent regardless of which path or table it happens on.
+            val rawSessionsArr = root.getJSONArray("sessions")
+            val rawDateIdeasArr = root.getJSONArray("dateIdeas")
+            val rawTimeCapsulesArr = root.getJSONArray("timeCapsules")
+            val rawMomentsArr = root.getJSONArray("moments")
+            val rawMomentNotesArr = root.optJSONArray("momentNotes")
+            val rawMilestonesArr = root.optJSONArray("milestones")
+            val rawListCategoriesArr = root.optJSONArray("listCategories")
             val parsed = try {
                 ParsedBackup(
-                    sessions = parseSessions(root.getJSONArray("sessions"), root.optLong("createdAt", System.currentTimeMillis())),
-                    dateIdeas = parseDateIdeas(root.getJSONArray("dateIdeas")),
-                    timeCapsules = parseTimeCapsules(root.getJSONArray("timeCapsules")),
-                    moments = parseMoments(root.getJSONArray("moments"), context),
-                    momentNotes = parseMomentNotes(root.optJSONArray("momentNotes")),
-                    milestones = parseMilestones(root.optJSONArray("milestones")),
-                    listCategories = parseListCategories(root.optJSONArray("listCategories")),
+                    sessions = parseSessions(rawSessionsArr, root.optLong("createdAt", System.currentTimeMillis())),
+                    dateIdeas = parseDateIdeas(rawDateIdeasArr),
+                    timeCapsules = parseTimeCapsules(rawTimeCapsulesArr),
+                    moments = parseMoments(rawMomentsArr, context),
+                    momentNotes = parseMomentNotes(rawMomentNotesArr),
+                    milestones = parseMilestones(rawMilestonesArr),
+                    listCategories = parseListCategories(rawListCategoriesArr),
                     pairingJson = root.getJSONObject("pairing"),
                     settingsJson = root.getJSONObject("settings"),
                     badgeUnlocks = root.getJSONObject("badgeUnlocks").let { obj ->
@@ -853,14 +860,21 @@ object BackupManager {
             // scenario backup/restore exists for) starts with none scheduled at all.
             MilestoneAlarmScheduler.scheduleAll(context, parsed.milestones.filter { !it.deleted })
 
-            val droppedSessionCount = rawSessionCount - parsed.sessions.size
+            val droppedCount =
+                (rawSessionsArr.length() - parsed.sessions.size) +
+                (rawDateIdeasArr.length() - parsed.dateIdeas.size) +
+                (rawTimeCapsulesArr.length() - parsed.timeCapsules.size) +
+                (rawMomentsArr.length() - parsed.moments.size) +
+                ((rawMomentNotesArr?.length() ?: 0) - parsed.momentNotes.size) +
+                ((rawMilestonesArr?.length() ?: 0) - parsed.milestones.size) +
+                ((rawListCategoriesArr?.length() ?: 0) - parsed.listCategories.size)
             BackupResult(
                 true, zipUri,
                 "Restored ${parsed.sessions.size} session(s), ${parsed.moments.size} photo(s), " +
                     "${parsed.dateIdeas.size} date idea(s), ${parsed.timeCapsules.size} capsule(s), " +
                     "${parsed.milestones.size} milestone(s)." +
-                    if (droppedSessionCount > 0) {
-                        " ($droppedSessionCount session(s) skipped as implausible - check this phone's clock is correct.)"
+                    if (droppedCount > 0) {
+                        " ($droppedCount item(s) skipped as implausible - check this phone's clock is correct.)"
                     } else {
                         ""
                     }
@@ -924,7 +938,7 @@ object BackupManager {
         } else {
             o.getLong("endedAt")
         }
-        val updatedAt = clampBackupUpdatedAt(o.optLong("updatedAt", 0L))
+        val updatedAt = o.optLong("updatedAt", 0L)
         // BLOCKER fix (ultimate-app-review, post-restart full-scope round, Opus): this parser performed
         // NO bounds validation at all - unlike GattSyncManager's wire path, ANY startedAt/endedAt from a
         // backup zip merged in verbatim. Live-verified: a crafted backup with `startedAt = Long.MIN_VALUE`
@@ -949,9 +963,9 @@ object BackupManager {
                 startedAt, endedAt, maxOf(System.currentTimeMillis(), backupCreatedAt),
                 com.ssbmedia.twogether.ble.GattSyncManager.MAX_CLOCK_SKEW_TOLERANCE_MILLIS,
                 com.ssbmedia.twogether.ble.GattSyncManager.MAX_PLAUSIBLE_SESSION_DURATION_MILLIS
-            )
+            ) || !isPlausibleBackupUpdatedAt(updatedAt)
         ) {
-            Log.w(TAG, "Rejecting implausible session from backup: startedAt=$startedAt endedAt=$endedAt")
+            Log.w(TAG, "Rejecting implausible session from backup: startedAt=$startedAt endedAt=$endedAt updatedAt=$updatedAt")
             return@mapNotNull null
         }
         TogetherSession(
@@ -968,27 +982,44 @@ object BackupManager {
         )
     }
 
-    private fun parseDateIdeas(arr: JSONArray): List<DateIdea> = (0 until arr.length()).map { i ->
+    private fun parseDateIdeas(arr: JSONArray): List<DateIdea> = (0 until arr.length()).mapNotNull { i ->
         val o = arr.getJSONObject(i)
+        val id = o.getString("id")
+        val updatedAt = o.getLong("updatedAt")
+        if (!isPlausibleBackupUpdatedAt(updatedAt)) {
+            Log.w(TAG, "Rejecting implausible date idea from backup: $id updatedAt=$updatedAt")
+            return@mapNotNull null
+        }
         DateIdea(
-            id = o.getString("id"),
+            id = id,
             text = o.getString("text"),
             // A pre-"Our Lists" backup has no listId key at all (it had category instead, now dropped) -
             // default to the default list, same defensive-fallback reasoning as GattSyncManager's own
             // deserializeDateIdeas optString default.
             listId = o.optStringOrNull("listId") ?: DEFAULT_LIST_ID,
             done = o.optBoolean("done", false),
-            updatedAt = clampBackupUpdatedAt(o.getLong("updatedAt")),
+            updatedAt = updatedAt,
             deleted = o.optBoolean("deleted", false)
         )
     }
 
-    /** BLOCKER fix (mirrors GattSyncManager.clampWireUpdatedAt's doc): a backup zip's manifest.json is
-     * just as untrusted as a live BLE peer's payload - a crafted or corrupted backup with a far-future
+    /** BLOCKER fix (mirrors GattSyncManager.isPlausibleWireUpdatedAt's doc): a backup zip's manifest.json
+     * is just as untrusted as a live BLE peer's payload - a crafted or corrupted backup with a far-future
      * `updatedAt` would otherwise let a restored row permanently win every future LWW merge against this
-     * couple's real edits. Same clamp, same tolerance window. */
-    private fun clampBackupUpdatedAt(wireUpdatedAt: Long): Long =
-        wireUpdatedAt.coerceAtMost(System.currentTimeMillis() + 5 * 60_000L)
+     * couple's real edits.
+     *
+     * MAJOR fix (deferred-minors, fixed per explicit user request): this used to CLAMP the value to
+     * `now + tolerance` and accept it rather than reject it outright - the exact "clamp-and-accept"
+     * design this whole review already found and fixed on the BLE sync path (GattSyncManager's own
+     * round-3 fix doc has the full story): because a full table is restored wholesale, clamping to a
+     * ceiling based on THIS restore's own "now" means a still-poisoned row from a REPEATED restore of
+     * the same bad backup would just get re-clamped to a fresh, later ceiling each time - the same
+     * self-heal failure mode already fixed on the wire path, now closed here too by rejecting outright
+     * instead. Restore being one-time-per-attempt (not a resync loop) made this genuinely lower-risk
+     * than the wire path, which is why it was deferred rather than blocking a release - not why it was
+     * correct to leave as clamp-and-accept. */
+    private fun isPlausibleBackupUpdatedAt(wireUpdatedAt: Long): Boolean =
+        wireUpdatedAt <= System.currentTimeMillis() + 5 * 60_000L
 
     /**
      * BUG fix: manualHoursAtCreation used to be omitted entirely from the manifest, so every restored
@@ -1019,6 +1050,11 @@ object BackupManager {
             return@mapNotNull null
         }
         val createdAt = o.getLong("createdAt")
+        val updatedAt = o.optLong("updatedAt", createdAt)
+        if (!isPlausibleBackupUpdatedAt(updatedAt)) {
+            Log.w(TAG, "Rejecting implausible time capsule from backup: updatedAt=$updatedAt")
+            return@mapNotNull null
+        }
         TimeCapsule(
             id = o.getLong("id"),
             text = o.getString("text"),
@@ -1027,7 +1063,7 @@ object BackupManager {
             unlockedAt = if (o.isNull("unlockedAt")) null else o.getLong("unlockedAt"),
             manualHoursAtCreation = o.optDouble("manualHoursAtCreation", 0.0).toFloat(),
             syncId = o.optStringOrNull("syncId")?.takeIf { it.isNotBlank() } ?: java.util.UUID.randomUUID().toString(),
-            updatedAt = clampBackupUpdatedAt(o.optLong("updatedAt", createdAt)),
+            updatedAt = updatedAt,
             deleted = o.optBoolean("deleted", false)
         )
     }
@@ -1049,11 +1085,19 @@ object BackupManager {
      * photoUri itself fully ignored. That's now fixed centrally inside localPhotoFile() itself (see its
      * own doc), which also covers mergeRemoteStubs' identical wire-data syncId for the BLE sync path.
      */
-    private fun parseMoments(arr: JSONArray, context: Context): List<MomentWithZipHint> = (0 until arr.length()).map { i ->
+    private fun parseMoments(arr: JSONArray, context: Context): List<MomentWithZipHint> = (0 until arr.length()).mapNotNull { i ->
         val o = arr.getJSONObject(i)
         val syncId = o.optStringOrNull("syncId")?.takeIf { it.isNotBlank() } ?: java.util.UUID.randomUUID().toString()
         val isRemote = o.optBoolean("isRemote", false)
         val rawPhotoUriHint = o.getString("photoUri")
+        // MINOR fix (deferred-minors, fixed per explicit user request): this was the one backup parser
+        // with NO updatedAt validation at all (every other entity already clamped or rejected) - a
+        // far-future value here would let a restored moment permanently win every future LWW merge.
+        val updatedAt = o.optLong("updatedAt", 0L)
+        if (!isPlausibleBackupUpdatedAt(updatedAt)) {
+            Log.w(TAG, "Rejecting implausible moment from backup: $syncId updatedAt=$updatedAt")
+            return@mapNotNull null
+        }
         val moment = Moment(
             id = o.getLong("id"),
             photoUri = MomentRepository.localPhotoFile(context, syncId, MomentRepository.extensionFromHint(rawPhotoUriHint)).absolutePath,
@@ -1067,7 +1111,7 @@ object BackupManager {
             // A pre-tombstone-sync backup has no updatedAt/deleted keys - default to "never tombstoned",
             // same defensive optLong/optBoolean pattern as syncId's/photoDownloaded's backward-compat
             // handling above.
-            updatedAt = o.optLong("updatedAt", 0L),
+            updatedAt = updatedAt,
             deleted = o.optBoolean("deleted", false)
         )
         MomentWithZipHint(moment, o.optStringOrNull("photoZipEntry"))
@@ -1075,13 +1119,19 @@ object BackupManager {
 
     private fun parseMomentNotes(arr: JSONArray?): List<MomentNote> {
         if (arr == null) return emptyList()
-        return (0 until arr.length()).map { i ->
+        return (0 until arr.length()).mapNotNull { i ->
             val o = arr.getJSONObject(i)
+            val momentSyncId = o.getString("momentSyncId")
+            val updatedAt = o.getLong("updatedAt")
+            if (!isPlausibleBackupUpdatedAt(updatedAt)) {
+                Log.w(TAG, "Rejecting implausible moment note from backup: $momentSyncId updatedAt=$updatedAt")
+                return@mapNotNull null
+            }
             MomentNote(
-                momentSyncId = o.getString("momentSyncId"),
+                momentSyncId = momentSyncId,
                 authorDeviceId = o.getString("authorDeviceId"),
                 text = o.optString("text", ""),
-                updatedAt = clampBackupUpdatedAt(o.getLong("updatedAt")),
+                updatedAt = updatedAt,
                 deleted = o.optBoolean("deleted", false)
             )
         }
@@ -1089,10 +1139,16 @@ object BackupManager {
 
     private fun parseMilestones(arr: JSONArray?): List<Milestone> {
         if (arr == null) return emptyList()
-        return (0 until arr.length()).map { i ->
+        return (0 until arr.length()).mapNotNull { i ->
             val o = arr.getJSONObject(i)
+            val id = o.getString("id")
+            val updatedAt = o.getLong("updatedAt")
+            if (!isPlausibleBackupUpdatedAt(updatedAt)) {
+                Log.w(TAG, "Rejecting implausible milestone from backup: $id updatedAt=$updatedAt")
+                return@mapNotNull null
+            }
             Milestone(
-                id = o.getString("id"),
+                id = id,
                 label = o.getString("label"),
                 // BLOCKER fix: month/day here are UNTRUSTED data from the backup zip's manifest.json,
                 // same trust boundary as photoUri/syncId above. An independent testing round found that
@@ -1108,7 +1164,7 @@ object BackupManager {
                 day = o.getInt("day").coerceIn(1, 31),
                 year = if (o.isNull("year")) null else o.optInt("year"),
                 createdAt = o.getLong("createdAt"),
-                updatedAt = clampBackupUpdatedAt(o.getLong("updatedAt")),
+                updatedAt = updatedAt,
                 deleted = o.optBoolean("deleted", false)
             )
         }
@@ -1116,13 +1172,19 @@ object BackupManager {
 
     private fun parseListCategories(arr: JSONArray?): List<ListCategory> {
         if (arr == null) return emptyList()
-        return (0 until arr.length()).map { i ->
+        return (0 until arr.length()).mapNotNull { i ->
             val o = arr.getJSONObject(i)
+            val id = o.getString("id")
+            val updatedAt = o.getLong("updatedAt")
+            if (!isPlausibleBackupUpdatedAt(updatedAt)) {
+                Log.w(TAG, "Rejecting implausible list category from backup: $id updatedAt=$updatedAt")
+                return@mapNotNull null
+            }
             ListCategory(
-                id = o.getString("id"),
+                id = id,
                 name = o.getString("name"),
                 createdAt = o.getLong("createdAt"),
-                updatedAt = clampBackupUpdatedAt(o.getLong("updatedAt")),
+                updatedAt = updatedAt,
                 deleted = o.optBoolean("deleted", false)
             )
         }
