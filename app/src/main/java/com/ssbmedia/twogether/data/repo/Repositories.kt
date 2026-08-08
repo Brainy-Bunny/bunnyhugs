@@ -178,6 +178,21 @@ class DateIdeaRepository(private val dao: DateIdeaDao) {
 }
 
 class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
+    companion object {
+        /** MAJOR fix (ultimate-app-review round 3, both Opus and Sonnet independently live-reproduced):
+         * this formula used to be duplicated verbatim - once here (fixed in round 2, commit `16b1468`)
+         * and once, unclamped, in CapsulesScreen's own display code. The two agreed before round 2's fix
+         * and silently diverged after it, since the fix only touched one copy - CapsulesScreen kept
+         * showing a nonsensical/alarming negative "hours to go" (or even a still-Locked capsule reading
+         * "0 to go") for a forged `manualHoursAtCreation`, and a real honest-use case (deleting a manual
+         * backfill entry after creating a capsule) rendered "Lowered by 20h..." text describing behavior
+         * that no longer exists post-clamp. Extracted to ONE shared function both [unlockEligible] and
+         * CapsulesScreen now call, so they structurally cannot re-diverge - see [unlockEligible]'s own doc
+         * for the full anti-cheat derivation and why the `maxOf(0f, ...)` clamp is there. */
+        fun effectiveThreshold(capsule: TimeCapsule, currentManualHoursCredit: Float): Float =
+            capsule.unlockAtHours + maxOf(0f, currentManualHoursCredit - capsule.manualHoursAtCreation)
+    }
+
     fun observeAll(): Flow<List<TimeCapsule>> = dao.observeActive()
 
     /** Raw/unfiltered - includes soft-deleted (tombstoned) rows. Used by BackupManager and by
@@ -250,8 +265,7 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
         val locked = dao.getLocked()
         val now = System.currentTimeMillis()
         locked.forEach { capsule ->
-            val effectiveThreshold = capsule.unlockAtHours + maxOf(0f, currentManualHoursCredit - capsule.manualHoursAtCreation)
-            if (effectiveThreshold <= totalHours) {
+            if (effectiveThreshold(capsule, currentManualHoursCredit) <= totalHours) {
                 // updatedAt bumped too (Feature: Time Capsule sync) - otherwise a local-only unlock would
                 // never itself be a reason to re-send this capsule's row, though in practice the initial
                 // add() sync (or any later local edit) already covers propagating the definition; bumping

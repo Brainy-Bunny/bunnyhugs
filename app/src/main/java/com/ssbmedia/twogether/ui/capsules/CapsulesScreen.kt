@@ -43,6 +43,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.data.datastore.ProximityPersistedState
 import com.ssbmedia.twogether.data.db.TimeCapsule
+import com.ssbmedia.twogether.data.repo.TimeCapsuleRepository
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.EmptyState
@@ -179,11 +180,14 @@ fun CapsulesScreen(onBack: () -> Unit) {
                                 Text("💌 Unlocked", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
                                 Text(capsule.text, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.padding(top = 4.dp))
                             } else {
-                                // Auto-adjusted threshold - see TimeCapsuleRepository.unlockEligible's doc.
-                                // Grows/shrinks by exactly however much manual-hours credit has changed
-                                // since this capsule was created, so it always takes the same amount of
-                                // genuine together-time to unlock regardless of backfill activity.
-                                val effectiveThreshold = capsule.unlockAtHours + (manualCredit - capsule.manualHoursAtCreation)
+                                // MAJOR fix (ultimate-app-review round 3, both Opus and Sonnet independently
+                                // live-reproduced): this used to recompute the anti-cheat formula inline,
+                                // unclamped - see TimeCapsuleRepository.effectiveThreshold's own doc for why
+                                // that let a forged manualHoursAtCreation render an alarming/nonsensical
+                                // negative "hours to go" here even though the real backend gate correctly
+                                // kept the capsule locked. Now calls the one shared, clamped implementation,
+                                // so this display can never disagree with the actual unlock decision again.
+                                val effectiveThreshold = TimeCapsuleRepository.effectiveThreshold(capsule, manualCredit)
                                 val remaining = (effectiveThreshold - stats.totalHoursAllTime.toFloat()).coerceAtLeast(0f)
                                 val delta = effectiveThreshold - capsule.unlockAtHours
                                 Text("🔒 Locked", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
@@ -192,16 +196,13 @@ fun CapsulesScreen(onBack: () -> Unit) {
                                     style = MaterialTheme.typography.bodyMedium,
                                     modifier = Modifier.padding(top = 4.dp)
                                 )
+                                // The "lowered by" case is now structurally unreachable - effectiveThreshold
+                                // can never fall below capsule.unlockAtHours (delta is clamped at >= 0 by
+                                // TimeCapsuleRepository.effectiveThreshold), so only the "extra time" case
+                                // remains possible.
                                 if (delta > 0.01f) {
                                     Text(
                                         "Includes an extra ${delta.trimZeros()}h from backfilled time, so it can't be unlocked early.",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.padding(top = 2.dp)
-                                    )
-                                } else if (delta < -0.01f) {
-                                    Text(
-                                        "Lowered by ${(-delta).trimZeros()}h since some backfilled time was removed.",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         modifier = Modifier.padding(top = 2.dp)

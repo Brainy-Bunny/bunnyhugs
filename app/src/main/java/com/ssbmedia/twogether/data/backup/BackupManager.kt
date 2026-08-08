@@ -963,8 +963,14 @@ object BackupManager {
         // protection against the Long.MIN_VALUE-class overflow attack (still caught by the lower bound
         // and duration ceiling regardless of this value) while no longer punishing an honestly-slow
         // restoring clock for a backup that's already in the past relative to real time.
+        //
+        // MAJOR fix (ultimate-app-review round 3, Opus live-reproduced): this used to be its own bare
+        // `maxOf(System.currentTimeMillis(), backupCreatedAt)`, independent of and un-capped by
+        // isPlausibleBackupUpdatedAt's later cap on the very same backupCreatedAt - see
+        // trustedBackupCeiling's own doc for the live repro this caused. Now calls that same shared,
+        // capped ceiling.
         if (!com.ssbmedia.twogether.util.SessionBoundsValidator.isPlausible(
-                startedAt, endedAt, maxOf(System.currentTimeMillis(), backupCreatedAt),
+                startedAt, endedAt, trustedBackupCeiling(backupCreatedAt),
                 com.ssbmedia.twogether.ble.GattSyncManager.MAX_CLOCK_SKEW_TOLERANCE_MILLIS,
                 com.ssbmedia.twogether.ble.GattSyncManager.MAX_PLAUSIBLE_SESSION_DURATION_MILLIS
             ) || !isPlausibleBackupUpdatedAt(updatedAt, backupCreatedAt)
@@ -1056,17 +1062,41 @@ object BackupManager {
      * time, is never more than a normal clock-skew window away from real "now," nowhere near this cap),
      * while bounding exactly how far a crafted backup's own claimed creation time can drag the ceiling
      * into the future - closing the unbounded-slide exploit outright instead of picking a tighter number
-     * that would just move the same class of bug to a different magnitude. */
+     * that would just move the same class of bug to a different magnitude.
+     *
+     * KNOWN, ACCEPTED RESIDUAL (round 3, Opus): check (1)'s 5-minute tolerance assumes a device's clock
+     * only ever moves forward. After an honest backward correction (RTC drift fixed by NTP, or a user
+     * fixing a manually-set-wrong clock) of more than 5 minutes, a row written before the correction can
+     * have `updatedAt` slightly ahead of a freshly-computed `backupCreatedAt` and get rejected on THAT
+     * device's own next backup/restore cycle. This self-heals (real time catches up) and is far narrower
+     * than the bug this whole fix closes, so it's accepted rather than widening the tolerance - a backup
+     * file has no cryptographic signature, so any bound here is inherently a trust judgment call, not a
+     * fully closeable gap; recording the trade-off explicitly rather than treating it as fully solved. */
     private fun isPlausibleBackupUpdatedAt(wireUpdatedAt: Long, backupCreatedAt: Long): Boolean {
         if (wireUpdatedAt > backupCreatedAt + 5 * 60_000L) return false
-        val cappedBackupCreatedAt = minOf(backupCreatedAt, System.currentTimeMillis() + MAX_BACKUP_CREATED_AT_FUTURE_SKEW_MILLIS)
-        return wireUpdatedAt <= maxOf(System.currentTimeMillis(), cappedBackupCreatedAt) + 5 * 60_000L
+        return wireUpdatedAt <= trustedBackupCeiling(backupCreatedAt) + 5 * 60_000L
     }
 
-    /** How far a backup's own claimed `createdAt` may be trusted to push [isPlausibleBackupUpdatedAt]'s
-     * ceiling beyond this device's real clock - generous enough to never punish a genuinely long-idle
-     * restoring device, while bounding a crafted backup's ability to neutralize the reject-gate by simply
-     * claiming a far-future creation time (see that function's own doc). */
+    /** MAJOR fix (ultimate-app-review round 3, Opus live-reproduced): the cap this function applies used
+     * to live only inside [isPlausibleBackupUpdatedAt] - parseSessions had its OWN separate, uncapped
+     * `maxOf(System.currentTimeMillis(), backupCreatedAt)` floor a few lines above its own call to that
+     * function, and never got the same fix. Live-reproduced: a backup claiming `createdAt` = year 2035
+     * with sessions dated across 2034-2035 restored with ZERO rejections, crediting ~5760 hours and
+     * instantly unlocking every capsule - the exact self-defeating-floor exploit this whole fix exists to
+     * close, just reachable through the one copy of the floor that didn't get capped. Extracted to ONE
+     * shared function every "trust a backup-claimed creation time as a floor" call site must now use, so
+     * the two can never independently drift out of sync again the way they just did. See
+     * [isPlausibleBackupUpdatedAt]'s own doc for the full two-check rationale (internal consistency +
+     * this cap) this function's caller-side half implements. */
+    private fun trustedBackupCeiling(backupCreatedAt: Long): Long {
+        val cappedBackupCreatedAt = minOf(backupCreatedAt, System.currentTimeMillis() + MAX_BACKUP_CREATED_AT_FUTURE_SKEW_MILLIS)
+        return maxOf(System.currentTimeMillis(), cappedBackupCreatedAt)
+    }
+
+    /** How far a backup's own claimed `createdAt` may be trusted to push [trustedBackupCeiling]'s result
+     * beyond this device's real clock - generous enough to never punish a genuinely long-idle restoring
+     * device, while bounding a crafted backup's ability to neutralize any reject-gate that trusts this
+     * ceiling by simply claiming a far-future creation time. */
     private const val MAX_BACKUP_CREATED_AT_FUTURE_SKEW_MILLIS = 730L * 24 * 60 * 60 * 1000
 
     /**

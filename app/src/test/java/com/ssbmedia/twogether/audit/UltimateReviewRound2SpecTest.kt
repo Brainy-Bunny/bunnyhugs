@@ -239,9 +239,11 @@ class UltimateReviewRound2SpecTest {
     // ---- unlockEligible structural clamp (Opus live-reproduced round 2's own manualHoursAtCreation bound as insufficient) ----
 
     private fun unlockEligibleThresholdHolds(unlockAtHours: Float, manualHoursAtCreation: Float, currentManualHoursCredit: Float, totalHours: Float): Boolean {
-        // Mirrors TimeCapsuleRepository.unlockEligible's own effectiveThreshold formula via reflection on
-        // the private method, so this test breaks (loudly) if the two ever drift apart instead of quietly
-        // testing a stale copy of the formula.
+        // MINOR fix (ultimate-app-review round 3, Opus): this comment previously claimed reflection on a
+        // private method - inaccurate. unlockEligible is public; this exercises the real function directly
+        // through a hand-written fake DAO (same pattern as TimeCapsuleSyncAuditTest's FakeTimeCapsuleDao),
+        // which is actually the stronger approach since it runs the real end-to-end unlock decision, not
+        // just the formula in isolation.
         val dao = object : TimeCapsuleDao {
             var row = com.ssbmedia.twogether.data.db.TimeCapsule(
                 id = 1L, text = "t", unlockAtHours = unlockAtHours, createdAt = 0L,
@@ -287,5 +289,58 @@ class UltimateReviewRound2SpecTest {
             "totalHours just short of unlockAtHours must still be locked, even though manual credit shrank since creation",
             !unlockEligibleThresholdHolds(unlockAtHours = 100f, manualHoursAtCreation = 50f, currentManualHoursCredit = 0f, totalHours = 99f)
         )
+    }
+
+    // ---- Round 3 (both Opus and Sonnet independently live-reproduced these gaps in round 2's fixes) ----
+
+    @Test
+    fun `TimeCapsuleRepository effectiveThreshold - the ONE shared formula both unlockEligible and CapsulesScreen call - never falls below unlockAtHours`() {
+        // MAJOR fix (round 3, both models): CapsulesScreen used to carry its own unclamped copy of this
+        // exact formula, silently diverging from unlockEligible's clamped one the moment round 2 fixed
+        // only the latter. Testing the single shared function directly - now the only implementation
+        // either call site can possibly use - so the two can never independently drift apart again.
+        val capsule = com.ssbmedia.twogether.data.db.TimeCapsule(
+            id = 1L, text = "t", unlockAtHours = 5000f, createdAt = 0L,
+            manualHoursAtCreation = 100_000f, syncId = "s", updatedAt = 0L
+        )
+        for (currentManualHoursCredit in listOf(0f, 1f, 100f, 4999f)) {
+            assertTrue(
+                "effectiveThreshold must never fall below unlockAtHours for currentManualHoursCredit=$currentManualHoursCredit",
+                TimeCapsuleRepository.effectiveThreshold(capsule, currentManualHoursCredit) >= capsule.unlockAtHours
+            )
+        }
+    }
+
+    @Test
+    fun `TimeCapsuleRepository effectiveThreshold - the normal backfill-grows-credit case is unaffected by the clamp`() {
+        val capsule = com.ssbmedia.twogether.data.db.TimeCapsule(
+            id = 1L, text = "t", unlockAtHours = 100f, createdAt = 0L,
+            manualHoursAtCreation = 10f, syncId = "s", updatedAt = 0L
+        )
+        // currentManualHoursCredit (30) > manualHoursAtCreation (10) - the clamp is a no-op here, and the
+        // threshold should rise by exactly the delta (20), matching the documented anti-cheat derivation.
+        assertEquals(120f, TimeCapsuleRepository.effectiveThreshold(capsule, 30f))
+    }
+
+    // ---- MAJOR-1 (Opus): parseSessions had its own SEPARATE, uncapped backupCreatedAt floor ----
+
+    private fun parseSessionsRaw(json: String, backupCreatedAt: Long): List<*> {
+        val method = BackupManager.javaClass.getDeclaredMethod(
+            "parseSessions", JSONArray::class.java, Long::class.javaPrimitiveType
+        )
+        method.isAccessible = true
+        return method.invoke(BackupManager, JSONArray(json), backupCreatedAt) as List<*>
+    }
+
+    @Test
+    fun `MAJOR-1 - parseSessions rejects a session dated years out even when backupCreatedAt claims the same far future`() {
+        // Opus's exact round-3 live repro: a backup claiming createdAt = year 2035, with every session
+        // dated 2034-2035 to stay internally consistent, restored with ZERO rejections before this fix -
+        // parseSessions' own SessionBoundsValidator call used a bare, uncapped `maxOf(now, backupCreatedAt)`
+        // that never got round 2's cap, unlike isPlausibleBackupUpdatedAt right next to it.
+        val forgedFarFuture = System.currentTimeMillis() + 5L * 365 * 24 * 60 * 60 * 1000 // ~5 years out
+        val json = """[{"id":1,"startedAt":$forgedFarFuture,"endedAt":${forgedFarFuture + 3_600_000L},"isManual":false,"syncId":"s1","updatedAt":$forgedFarFuture,"deleted":false}]"""
+        val result = parseSessionsRaw(json, forgedFarFuture)
+        assertTrue("a session dated years past any plausible clock skew must be rejected, not silently credited", result.isEmpty())
     }
 }
