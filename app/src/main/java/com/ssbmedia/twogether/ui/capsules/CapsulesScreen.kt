@@ -235,7 +235,11 @@ fun CapsulesScreen(onBack: () -> Unit) {
 // Above this, an unlock threshold stops being a remotely plausible amount of together-time to enter
 // by hand - purely a guardrail against a typo (e.g. an extra digit) silently creating a capsule that
 // could never realistically unlock, not a real usage limit.
-private const val MAX_CAPSULE_UNLOCK_HOURS = 5000f
+//
+// MINOR fix (Opus+Sonnet+Fable all independently proposed this): now sourced from
+// TimeCapsuleRepository.MAX_UNLOCK_AT_HOURS, the one shared constant also used by the untrusted wire/
+// backup ingestion paths - was a separate local 5000f literal here, free to drift from the other two.
+private val MAX_CAPSULE_UNLOCK_HOURS = TimeCapsuleRepository.MAX_UNLOCK_AT_HOURS
 
 @Composable
 private fun AddCapsuleDialog(onDismiss: () -> Unit, onAdd: (String, Float) -> Unit) {

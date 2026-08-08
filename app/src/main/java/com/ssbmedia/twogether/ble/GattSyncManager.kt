@@ -549,9 +549,14 @@ class GattSyncManager(
         }
     }
 
-    /** Feature: Time Capsule sync. `unlockedAt` is included on the wire purely for forward-compat/
-     * debuggability - see TimeCapsuleRepository.mergeRemote's doc for why it's deliberately never
-     * trusted on the receiving end regardless of what's sent here. */
+    /** MINOR fix (Opus+Sonnet+Fable all independently proposed this): `unlockedAt` used to be included
+     * on the wire "for forward-compat/debuggability" even though TimeCapsuleRepository.mergeRemote and
+     * deserializeTimeCapsules already both refused to ever read it back - the top invariant held by
+     * convention (every reader happened to ignore the field), not by construction. Omitting it here
+     * removes the field from this device's own payload entirely, so there is nothing left for a future
+     * reader to accidentally trust - the invariant is now structurally unbreakable rather than
+     * convention-enforced. Both devices still converge on the same real unlock moment regardless, since
+     * totalHours is derived from the SAME (already-synced) session data on both sides - nothing is lost. */
     private fun serializeTimeCapsules(capsules: List<com.ssbmedia.twogether.data.db.TimeCapsule>): JSONArray {
         val arr = JSONArray()
         for (c in capsules) {
@@ -560,7 +565,6 @@ class GattSyncManager(
                 put("text", c.text)
                 put("unlockAtHours", c.unlockAtHours.toDouble())
                 put("createdAt", c.createdAt)
-                put("unlockedAt", c.unlockedAt ?: JSONObject.NULL)
                 put("manualHoursAtCreation", c.manualHoursAtCreation.toDouble())
                 put("updatedAt", c.updatedAt)
                 put("deleted", c.deleted)
@@ -587,7 +591,7 @@ class GattSyncManager(
             // creation, re-applied here since this value arrives from a peer, not this device's own
             // validated UI input.
             val unlockAtHours = o.getDouble("unlockAtHours").toFloat()
-            if (!unlockAtHours.isFinite() || unlockAtHours <= 0f || unlockAtHours > 5000f) {
+            if (!unlockAtHours.isFinite() || unlockAtHours <= 0f || unlockAtHours > com.ssbmedia.twogether.data.repo.TimeCapsuleRepository.MAX_UNLOCK_AT_HOURS) {
                 Log.w(TAG, "Dropping remote timeCapsule $syncId with implausible unlockAtHours=$unlockAtHours")
                 return@mapNotNull null
             }
@@ -606,7 +610,7 @@ class GattSyncManager(
             // plausible real "manual hours credit" - the largest value either reviewer's live exploit used
             // was ~1e6/1e9/1e39, all comfortably rejected here).
             val manualHoursAtCreation = o.optDouble("manualHoursAtCreation", 0.0).toFloat()
-            if (!manualHoursAtCreation.isFinite() || manualHoursAtCreation < 0f || manualHoursAtCreation > 100_000f) {
+            if (!manualHoursAtCreation.isFinite() || manualHoursAtCreation < 0f || manualHoursAtCreation > com.ssbmedia.twogether.data.repo.TimeCapsuleRepository.MAX_MANUAL_HOURS_AT_CREATION) {
                 Log.w(TAG, "Dropping remote timeCapsule $syncId with implausible manualHoursAtCreation=$manualHoursAtCreation")
                 return@mapNotNull null
             }

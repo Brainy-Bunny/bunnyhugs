@@ -179,6 +179,21 @@ class DateIdeaRepository(private val dao: DateIdeaDao) {
 
 class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
     companion object {
+        /** MINOR fix (ultimate-app-review round 2/Step 4, Opus+Sonnet+Fable all independently proposed
+         * this): the "typo guardrail" bound on a capsule's unlock-hours threshold used to be a bare
+         * `5000f` literal duplicated in three places (here as CapsulesScreen's own local
+         * `MAX_CAPSULE_UNLOCK_HOURS`, plus GattSyncManager.deserializeTimeCapsules and
+         * BackupManager.parseTimeCapsules) - free to silently drift apart. One shared constant, in the
+         * data layer so both the UI and the untrusted-ingestion paths can reference it without a
+         * UI-to-data-layer dependency running backward. */
+        const val MAX_UNLOCK_AT_HOURS = 5000f
+
+        /** MINOR fix, same round: the bound on the wire/backup-untrusted `manualHoursAtCreation` field
+         * (see [effectiveThreshold]'s doc for why this field matters) was duplicated identically in
+         * GattSyncManager.deserializeTimeCapsules and BackupManager.parseTimeCapsules. One shared
+         * constant, same reasoning as [MAX_UNLOCK_AT_HOURS] above. */
+        const val MAX_MANUAL_HOURS_AT_CREATION = 100_000f
+
         /** MAJOR fix (ultimate-app-review round 3, both Opus and Sonnet independently live-reproduced):
          * this formula used to be duplicated verbatim - once here (fixed in round 2, commit `16b1468`)
          * and once, unclamped, in CapsulesScreen's own display code. The two agreed before round 2's fix

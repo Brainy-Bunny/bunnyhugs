@@ -23,6 +23,7 @@ import com.ssbmedia.twogether.data.db.MomentNote
 import com.ssbmedia.twogether.data.db.TimeCapsule
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.data.repo.MomentRepository
+import com.ssbmedia.twogether.data.repo.TimeCapsuleRepository
 import com.ssbmedia.twogether.notif.MilestoneAlarmScheduler
 import com.ssbmedia.twogether.notif.Notifications
 import kotlinx.coroutines.CancellationException
@@ -1127,7 +1128,7 @@ object BackupManager {
         // previously indistinguishable when multiple capsules were rejected from the same restore).
         val syncIdForLogging = o.optStringOrNull("syncId")?.takeIf { it.isNotBlank() } ?: "(no syncId)"
         val unlockAtHours = o.getDouble("unlockAtHours").toFloat()
-        if (!unlockAtHours.isFinite() || unlockAtHours <= 0f || unlockAtHours > 5000f) {
+        if (!unlockAtHours.isFinite() || unlockAtHours <= 0f || unlockAtHours > TimeCapsuleRepository.MAX_UNLOCK_AT_HOURS) {
             Log.w(TAG, "Rejecting implausible time capsule from backup: $syncIdForLogging unlockAtHours=$unlockAtHours")
             return@mapNotNull null
         }
@@ -1144,7 +1145,7 @@ object BackupManager {
         // instant false unlock purely from a crafted backup file, or (a non-finite value) persists a row
         // that then makes every future serializeTimeCapsules() call throw and crash-loop the sync path.
         val manualHoursAtCreation = o.optDouble("manualHoursAtCreation", 0.0).toFloat()
-        if (!manualHoursAtCreation.isFinite() || manualHoursAtCreation < 0f || manualHoursAtCreation > 100_000f) {
+        if (!manualHoursAtCreation.isFinite() || manualHoursAtCreation < 0f || manualHoursAtCreation > TimeCapsuleRepository.MAX_MANUAL_HOURS_AT_CREATION) {
             Log.w(TAG, "Rejecting implausible time capsule from backup: $syncIdForLogging manualHoursAtCreation=$manualHoursAtCreation")
             return@mapNotNull null
         }
