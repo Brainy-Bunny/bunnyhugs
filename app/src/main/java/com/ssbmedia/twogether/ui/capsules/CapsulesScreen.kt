@@ -221,7 +221,24 @@ fun CapsulesScreen(onBack: () -> Unit) {
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
             title = { Text("Delete this time capsule?") },
-            text = { Text(if (capsule.unlockedAt != null) "This will remove it for both of you once you next sync." else "It'll be gone before it ever unlocks.") },
+            text = {
+                // MINOR fix (ultimate-app-review, deferred-minors D2, fixed per explicit user request):
+                // matches the house delete-confirm pattern every other screen uses (quote the item, state
+                // it propagates on next sync) - this previously omitted the sync-propagation warning for
+                // the still-locked case, and never quoted the item at all. The locked case deliberately
+                // does NOT quote capsule.text, unlike every other screen's pattern: a still-locked capsule
+                // can belong to your partner and hasn't unlocked for you either (its card shows no text at
+                // all, by design), so echoing the real text back here would leak a secret this dialog has
+                // no business revealing early. The unlocked case is safe to quote since that text is
+                // already visible on the card itself.
+                Text(
+                    if (capsule.unlockedAt != null) {
+                        "\"${capsule.text}\" will be removed for both of you once you next sync."
+                    } else {
+                        "This sealed note will be removed for both of you once you next sync — it'll be gone before it ever unlocks."
+                    }
+                )
+            },
             confirmButton = { TextButton(onClick = { vm.delete(capsule); pendingDelete = null }) { Text("Delete") } },
             dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Cancel") } }
         )
