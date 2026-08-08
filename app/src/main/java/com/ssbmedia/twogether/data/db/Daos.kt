@@ -80,6 +80,20 @@ interface TimeCapsuleDao {
     @Query("SELECT * FROM time_capsules WHERE unlockedAt IS NULL AND deleted = 0")
     suspend fun getLocked(): List<TimeCapsule>
 
+    /** MINOR fix (test-code-allmodels, Fable): TimeCapsuleRepository.unlockEligible used to read a
+     * capsule via [getLocked], then write it back with a plain [update] - a stale-read full-row
+     * overwrite with no transaction. If a tombstone (local delete, or a sync merge's tombstone-apply)
+     * landed on that exact row between the read and the write, the [update] would carry the STALE
+     * `deleted = false` forward, silently resurrecting a just-deleted capsule as unlocked - the
+     * race-window variant of the exact resurrection bug class this app's whole review history has
+     * already fixed logically (see TimeCapsuleRepository.mergeRemote's own doc). This targeted query
+     * re-checks `deleted = 0` as part of the same atomic SQL statement that performs the write, so a
+     * tombstone that landed after the read but before this executes correctly makes the row not match
+     * and the unlock silently (and correctly) doesn't happen - the next `unlockEligible` pass on a
+     * still-eligible, still-active capsule would unlock it normally regardless. */
+    @Query("UPDATE time_capsules SET unlockedAt = :unlockedAt, updatedAt = :updatedAt WHERE id = :id AND deleted = 0")
+    suspend fun unlockIfNotDeleted(id: Long, unlockedAt: Long, updatedAt: Long)
+
     /** Raw/unfiltered - includes soft-deleted (tombstoned) rows. Used by BackupManager (so backups
      * round-trip tombstones) and by TimeCapsuleRepository.mergeRemote (needs to see already-tombstoned
      * local rows to match syncIds regardless of deletion state), same pattern as every other synced

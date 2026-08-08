@@ -285,7 +285,11 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
                 // never itself be a reason to re-send this capsule's row, though in practice the initial
                 // add() sync (or any later local edit) already covers propagating the definition; bumping
                 // here is just consistent with "every real local write touches updatedAt."
-                dao.update(capsule.copy(unlockedAt = now, updatedAt = now))
+                //
+                // MINOR fix (test-code-allmodels, Fable): was a plain dao.update(capsule.copy(...)) - a
+                // stale-read full-row overwrite. See unlockIfNotDeleted's own doc for the race this
+                // closes.
+                dao.unlockIfNotDeleted(capsule.id, unlockedAt = now, updatedAt = now)
             }
         }
     }

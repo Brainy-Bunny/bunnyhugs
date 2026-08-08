@@ -1053,9 +1053,28 @@ class GattSyncManager(
                             activeServerOnSyncDone(false)
                             return@launch
                         }
-                        val payload = buildPayload()
-                        sendToClient(device, payload)
-                        activeServerOnSyncDone(true)
+                        // MAJOR fix (test-code-allmodels, Opus - unfixed twin of round 2's
+                        // serializeTimeCapsules crash-loop fix): buildPayload()/sendToClient()/
+                        // activeServerOnSyncDone() used to sit outside this try/catch entirely, inside a
+                        // bare scope.launch with no CoroutineExceptionHandler on this scope
+                        // (ProximityForegroundService.lifecycleScope) - any uncaught throw here (a
+                        // DataStore IOException, a Room read failure, or exactly the kind of poisoned-value
+                        // JSONException round 2 already fixed the INPUT side of but never guarded the
+                        // call site itself) crashed the whole process. Since this service is START_STICKY
+                        // and the peer keeps reconnecting, a persistently-bad local state (not even
+                        // adversarial - a disk-full DataStore write, say) would crash-loop indefinitely
+                        // instead of failing this one sync cleanly. Same report-and-stop shape as the
+                        // parse-failure branch above.
+                        try {
+                            val payload = buildPayload()
+                            sendToClient(device, payload)
+                            activeServerOnSyncDone(true)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to build/send sync response - reporting failure instead of crashing", e)
+                            activeServerOnSyncDone(false)
+                        }
                         // Feature 2: the server never needs to know what IT wants from the client here -
                         // the client already deduced that itself from this same response payload and will
                         // push it unprompted (see runPhotoPhaseAsClient). The server's only remaining job
@@ -1558,10 +1577,25 @@ class GattSyncManager(
                             break
                         }
                     }
+                    // MAJOR fix (test-code-allmodels, Opus - unfixed twin of round 2's serializeTimeCapsules
+                    // crash-loop fix, same as the server-side buildPayload() call site above): this used to
+                    // have no try/catch at all, inside a bare scope.launch on ProximityForegroundService.
+                    // lifecycleScope with no CoroutineExceptionHandler - any uncaught throw (a DataStore
+                    // IOException, a Room read failure) crashed the whole process instead of failing this
+                    // one sync attempt. Same report-and-disconnect shape every other failure branch in this
+                    // handshake/sync flow already uses (finish(false) + best-effort disconnect).
                     scope.launch {
-                        val payload = buildPayload()
-                        synchronized(clientLock) { clientOutQueue = toChunks(payload, clientChunkPayload).toMutableList() }
-                        sendNextClientChunk(gatt, characteristic)
+                        try {
+                            val payload = buildPayload()
+                            synchronized(clientLock) { clientOutQueue = toChunks(payload, clientChunkPayload).toMutableList() }
+                            sendNextClientChunk(gatt, characteristic)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to build/send outgoing sync payload - reporting failure instead of crashing", e)
+                            finish(false)
+                            try { gatt.disconnect() } catch (e2: SecurityException) { /* ignore */ }
+                        }
                     }
                     return
                 }

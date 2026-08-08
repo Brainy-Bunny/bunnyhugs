@@ -253,6 +253,11 @@ class UltimateReviewRound2SpecTest {
             override suspend fun update(capsule: com.ssbmedia.twogether.data.db.TimeCapsule) { row = capsule }
             override fun observeActive() = throw NotImplementedError()
             override suspend fun getLocked() = listOf(row)
+            // Mirrors the real WHERE-guarded SQL: only mutates if the id matches AND the row isn't
+            // (already) tombstoned - same semantics unlockEligible's own production caller relies on.
+            override suspend fun unlockIfNotDeleted(id: Long, unlockedAt: Long, updatedAt: Long) {
+                if (row.id == id && !row.deleted) row = row.copy(unlockedAt = unlockedAt, updatedAt = updatedAt)
+            }
             override suspend fun getAll() = listOf(row)
             override suspend fun clearAll() {}
         }

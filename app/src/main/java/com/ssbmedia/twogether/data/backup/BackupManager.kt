@@ -377,7 +377,15 @@ object BackupManager {
                     put("text", c.text)
                     put("unlockAtHours", c.unlockAtHours.toDouble())
                     put("createdAt", c.createdAt)
-                    put("unlockedAt", c.unlockedAt)
+                    // MINOR fix (test-code-allmodels, Opus AND Sonnet independently found this): used to
+                    // write the real c.unlockedAt into the manifest, unlike the wire path (GattSyncManager.
+                    // serializeTimeCapsules), which was deliberately hardened to omit the field entirely
+                    // "so there's nothing left for a future reader to accidentally trust." parseTimeCapsules
+                    // already ignores this value correctly (always constructs unlockedAt = null), so there
+                    // was no live bug - but that safety was convention-enforced on this path, not
+                    // structural, and a backup file lives on shared external storage where tampering needs
+                    // no partner cooperation. Omitted here too now, for the same reason and the same
+                    // structural benefit as the wire-side fix.
                     // BUG fix: was missing entirely, so a restore always defaulted this to 0 regardless
                     // of what it actually was - see parseTimeCapsules' matching fix for the full failure
                     // scenario (a restored capsule's anti-cheat effective threshold silently drifts
