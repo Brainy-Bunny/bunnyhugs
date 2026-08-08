@@ -591,6 +591,25 @@ class GattSyncManager(
                 Log.w(TAG, "Dropping remote timeCapsule $syncId with implausible unlockAtHours=$unlockAtHours")
                 return@mapNotNull null
             }
+            // BLOCKER fix (ultimate-app-review round 2, Opus+Sonnet both independently live-reproduced):
+            // this field had ZERO validation - unlike unlockAtHours two lines above. Since
+            // TimeCapsuleRepository.unlockEligible computes `effectiveThreshold = unlockAtHours +
+            // (currentManualHoursCredit - manualHoursAtCreation)`, a peer claiming a huge value here drives
+            // the threshold deeply negative, forcing an instant, irreversible false unlock on the receiving
+            // device WITHOUT ever touching unlockedAt on the wire - the two enforcement layers documented on
+            // TimeCapsuleRepository.mergeRemote guard the unlockedAt field itself, not this input to the
+            // formula that sets it. Separately, a non-finite value (a plain finite-in-JSON double like 1e39
+            // that overflows Float to Infinity, or a JSON string "NaN") used to get persisted and then made
+            // every subsequent serializeTimeCapsules() call throw an uncaught JSONException inside
+            // buildPayload()'s bare scope.launch - a permanent per-device sync crash loop, live-reproduced
+            // by Opus. Same bound shape as unlockAtHours (finite, non-negative, capped well above any
+            // plausible real "manual hours credit" - the largest value either reviewer's live exploit used
+            // was ~1e6/1e9/1e39, all comfortably rejected here).
+            val manualHoursAtCreation = o.optDouble("manualHoursAtCreation", 0.0).toFloat()
+            if (!manualHoursAtCreation.isFinite() || manualHoursAtCreation < 0f || manualHoursAtCreation > 100_000f) {
+                Log.w(TAG, "Dropping remote timeCapsule $syncId with implausible manualHoursAtCreation=$manualHoursAtCreation")
+                return@mapNotNull null
+            }
             com.ssbmedia.twogether.data.db.TimeCapsule(
                 text = o.optString("text", ""),
                 unlockAtHours = unlockAtHours,
@@ -600,7 +619,7 @@ class GattSyncManager(
                 // never overwrites a local unlock either; this is defense-in-depth at the parse layer
                 // too, so no future caller of this function could accidentally trust it.
                 unlockedAt = null,
-                manualHoursAtCreation = o.optDouble("manualHoursAtCreation", 0.0).toFloat(),
+                manualHoursAtCreation = manualHoursAtCreation,
                 syncId = syncId,
                 updatedAt = updatedAt,
                 deleted = o.optBoolean("deleted", false)

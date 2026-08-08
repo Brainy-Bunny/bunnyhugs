@@ -241,22 +241,38 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
         }
     }
 
-    /** Feature: Time Capsule sync. Union+tombstone LWW merge by [TimeCapsule.syncId], mirroring
-     * SessionRepository.mergeRemoteSessions' shape (TimeCapsule uses the same local-autoincrement-[id] +
-     * separate-syncId identity those do, unlike Milestone/DateIdea's single-UUID-primary-key shape) - a
-     * genuinely new remote row inserts with `id = 0` (Room autogenerates); an already-known syncId
-     * preserves this device's own local [TimeCapsule.id] and only takes the remote's OTHER fields when
-     * the remote is LWW-newer.
+    /** Feature: Time Capsule sync. Union+STICKY-tombstone merge by [TimeCapsule.syncId], mirroring
+     * SessionRepository.mergeRemoteSessions'/MomentRepository.mergeRemoteStubs' shape exactly (TimeCapsule
+     * uses the same local-autoincrement-[id] + separate-syncId identity those do, unlike Milestone/
+     * DateIdea's single-UUID-primary-key shape) - a genuinely new remote row inserts with `id = 0` (Room
+     * autogenerates); an already-known syncId only ever has its tombstone applied one-way
+     * (`deleted: false -> true`, never the reverse), exactly like those two siblings' own tombstone-apply
+     * branch.
      *
-     * SECURITY: [TimeCapsule.unlockedAt] is NEVER taken from the remote side, even when the remote row
-     * otherwise wins the comparison - only this device's OWN [unlockEligible], computed from its own
-     * already-validated session data, may ever set it. Without this, a compromised or buggy peer could
-     * claim `unlockedAt` in its payload and falsely reveal a capsule's contents on the receiving device
-     * without that device's own total hours having actually crossed the threshold - the exact "never
-     * trust a peer's claim about high-stakes, irreversible state" principle this whole review applied to
-     * every timestamp in the app. Both devices still converge on the same real unlock moment naturally,
-     * since totalHours is derived from the SAME (already-synced) session data on both sides - nothing is
-     * lost by keeping this one field strictly local.
+     * BLOCKER fix (ultimate-app-review round 2, Opus+Sonnet both independently live-reproduced as S9):
+     * this used to be a general LWW merge that also took `text`/`unlockAtHours`/`manualHoursAtCreation`
+     * from the remote whenever `r.updatedAt > local.updatedAt` - but per [add]'s and [unlockEligible]'s
+     * own docs, those fields are a fixed snapshot set ONCE at creation and never legitimately mutated
+     * again by this app (there is no "edit capsule" feature). The only two post-creation mutations that
+     * exist are [delete] (tombstone) and [unlockEligible] (which also bumps updatedAt, purely locally,
+     * with no user action). Combined, the old LWW-take-everything shape let a background unlock on one
+     * device's newer updatedAt beat and UN-DELETE a capsule the OTHER device had explicitly, intentionally
+     * deleted moments earlier - live-reproduced by both reviewers in a completely ordinary two-partner
+     * scenario, no attacker needed. Restricting an already-known row to tombstone-apply-only, like every
+     * sibling synced entity in this file already does, closes that resurrection path structurally rather
+     * than by convention - and as a side effect also closes the "resend an existing syncId with a forged
+     * manualHoursAtCreation to move its already-set anti-cheat threshold" variant of S4, since no field
+     * but `deleted`/`updatedAt` can ever change after a capsule's first insert.
+     *
+     * SECURITY: [TimeCapsule.unlockedAt] is NEVER taken from the remote side, on either branch - only this
+     * device's OWN [unlockEligible], computed from its own already-validated session data, may ever set
+     * it. Without this, a compromised or buggy peer could claim `unlockedAt` in its payload and falsely
+     * reveal a capsule's contents on the receiving device without that device's own total hours having
+     * actually crossed the threshold - the exact "never trust a peer's claim about high-stakes,
+     * irreversible state" principle this whole review applied to every timestamp in the app. Both devices
+     * still converge on the same real unlock moment naturally, since totalHours is derived from the SAME
+     * (already-synced) session data on both sides - nothing is lost by keeping this one field strictly
+     * local.
      */
     suspend fun mergeRemote(remote: List<TimeCapsule>): List<TimeCapsule> {
         val localBySyncId = dao.getAll().filter { it.syncId.isNotBlank() }.associateBy { it.syncId }
@@ -267,8 +283,8 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
                 val toInsert = r.copy(id = 0, unlockedAt = null)
                 dao.insert(toInsert)
                 changed.add(toInsert)
-            } else if (r.updatedAt > local.updatedAt) {
-                val merged = r.copy(id = local.id, unlockedAt = local.unlockedAt)
+            } else if (r.deleted && !local.deleted) {
+                val merged = local.copy(deleted = true, updatedAt = maxOf(local.updatedAt, r.updatedAt))
                 dao.update(merged)
                 changed.add(merged)
             }

@@ -36,11 +36,18 @@ import org.mockito.Mockito.mock
  * independently derived from checklist.md's deferred-item note ("Time Capsules are never included in
  * the sync payload - a capsule written for your partner never reaches them") and the user's explicit
  * follow-up ask to finish the feature "without bugs." The central invariant this file guards:
- * TimeCapsule.unlockedAt must NEVER be settable by a remote peer's payload, even when that peer's row
- * otherwise wins the LWW comparison - only this device's own TimeCapsuleRepository.unlockEligible
- * (computed from its own already-validated session data) may ever unlock a capsule. This mirrors every
- * other "never trust a peer's claim about high-stakes, irreversible state" fix this whole review
- * applied to timestamps - here applied to a capsule's reveal state instead.
+ * TimeCapsule.unlockedAt must NEVER be settable by a remote peer's payload - only this device's own
+ * TimeCapsuleRepository.unlockEligible (computed from its own already-validated session data) may ever
+ * unlock a capsule. This mirrors every other "never trust a peer's claim about high-stakes, irreversible
+ * state" fix this whole review applied to timestamps - here applied to a capsule's reveal state instead.
+ *
+ * UPDATED (ultimate-app-review round 2, Opus+Sonnet both independently live-reproduced as S9):
+ * mergeRemote is no longer a general LWW merge of every field - an already-known syncId now only ever
+ * receives a one-way tombstone-apply (`deleted: false -> true`), mirroring SessionRepository/
+ * MomentRepository's sibling merges exactly, since a capsule's definitional fields never legitimately
+ * change after creation (no "edit capsule" feature exists). The old general-LWW shape let a purely-local,
+ * no-user-action unlock's updatedAt bump on one device beat and resurrect a tombstone the OTHER device
+ * had explicitly applied - see the tests below for the exact reproduced scenario.
  *
  * Merge tests use a hand-written fake DAO rather than a Mockito mock - ArgumentCaptor.capture()
  * returns a Java `null` placeholder internally, which crashes against this DAO's non-null Kotlin
@@ -165,32 +172,59 @@ class TimeCapsuleSyncAuditTest {
         override suspend fun clearAll() { localRows = emptyList() }
     }
 
+    // NOTE (ultimate-app-review round 2, Opus+Sonnet both independently live-reproduced as S9): the test
+    // that used to live here asserted the OLD, buggy contract - that a known syncId's `text`/other
+    // definitional fields update from a LWW-newer remote row. That was itself the bug: it let a
+    // background, no-user-action unlock (which also bumps updatedAt) on one device beat and UN-DELETE a
+    // capsule the other device had explicitly deleted moments earlier. TimeCapsuleRepository.mergeRemote
+    // now only ever applies a one-way tombstone for an already-known syncId (mirroring
+    // SessionRepository.mergeRemoteSessions/MomentRepository.mergeRemoteStubs exactly) - replaced below
+    // with tests of the corrected contract, including the exact S9 resurrection scenario both reviewers
+    // reproduced live.
+
     @Test
-    fun `mergeRemote never overwrites a locally-unlocked capsule's unlockedAt, even on a newer remote edit`() = runBlocking {
-        val localUnlockedAt = 1_000_000L
+    fun `mergeRemote ignores a non-delete remote edit to an already-known syncId - definitional fields are immutable after creation`() = runBlocking {
         val local = TimeCapsule(
             id = 42L, text = "old text", unlockAtHours = 100f, createdAt = 0L,
-            unlockedAt = localUnlockedAt, syncId = "shared-id", updatedAt = 5_000L
+            manualHoursAtCreation = 10f, syncId = "shared-id", updatedAt = 5_000L
         )
         val dao = FakeTimeCapsuleDao(listOf(local))
         val repo = TimeCapsuleRepository(dao)
 
-        // Remote wins LWW (updatedAt 6000 > local's 5000) and even tries to claim its OWN unlockedAt.
+        // A newer updatedAt and a forged manualHoursAtCreation must NOT move the local row at all - there
+        // is no "edit capsule" feature, so nothing but a tombstone may ever change a known capsule.
         val remote = TimeCapsule(
             id = 999L, text = "edited text", unlockAtHours = 100f, createdAt = 0L,
-            unlockedAt = 9_999_999L, syncId = "shared-id", updatedAt = 6_000L
+            manualHoursAtCreation = 999_999f, syncId = "shared-id", updatedAt = 6_000L, deleted = false
         )
-        repo.mergeRemote(listOf(remote))
+        val result = repo.mergeRemote(listOf(remote))
 
-        assertEquals(1, dao.updated.size)
-        val merged = dao.updated.first()
-        assertEquals("definitional fields come from the LWW-winning remote", "edited text", merged.text)
-        assertEquals("local id must be preserved, not the remote's meaningless-cross-device one", 42L, merged.id)
-        assertEquals(
-            "unlockedAt must be preserved from LOCAL state, never the remote's claim",
-            localUnlockedAt, merged.unlockedAt
-        )
+        assertTrue("no update and no insert - a non-delete edit to a known syncId is a pure no-op", dao.updated.isEmpty())
         assertTrue(dao.inserted.isEmpty())
+        assertTrue(result.isEmpty())
+    }
+
+    @Test
+    fun `mergeRemote does not resurrect a local tombstone even when the remote's non-deleted row is newer (S9)`() = runBlocking {
+        // The exact live-reproduced scenario: device B deletes a capsule (tombstone at T1); device A
+        // independently auto-unlocks the SAME capsule in the background at T2 > T1 (no user action, just
+        // unlockEligible's updatedAt bump) before it ever saw B's delete; B then receives A's row on the
+        // next sync. B's tombstone must survive.
+        val local = TimeCapsule(
+            id = 1L, text = "note", unlockAtHours = 100f, createdAt = 0L,
+            syncId = "shared-id", updatedAt = 1_000L, deleted = true // B's delete, T1 = 1000
+        )
+        val dao = FakeTimeCapsuleDao(listOf(local))
+        val repo = TimeCapsuleRepository(dao)
+
+        val remoteFromA = TimeCapsule(
+            id = 2L, text = "note", unlockAtHours = 100f, createdAt = 0L,
+            syncId = "shared-id", updatedAt = 2_000L, deleted = false // A's background unlock bump, T2 > T1
+        )
+        val result = repo.mergeRemote(listOf(remoteFromA))
+
+        assertTrue("a non-delete remote row must never un-delete a local tombstone, regardless of updatedAt", dao.updated.isEmpty())
+        assertTrue(result.isEmpty())
     }
 
     @Test
@@ -210,13 +244,15 @@ class TimeCapsuleSyncAuditTest {
     }
 
     @Test
-    fun `mergeRemote ignores a remote row that is not LWW-newer`() = runBlocking {
+    fun `mergeRemote ignores a non-delete remote row for an already-known syncId regardless of updatedAt`() = runBlocking {
         val local = TimeCapsule(id = 1L, text = "current", unlockAtHours = 100f, createdAt = 0L, syncId = "id-1", updatedAt = 5_000L)
         val dao = FakeTimeCapsuleDao(listOf(local))
         val repo = TimeCapsuleRepository(dao)
 
-        val staleRemote = TimeCapsule(id = 2L, text = "stale", unlockAtHours = 100f, createdAt = 0L, syncId = "id-1", updatedAt = 4_000L)
-        val result = repo.mergeRemote(listOf(staleRemote))
+        // Even a newer updatedAt changes nothing, since there is no field left that a non-delete remote
+        // row is allowed to update - see the mergeRemote contract change above (S9 fix).
+        val newerNonDeleteRemote = TimeCapsule(id = 2L, text = "stale", unlockAtHours = 100f, createdAt = 0L, syncId = "id-1", updatedAt = 6_000L)
+        val result = repo.mergeRemote(listOf(newerNonDeleteRemote))
 
         assertTrue(result.isEmpty())
         assertTrue(dao.inserted.isEmpty())
@@ -224,7 +260,7 @@ class TimeCapsuleSyncAuditTest {
     }
 
     @Test
-    fun `mergeRemote propagates a deletion tombstone like any other definitional field`() = runBlocking {
+    fun `mergeRemote applies a remote deletion tombstone to an already-known, not-yet-deleted local row`() = runBlocking {
         val local = TimeCapsule(id = 1L, text = "note", unlockAtHours = 100f, createdAt = 0L, syncId = "id-1", updatedAt = 5_000L, deleted = false)
         val dao = FakeTimeCapsuleDao(listOf(local))
         val repo = TimeCapsuleRepository(dao)
@@ -234,5 +270,6 @@ class TimeCapsuleSyncAuditTest {
 
         assertEquals(1, dao.updated.size)
         assertTrue(dao.updated.first().deleted)
+        assertEquals("local id preserved on a tombstone-apply too", 1L, dao.updated.first().id)
     }
 }

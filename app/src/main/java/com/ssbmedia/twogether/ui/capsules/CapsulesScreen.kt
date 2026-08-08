@@ -43,6 +43,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.data.datastore.ProximityPersistedState
 import com.ssbmedia.twogether.data.db.TimeCapsule
+import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.EmptyState
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
@@ -92,12 +93,26 @@ class CapsulesViewModel : ViewModel() {
         viewModelScope.launch {
             val manualCredit = StatsCalculator.manualHoursCredit(sessions.value, lastSeenAt = proximityState.value.lastSeenAt)
             ServiceLocator.timeCapsuleRepository.add(text.trim(), unlockHours, manualCredit)
+            // MAJOR fix (ultimate-app-review round 2, Sonnet): every other mutation type in the app (date
+            // ideas, milestones, list items, a new photo capture) already requests an immediate sync when
+            // the couple is currently together, so the change reaches the partner right away instead of
+            // waiting for the next reconnect or the 15-minute catch-all - see CalendarScreen's
+            // addManualSession for the same pattern. Time Capsules were the one mutation type missing this,
+            // live-observed as an 8+ minute propagation delay for a capsule written while genuinely
+            // together.
+            if (ServiceLocator.proximityStateStore.current().isTogether) {
+                AppEvents.requestManualSync()
+            }
         }
     }
 
     fun delete(capsule: TimeCapsule) {
         viewModelScope.launch {
             ServiceLocator.timeCapsuleRepository.delete(capsule)
+            // Same reasoning as add() above - don't make a capsule deletion wait for the next reconnect.
+            if (ServiceLocator.proximityStateStore.current().isTogether) {
+                AppEvents.requestManualSync()
+            }
         }
     }
 }
