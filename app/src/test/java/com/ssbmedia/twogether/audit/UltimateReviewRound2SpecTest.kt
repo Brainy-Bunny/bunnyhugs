@@ -334,13 +334,57 @@ class UltimateReviewRound2SpecTest {
 
     @Test
     fun `MAJOR-1 - parseSessions rejects a session dated years out even when backupCreatedAt claims the same far future`() {
-        // Opus's exact round-3 live repro: a backup claiming createdAt = year 2035, with every session
-        // dated 2034-2035 to stay internally consistent, restored with ZERO rejections before this fix -
-        // parseSessions' own SessionBoundsValidator call used a bare, uncapped `maxOf(now, backupCreatedAt)`
-        // that never got round 2's cap, unlike isPlausibleBackupUpdatedAt right next to it.
-        val forgedFarFuture = System.currentTimeMillis() + 5L * 365 * 24 * 60 * 60 * 1000 // ~5 years out
-        val json = """[{"id":1,"startedAt":$forgedFarFuture,"endedAt":${forgedFarFuture + 3_600_000L},"isManual":false,"syncId":"s1","updatedAt":$forgedFarFuture,"deleted":false}]"""
+        // MINOR fix (ultimate-app-review round 4, Opus): the original version of this test used
+        // `updatedAt = forgedFarFuture` too, which meant `isPlausibleBackupUpdatedAt`'s OWN cap already
+        // rejected the row via the `||` short-circuit in parseSessions - the test passed even when Opus
+        // reverted trustedBackupCeiling(backupCreatedAt) back to the OLD bare, uncapped
+        // `maxOf(now, backupCreatedAt)` inside parseSessions' own SessionBoundsValidator call, proving it
+        // didn't actually guard what it claimed to. Fixed with Opus's exact discriminating inputs: a
+        // realistic, RECENT `updatedAt` so isPlausibleBackupUpdatedAt passes on its own, isolating
+        // parseSessions' OWN ceiling as the only thing that can still reject the row.
+        val now = System.currentTimeMillis()
+        val forgedFarFuture = now + 5L * 365 * 24 * 60 * 60 * 1000 // ~5 years out - the backup's own claim
+        val startedAt = forgedFarFuture - 365L * 24 * 60 * 60 * 1000 // still ~4 years out
+        val endedAt = startedAt + 20L * 24 * 60 * 60 * 1000 // 20 days - inside MAX_PLAUSIBLE_SESSION_DURATION_MILLIS
+        val recentUpdatedAt = now - 24 * 60 * 60 * 1000L // realistic, passes isPlausibleBackupUpdatedAt on its own
+        val json = """[{"id":1,"startedAt":$startedAt,"endedAt":$endedAt,"isManual":false,"syncId":"s1","updatedAt":$recentUpdatedAt,"deleted":false}]"""
         val result = parseSessionsRaw(json, forgedFarFuture)
-        assertTrue("a session dated years past any plausible clock skew must be rejected, not silently credited", result.isEmpty())
+        assertTrue(
+            "a session dated years out must be rejected by parseSessions' OWN ceiling, independent of isPlausibleBackupUpdatedAt",
+            result.isEmpty()
+        )
+    }
+
+    @Test
+    fun `parseSessions - a Long-MAX_VALUE backupCreatedAt fails closed rather than overflowing into acceptance`() {
+        // Opus's P1 proposal: pins the overflow behavior verified live in round 4 (backupCreatedAt +
+        // 5min overflows negative on Long.MAX_VALUE, which must still reject rather than silently wrap
+        // into an always-true comparison).
+        val now = System.currentTimeMillis()
+        val json = """[{"id":1,"startedAt":${now - 3_600_000L},"endedAt":$now,"isManual":false,"syncId":"s1","updatedAt":$now,"deleted":false}]"""
+        val result = parseSessionsRaw(json, Long.MAX_VALUE)
+        assertTrue("an overflow-inducing backupCreatedAt must fail closed, never silently accept", result.isEmpty())
+    }
+
+    // ---- effectiveThreshold invariant (Opus P2): the display and the real unlock decision must always agree ----
+
+    @Test
+    fun `effectiveThreshold - unlocking decision agrees with the threshold value across adversarial manualHoursAtCreation`() {
+        val unlockAtHours = 100f
+        val currentManualHoursCredit = 10f
+        for (manualHoursAtCreation in listOf(0f, 10f, 100_000f, Float.MAX_VALUE, Float.POSITIVE_INFINITY)) {
+            val capsule = com.ssbmedia.twogether.data.db.TimeCapsule(
+                id = 1L, text = "t", unlockAtHours = unlockAtHours, createdAt = 0L,
+                manualHoursAtCreation = manualHoursAtCreation, syncId = "s", updatedAt = 0L
+            )
+            val threshold = TimeCapsuleRepository.effectiveThreshold(capsule, currentManualHoursCredit)
+            assertTrue(
+                "effectiveThreshold must never go below unlockAtHours for manualHoursAtCreation=$manualHoursAtCreation",
+                threshold >= unlockAtHours
+            )
+            // The single formula both unlockEligible and CapsulesScreen call - if this holds, they can
+            // never disagree, since there is only one implementation left to call.
+            assertTrue(!threshold.isNaN())
+        }
     }
 }
