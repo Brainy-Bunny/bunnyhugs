@@ -395,9 +395,14 @@ class GattSyncMergeSecurityAuditTest {
     fun `an unrelated file's bytes are rejected - the live-verified F-1 attack`() {
         // Fable's actual attack: a poisoned photoUri pointed at the peer's own SQLite DB / DataStore
         // protobuf, both of which streamed through with no content check at all.
+        //
+        // MINOR fix (test-code-allmodels, Fable - tooling hygiene): this used to embed the real SQLite
+        // magic header's raw NUL terminator as a literal byte in the Kotlin string - compiles fine, but
+        // makes diff/grep/git classify this whole source file as binary and silently skip it. The escape
+        // sequence below produces byte-identical content without that tooling footgun.
         assertTrue(
             "SQLite header must be rejected",
-            !looksLikeImage("SQLite format 3 ".toByteArray() + ByteArray(20))
+            !looksLikeImage("SQLite format 3\u0000".toByteArray() + ByteArray(20))
         )
     }
 

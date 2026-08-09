@@ -250,7 +250,6 @@ class UltimateReviewRound2SpecTest {
                 manualHoursAtCreation = manualHoursAtCreation, syncId = "s", updatedAt = 0L
             )
             override suspend fun insert(capsule: com.ssbmedia.twogether.data.db.TimeCapsule) = 1L
-            override suspend fun update(capsule: com.ssbmedia.twogether.data.db.TimeCapsule) { row = capsule }
             override fun observeActive() = throw NotImplementedError()
             override suspend fun getLocked() = listOf(row)
             // Mirrors the real WHERE-guarded SQL: only mutates if the id matches AND the row isn't

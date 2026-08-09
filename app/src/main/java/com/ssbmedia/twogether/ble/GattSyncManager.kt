@@ -1867,11 +1867,20 @@ class GattSyncManager(
 
         /** BLOCKER fix: an independent testing round found that every LWW merge (dateIdeas,
          * listCategories, milestones, momentNotes) trusted the peer's `updatedAt` absolutely, with no
-         * clamp - a peer with a wrong clock (or a forged payload) could stamp a value far in the future,
+         * bound - a peer with a wrong clock (or a forged payload) could stamp a value far in the future,
          * after which no local edit could ever win again since local writes stamp real wall-clock time.
-         * Clamping incoming `updatedAt` to `now + this tolerance` bounds the damage to a small, genuine
-         * clock-skew window: a poisoned/forged row can still win once, but any subsequent real local edit
-         * (stamped with actual current time, which will already exceed the clamped value) wins back. */
+         *
+         * MINOR fix (test-code-allmodels, Fable - doc drift): this doc used to describe a CLAMP-and-accept
+         * design ("clamping incoming updatedAt to now + this tolerance... a poisoned/forged row can still
+         * win once, but any subsequent real local edit wins back"). That design was replaced with
+         * reject-outright ([isPlausibleWireUpdatedAt] below simply drops a row failing this check, never
+         * clamps and accepts it) after a later round found clamping doesn't self-heal under REPEATED
+         * replay of the same poisoned value - each replay gets clamped to a fresh, later ceiling relative
+         * to its own "now," letting a repeatedly-resent poisoned row keep beating legitimate edits made in
+         * between instead of losing once. This constant is still the tolerance window for that reject
+         * check (and the sibling backup-restore reject checks in BackupManager), just no longer a clamp
+         * ceiling - kept the doc accurate so a future maintainer doesn't reintroduce clamping here by
+         * reading stale reasoning. */
         const val MAX_CLOCK_SKEW_TOLERANCE_MILLIS = 5 * 60_000L
 
         /** MAJOR fix (ultimate-app-review, post-restart full-scope round, Opus): caps how large a

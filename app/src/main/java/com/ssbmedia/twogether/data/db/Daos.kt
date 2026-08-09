@@ -69,8 +69,14 @@ interface TimeCapsuleDao {
     @Insert
     suspend fun insert(capsule: TimeCapsule): Long
 
-    @Update
-    suspend fun update(capsule: TimeCapsule)
+    // MINOR fix (test-code-allmodels, Sonnet - final clean-room pass): the raw @Update(capsule) was left
+    // on this interface with zero remaining production callers (every real write site now goes through
+    // the narrower unlockIfNotDeleted/tombstone/insert queries above/below) - removed rather than left as
+    // a latent footgun. A full-row @Update is exactly the stale-read-full-row-overwrite shape this file's
+    // two targeted queries exist to avoid; a future feature reaching for the obvious dao.update(capsule.
+    // copy(...)) here would silently reintroduce the same race class this review spent multiple rounds
+    // closing. If a genuine future need for a full-row update arises, add a fresh, deliberately-scoped
+    // query rather than resurrecting this one.
 
     /** Feature: Time Capsule sync. Excludes soft-deleted (tombstoned) rows - what the UI should always
      * see. */

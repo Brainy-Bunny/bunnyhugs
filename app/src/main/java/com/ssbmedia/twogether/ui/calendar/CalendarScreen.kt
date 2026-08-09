@@ -57,6 +57,7 @@ import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import com.ssbmedia.twogether.util.SessionBoundsValidator
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -471,9 +472,21 @@ private fun AddManualSessionDialog(zone: ZoneId, onDismiss: () -> Unit, onAdd: (
         } else null
     }
 
+    // MINOR fix (test-code-allmodels final clean-room pass, Opus): this dialog previously had no lower
+    // date bound - a pre-2020 entry inserted with no error, but SessionBoundsValidator.
+    // MIN_PLAUSIBLE_TIMESTAMP_MILLIS (the same floor every untrusted wire/backup timestamp is already
+    // checked against) silently rejects it everywhere else: StatsCalculator's own merge excludes it from
+    // every stat, deserializeSessions drops it from the sync payload, and a restored backup drops it too
+    // (SessionBoundsValidator.isPlausible). The row would sit in the local DB forever contributing to
+    // nothing while the Calendar day-detail view showed a self-contradictory "manual entry, but no time
+    // together that day." Validated up front here instead, using the exact same floor.
+    val minPlausibleDate = remember {
+        java.time.Instant.ofEpochMilli(SessionBoundsValidator.MIN_PLAUSIBLE_TIMESTAMP_MILLIS).atZone(zone).toLocalDate()
+    }
     val error: String? = when {
         parsedDate == null -> "Enter a valid date as YYYY-MM-DD"
         parsedDate.isAfter(today) -> "Date can't be in the future"
+        parsedDate.isBefore(minPlausibleDate) -> "Date can't be before $minPlausibleDate"
         totalMinutes <= 0 -> "Enter a duration greater than zero"
         totalMinutes > 24 * 60 -> "Can't be more than 24 hours in one day"
         elapsedMinutesToday != null && totalMinutes > elapsedMinutesToday ->

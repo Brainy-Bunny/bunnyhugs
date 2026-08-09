@@ -163,9 +163,6 @@ class TimeCapsuleSyncAuditTest {
             inserted.add(capsule)
             return 1L
         }
-        override suspend fun update(capsule: TimeCapsule) {
-            updated.add(capsule)
-        }
         override fun observeActive(): Flow<List<TimeCapsule>> = throw NotImplementedError("not used by mergeRemote")
         override suspend fun getLocked(): List<TimeCapsule> = throw NotImplementedError("not used by mergeRemote")
         override suspend fun unlockIfNotDeleted(id: Long, unlockedAt: Long, updatedAt: Long) = throw NotImplementedError("not used by mergeRemote")

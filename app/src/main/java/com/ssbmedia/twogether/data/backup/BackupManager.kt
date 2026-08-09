@@ -894,6 +894,17 @@ object BackupManager {
             )
         } catch (e: CancellationException) {
             throw e
+        } catch (e: android.database.sqlite.SQLiteConstraintException) {
+            // MINOR fix (test-code-allmodels final clean-room pass, Opus): every row this restore writes
+            // was already validated by the parse* functions above BEFORE this transaction ever started
+            // (S12 - parse-then-apply, never partial), so the only way a constraint failure reaches this
+            // catch is a structural defect in the file itself (e.g. two manifest rows sharing a primary
+            // key) that will deterministically fail again on retry - not a transient condition. The
+            // generic catch below defaults to retryable (permanent=false), which previously cost up to
+            // MAX_SILENT_RESTORE_RETRIES wasted silent attempts (each re-parsing and re-failing
+            // identically) before the "gave up resuming" notification. Classified permanent here instead,
+            // same as every other "this file is broken" rejection above.
+            BackupResult(false, null, "This backup file is corrupt or incomplete (${e.message ?: e.javaClass.simpleName}).", permanent = true)
         } catch (e: Exception) {
             BackupResult(false, null, "Restore failed: ${e.message ?: e.javaClass.simpleName}")
         } finally {
