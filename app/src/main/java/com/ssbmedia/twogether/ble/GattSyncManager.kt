@@ -12,6 +12,7 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.util.Log
+import com.ssbmedia.twogether.data.datastore.PairingStore
 import com.ssbmedia.twogether.data.datastore.SettingsStore
 import com.ssbmedia.twogether.data.db.DEFAULT_LIST_ID
 import com.ssbmedia.twogether.data.db.DateIdea
@@ -105,6 +106,7 @@ class GattSyncManager(
     private val milestoneRepository: MilestoneRepository,
     private val timeCapsuleRepository: com.ssbmedia.twogether.data.repo.TimeCapsuleRepository,
     private val settingsStore: SettingsStore,
+    private val pairingStore: PairingStore,
     private val scope: CoroutineScope
 ) {
     private val bluetoothManager get() = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -144,6 +146,9 @@ class GattSyncManager(
         // build's payload degrades safely (applyPayload's optLong default treats that as "no observed
         // offset", i.e. today's stricter-but-correct-for-matched-clocks behavior).
         obj.put("deviceTimestamp", System.currentTimeMillis())
+        // SECURITY: lets the receiver's applyPayload pin (or verify against an already-pinned) sender
+        // identity - see PairingStore.pinPartnerDeviceIdIfAbsent's doc.
+        obj.put("senderDeviceId", deviceId)
         obj.put("dateIdeas", serializeDateIdeas(dateIdeaRepository.getAll()))
         obj.put("listCategories", serializeListCategories(listCategoryRepository.getAll()))
         obj.put("sessions", serializeSessions(sessionRepository.getAllIncludingDeleted().filter { it.endedAt != null }))
@@ -164,6 +169,21 @@ class GattSyncManager(
     private suspend fun applyPayload(bytes: ByteArray): List<RemoteMomentInfo> {
         val deviceId = settingsStore.getOrCreateLocalDeviceId()
         val root = JSONObject(String(bytes, Charsets.UTF_8))
+        // SECURITY: trust-on-first-use device pinning (see PairingInfo.pinnedPartnerDeviceId's doc for
+        // the collision this closes). The GATT handshake above only proves the sender knows our pairing
+        // code - it says nothing about WHICH device that is, so a second couple who coincidentally landed
+        // on the same 6-digit code would otherwise pass the handshake exactly like our real partner would.
+        // Checked here, before a single row of any table below gets merged: once a pin exists, a payload
+        // from any other device is rejected outright rather than partially applied. A blank senderDeviceId
+        // (a payload from a build that predates this field) is treated as "unknown, not necessarily
+        // hostile" and allowed through unpinned rather than breaking sync for an already-paired couple
+        // where one side hasn't updated yet.
+        val senderDeviceId = root.optString("senderDeviceId", "")
+        val pinnedPartnerDeviceId = pairingStore.current().pinnedPartnerDeviceId
+        if (!pinnedPartnerDeviceId.isNullOrBlank() && senderDeviceId.isNotBlank() && senderDeviceId != pinnedPartnerDeviceId) {
+            Log.w(TAG, "Rejecting sync payload: sender device id did not match this pairing's pinned partner")
+            throw SecurityException("Sync payload sender did not match pinned partner device")
+        }
         // MAJOR fix (ultimate-app-review, Fable F-4): isPlausibleWireUpdatedAt rejects anything more
         // than MAX_CLOCK_SKEW_TOLERANCE_MILLIS ahead of OUR OWN clock - but in a serverless two-device
         // system with no time authority, a peer whose clock is merely wrong (no NTP - this app is
@@ -237,6 +257,11 @@ class GattSyncManager(
             (notesArr?.length() ?: 0) - notesParsed.size +
             (milestonesArr?.length() ?: 0) - milestonesParsed.size +
             (timeCapsulesArr?.length() ?: 0) - timeCapsulesParsed.size
+        // SECURITY: only pin once the whole payload has genuinely merged successfully (a no-op after the
+        // first time - see pinPartnerDeviceIdIfAbsent's doc). A blank senderDeviceId (old-build peer, see
+        // this function's own check above) is simply never pinned, which is fine - unauthenticated pairs
+        // still get the exact pre-pinning behavior they always had.
+        if (senderDeviceId.isNotBlank()) pairingStore.pinPartnerDeviceIdIfAbsent(senderDeviceId)
         return parseRemoteMomentInfo(momentsArr)
     }
 
@@ -513,6 +538,7 @@ class GattSyncManager(
                 put("createdAt", m.createdAt)
                 put("updatedAt", m.updatedAt)
                 put("deleted", m.deleted)
+                put("linkedMomentSyncId", m.linkedMomentSyncId ?: JSONObject.NULL)
             })
         }
         return arr
@@ -544,7 +570,12 @@ class GattSyncManager(
                 year = if (o.isNull("year")) null else o.getInt("year"),
                 createdAt = o.getLong("createdAt"),
                 updatedAt = updatedAt,
-                deleted = o.optBoolean("deleted", false)
+                deleted = o.optBoolean("deleted", false),
+                // Defensive fallback (not getString) for a payload from a not-yet-updated partner build,
+                // same pattern as dateIdeas' listId above - just a reference, never a filesystem path (see
+                // Milestone.linkedMomentSyncId's own doc), so no extra validation needed beyond "missing
+                // means null".
+                linkedMomentSyncId = if (o.isNull("linkedMomentSyncId")) null else o.getString("linkedMomentSyncId")
             )
         }
     }

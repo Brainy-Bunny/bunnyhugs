@@ -1,7 +1,9 @@
 package com.ssbmedia.twogether.ui.milestones
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,6 +25,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -84,9 +87,9 @@ class MilestonesViewModel : ViewModel() {
     val moments = ServiceLocator.momentRepository.observeAll()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    fun add(context: android.content.Context, label: String, month: Int, day: Int, year: Int?) {
+    fun add(context: android.content.Context, label: String, month: Int, day: Int, year: Int?, linkedMomentSyncId: String?) {
         viewModelScope.launch {
-            val created = ServiceLocator.milestoneRepository.add(label, month, day, year)
+            val created = ServiceLocator.milestoneRepository.add(label, month, day, year, linkedMomentSyncId)
             MilestoneAlarmScheduler.scheduleOne(context, created)
             if (ServiceLocator.proximityStateStore.current().isTogether) AppEvents.requestManualSync()
         }
@@ -96,6 +99,18 @@ class MilestonesViewModel : ViewModel() {
         viewModelScope.launch {
             ServiceLocator.milestoneRepository.delete(milestone)
             MilestoneAlarmScheduler.cancel(context, milestone.id)
+            if (ServiceLocator.proximityStateStore.current().isTogether) AppEvents.requestManualSync()
+        }
+    }
+
+    /** Changes (or clears, if [linkedMomentSyncId] is null) an EXISTING milestone's linked photo - the
+     * add-time-only picker in AddMilestoneDialog covers a NEW milestone, this covers going back to add/
+     * swap/remove one on a milestone that already exists. No alarm rescheduling needed here (unlike
+     * add/delete above) - the photo link never affects month/day/label, the only things
+     * MilestoneAlarmScheduler cares about. */
+    fun setLinkedMoment(milestone: Milestone, linkedMomentSyncId: String?) {
+        viewModelScope.launch {
+            ServiceLocator.milestoneRepository.setLinkedMoment(milestone, linkedMomentSyncId)
             if (ServiceLocator.proximityStateStore.current().isTogether) AppEvents.requestManualSync()
         }
     }
@@ -111,6 +126,7 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onI
 
     var showAddDialog by remember { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<Milestone?>(null) }
+    var editingPhotoFor by remember { mutableStateOf<Milestone?>(null) }
     // BUG fix: was `var retrospectiveFor by remember { mutableStateOf<Milestone?>(null) }` - a further
     // review round found that plain `remember` here defeated the ROTATION half of the fix below (making
     // NavGraph's latchedMilestoneId `rememberSaveable`): the caller's latch is nulled via
@@ -171,6 +187,14 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onI
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 items(milestones, key = { it.id }) { milestone ->
+                    // Feature: link a Moment's photo to a milestone (see Milestone.linkedMomentSyncId's
+                    // own doc) - resolved fresh from the currently-loaded moments list rather than cached
+                    // on the milestone row itself, same "always re-resolve, never denormalize" approach
+                    // MilestoneRetrospective already uses below for its own date-matched gallery. A link
+                    // that no longer resolves to a locally-held photo (not yet synced, or deleted) is
+                    // treated as "no photo" - see the field's own doc.
+                    val linkedMoment = milestone.linkedMomentSyncId?.let { syncId -> moments.firstOrNull { it.syncId == syncId } }
+                    val hasLinkedPhoto = linkedMoment != null && linkedMoment.photoDownloaded && File(linkedMoment.photoUri).isFile
                     Card(
                         shape = MaterialTheme.shapes.large,
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
@@ -181,15 +205,30 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onI
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Column {
-                                Text(milestone.label, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                                Text(
-                                    text = monthDayLabel(milestone.month, milestone.day) + (milestone.year?.let { " · since $it" } ?: ""),
-                                    style = MaterialTheme.typography.bodySmall
-                                )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (hasLinkedPhoto) {
+                                    AsyncImage(
+                                        model = linkedMoment!!.photoUri,
+                                        contentDescription = "${milestone.label} photo",
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.size(48.dp).clip(RoundedCornerShape(10.dp))
+                                    )
+                                }
+                                Column(modifier = Modifier.padding(start = if (hasLinkedPhoto) 10.dp else 0.dp)) {
+                                    Text(milestone.label, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                                    Text(
+                                        text = monthDayLabel(milestone.month, milestone.day) + (milestone.year?.let { " · since $it" } ?: ""),
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
                             }
-                            IconButton(onClick = { pendingDelete = milestone }) {
-                                Icon(Icons.Filled.Delete, contentDescription = "Delete")
+                            Row {
+                                IconButton(onClick = { editingPhotoFor = milestone }) {
+                                    Icon(Icons.Filled.Edit, contentDescription = "Edit photo")
+                                }
+                                IconButton(onClick = { pendingDelete = milestone }) {
+                                    Icon(Icons.Filled.Delete, contentDescription = "Delete")
+                                }
                             }
                         }
                     }
@@ -200,9 +239,10 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onI
 
     if (showAddDialog) {
         AddMilestoneDialog(
+            moments = moments,
             onDismiss = { showAddDialog = false },
-            onAdd = { label, month, day, year ->
-                vm.add(context, label, month, day, year)
+            onAdd = { label, month, day, year, linkedMomentSyncId ->
+                vm.add(context, label, month, day, year, linkedMomentSyncId)
                 showAddDialog = false
             }
         )
@@ -221,16 +261,38 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onI
     retrospectiveFor?.let { milestone ->
         MilestoneRetrospective(milestone = milestone, moments = moments, zone = zone, onDismiss = { retrospectiveForId = null })
     }
+
+    editingPhotoFor?.let { milestone ->
+        EditMilestonePhotoDialog(
+            milestone = milestone,
+            moments = moments,
+            onDismiss = { editingPhotoFor = null },
+            onSave = { linkedMomentSyncId ->
+                vm.setLinkedMoment(milestone, linkedMomentSyncId)
+                editingPhotoFor = null
+            }
+        )
+    }
 }
 
 @Composable
-private fun AddMilestoneDialog(onDismiss: () -> Unit, onAdd: (label: String, month: Int, day: Int, year: Int?) -> Unit) {
+private fun AddMilestoneDialog(
+    moments: List<Moment>,
+    onDismiss: () -> Unit,
+    onAdd: (label: String, month: Int, day: Int, year: Int?, linkedMomentSyncId: String?) -> Unit
+) {
     var label by remember { mutableStateOf("") }
     val today = remember { LocalDate.now() }
     var month by remember { mutableStateOf(today.monthValue) }
     var dayText by remember { mutableStateOf(today.dayOfMonth.toString()) }
     var yearText by remember { mutableStateOf("") }
     var monthMenuExpanded by remember { mutableStateOf(false) }
+    var selectedMomentSyncId by remember { mutableStateOf<String?>(null) }
+    // Same photoDownloaded+file-exists gate as MilestoneRetrospective/the milestone-card thumbnail below -
+    // only ever offer a photo this device can actually display right now.
+    val availableMoments = remember(moments) {
+        moments.filter { it.photoDownloaded && File(it.photoUri).isFile }.sortedByDescending { it.takenAt }
+    }
 
     val day = dayText.toIntOrNull()
     val maxDay = remember(month) { YearMonth.of(2024, month).lengthOfMonth() } // 2024 is a leap year, so Feb 29 is always offered
@@ -291,6 +353,11 @@ private fun AddMilestoneDialog(onDismiss: () -> Unit, onAdd: (label: String, mon
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     modifier = Modifier.fillMaxWidth().padding(top = 12.dp)
                 )
+                MomentPhotoPicker(
+                    availableMoments = availableMoments,
+                    selectedMomentSyncId = selectedMomentSyncId,
+                    onSelect = { selectedMomentSyncId = it }
+                )
                 error?.let {
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
                 }
@@ -299,8 +366,80 @@ private fun AddMilestoneDialog(onDismiss: () -> Unit, onAdd: (label: String, mon
         confirmButton = {
             TextButton(
                 enabled = error == null,
-                onClick = { onAdd(label.trim(), month, day ?: 1, yearText.toIntOrNull()) }
+                onClick = { onAdd(label.trim(), month, day ?: 1, yearText.toIntOrNull(), selectedMomentSyncId) }
             ) { Text("Add") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
+/** Shared photo-picker grid - used by both AddMilestoneDialog (choosing at creation time) and
+ * EditMilestonePhotoDialog (changing/clearing it later) so the two flows can never visually drift apart. */
+@Composable
+private fun MomentPhotoPicker(availableMoments: List<Moment>, selectedMomentSyncId: String?, onSelect: (String?) -> Unit) {
+    if (availableMoments.isEmpty()) return
+    Text(
+        "Photo (optional)",
+        style = MaterialTheme.typography.bodyMedium,
+        modifier = Modifier.padding(top = 16.dp, bottom = 6.dp)
+    )
+    Row(
+        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        availableMoments.forEach { moment ->
+            val selected = moment.syncId == selectedMomentSyncId
+            AsyncImage(
+                model = moment.photoUri,
+                contentDescription = "Pick this photo",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .size(56.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .border(
+                        width = if (selected) 3.dp else 0.dp,
+                        color = MaterialTheme.colorScheme.primary,
+                        shape = RoundedCornerShape(10.dp)
+                    )
+                    .clickable { onSelect(if (selected) null else moment.syncId) }
+            )
+        }
+    }
+}
+
+/** Lets the user pick/swap/clear an EXISTING milestone's linked photo - AddMilestoneDialog's picker only
+ * ever runs at creation time, this covers going back to it afterward (see MilestonesViewModel.
+ * setLinkedMoment's own doc). Deliberately just the photo picker, not label/date - editing those isn't
+ * supported anywhere else in this screen either, so adding it here would be scope beyond what this fix
+ * needs. */
+@Composable
+private fun EditMilestonePhotoDialog(milestone: Milestone, moments: List<Moment>, onDismiss: () -> Unit, onSave: (linkedMomentSyncId: String?) -> Unit) {
+    var selectedMomentSyncId by remember(milestone.id) { mutableStateOf(milestone.linkedMomentSyncId) }
+    val availableMoments = remember(moments) {
+        moments.filter { it.photoDownloaded && File(it.photoUri).isFile }.sortedByDescending { it.takenAt }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Photo for \"${milestone.label}\"") },
+        text = {
+            Column {
+                if (availableMoments.isEmpty()) {
+                    Text(
+                        "No photos to choose from yet - take one in Moments first.",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                } else {
+                    MomentPhotoPicker(
+                        availableMoments = availableMoments,
+                        selectedMomentSyncId = selectedMomentSyncId,
+                        onSelect = { selectedMomentSyncId = it }
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(selectedMomentSyncId) }) { Text("Save") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
     )

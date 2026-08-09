@@ -251,6 +251,39 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
     var isCheckingForUpdate by remember { mutableStateOf(false) }
     var updateCheckMessage by remember { mutableStateOf<String?>(null) }
 
+    // "Sync now" - same mechanism OurListsScreen's own button uses (AppEvents.requestManualSync), just
+    // surfaced here too since a full sync is convenient to trigger without having to go into Our Lists
+    // first. See OurListsScreen's identical block for why each piece of state below exists.
+    var lastSyncAt by remember { mutableStateOf(0L) }
+    var syncing by remember { mutableStateOf(false) }
+    var syncMessage by remember { mutableStateOf<String?>(null) }
+    var isListeningRole by remember { mutableStateOf(false) }
+    val syncCoroutineScope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        lastSyncAt = ServiceLocator.settingsStore.current().lastSyncAt
+    }
+    LaunchedEffect(Unit) {
+        AppEvents.syncListening.collect {
+            isListeningRole = true
+            syncing = false
+            syncMessage = "Listening for your partner's phone…"
+        }
+    }
+    LaunchedEffect(Unit) {
+        AppEvents.syncCompleted.collect { success ->
+            syncing = false
+            isListeningRole = false
+            val dropped = AppEvents.lastSyncDroppedCount.value
+            syncMessage = when {
+                !success -> "Couldn't sync — make sure you're together"
+                dropped > 0 -> "Synced, but $dropped item${if (dropped == 1) "" else "s"} skipped — check both phones' clocks"
+                else -> "Synced! 💛"
+            }
+            if (success) lastSyncAt = ServiceLocator.settingsStore.current().lastSyncAt
+        }
+    }
+
     Scaffold(
         topBar = {
             CenterAlignedTopAppBar(
@@ -348,6 +381,31 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                             )
                         }
                     }
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+                SettingsRow(
+                    label = "Sync now",
+                    subtitle = syncMessage
+                        ?: if (lastSyncAt > 0) "Last synced ${settingsMinutesAgo(lastSyncAt)}m ago" else "Not synced yet"
+                ) {
+                    TextButton(
+                        onClick = {
+                            syncing = true
+                            isListeningRole = false
+                            syncMessage = null
+                            AppEvents.requestManualSync()
+                            // Same belt-and-suspenders timeout as OurListsScreen's button - see its own
+                            // doc for why this can't just wait on syncCompleted forever.
+                            syncCoroutineScope.launch {
+                                kotlinx.coroutines.delay(8_000)
+                                if (syncing && !isListeningRole) {
+                                    syncing = false
+                                    syncMessage = "Couldn't sync — make sure you're together"
+                                }
+                            }
+                        },
+                        enabled = !syncing
+                    ) { Text(if (syncing) "Syncing…" else "Sync now") }
                 }
                 Spacer(modifier = Modifier.height(4.dp))
                 SettingsRow(label = "Unpair this phone", subtitle = "Disconnects from your partner locally") {
@@ -537,6 +595,10 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
     }
 
 }
+
+/** Same one-line calc as OurListsScreen's own private minutesAgo - kept separate rather than shared
+ * since it's this trivial and each screen already keeps its own small helpers. */
+private fun settingsMinutesAgo(pastMillis: Long): Long = ((System.currentTimeMillis() - pastMillis) / 60000L).coerceAtLeast(0)
 
 @Composable
 private fun SettingsSection(title: String, content: @Composable ColumnScope.() -> Unit) {

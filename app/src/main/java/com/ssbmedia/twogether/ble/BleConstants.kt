@@ -24,6 +24,20 @@ import javax.crypto.spec.SecretKeySpec
  * GattSyncManager's class doc), NOT a static bearer token - a captured handshake response is worthless
  * replayed against a later connection, since the server issues a brand new random nonce every time a
  * device subscribes to the sync characteristic and only that exact nonce's HMAC is accepted.
+ *
+ * SECURITY (device-ID pinning): the handshake above only proves a connecting device knows OUR pairing
+ * code - it says nothing about WHICH device that is. Before this, a second couple who coincidentally
+ * landed on the same 6-digit code (1-in-a-million per pairing, non-negligible if many couples pair
+ * nearby around the same time - a crowded venue, say) would pass the handshake and sync data exactly
+ * like the real partner would, for as long as both phones kept running the background proximity
+ * service - not just once. PairingStore.pinPartnerDeviceIdIfAbsent + GattSyncManager.applyPayload's use
+ * of it now close most of that: the first sync after pairing pins whichever device we synced with as
+ * the trusted partner, and every later sync from a different device id is rejected outright. This is
+ * trust-on-first-use, not a full fix - if a colliding stranger's phone happens to win the race to be
+ * first to sync (needs matching code + BLE range + beating the real partner to it), that stranger gets
+ * pinned instead. Considered an acceptable residual risk for the same reason the rest of this file's
+ * gaps are: closing it completely would need a longer code and/or a manual confirm-on-first-connect
+ * step, out of scope for this pass.
  */
 object BleConstants {
     /** Shared by every Twogether install so the scanner can find any Twogether beacon at the OS filter level. */

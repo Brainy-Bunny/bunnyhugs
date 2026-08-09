@@ -2,6 +2,7 @@ package com.ssbmedia.twogether.audit
 
 import android.content.Context
 import com.ssbmedia.twogether.ble.GattSyncManager
+import com.ssbmedia.twogether.data.datastore.PairingStore
 import com.ssbmedia.twogether.data.datastore.SettingsStore
 import com.ssbmedia.twogether.data.db.AppDatabase
 import com.ssbmedia.twogether.data.db.DateIdeaDao
@@ -60,9 +61,14 @@ class GattSyncMergeSecurityAuditTest {
         // which needs a real Context - irrelevant here since none of the merge functions under test
         // read settingsStore at all.
         val settingsStore = mock(SettingsStore::class.java)
+        // Mocked for the same reason as settingsStore above - PairingStore's `info`/`lastConnection`
+        // properties eagerly touch context.pairingDs at construction time. Never stubbed/invoked by any
+        // test in this file (they only reflect into pure deserialize/validation helpers, never
+        // applyPayload itself).
+        val pairingStore = mock(PairingStore::class.java)
         return GattSyncManager(
             context, dateIdeaRepo, listCategoryRepo, sessionRepo, momentRepo,
-            momentNoteRepo, milestoneRepo, timeCapsuleRepo, settingsStore, CoroutineScope(Dispatchers.Unconfined)
+            momentNoteRepo, milestoneRepo, timeCapsuleRepo, settingsStore, pairingStore, CoroutineScope(Dispatchers.Unconfined)
         )
     }
 

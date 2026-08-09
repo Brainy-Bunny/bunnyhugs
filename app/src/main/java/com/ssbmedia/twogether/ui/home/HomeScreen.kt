@@ -69,6 +69,7 @@ import com.ssbmedia.twogether.ble.BlePermissions
 import com.ssbmedia.twogether.ble.ProximityStateMachine
 import com.ssbmedia.twogether.data.datastore.PairingInfo
 import com.ssbmedia.twogether.data.datastore.ProximityPersistedState
+import com.ssbmedia.twogether.data.db.Milestone
 import com.ssbmedia.twogether.data.db.Moment
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.events.AppEvents
@@ -156,6 +157,12 @@ class HomeViewModel : ViewModel() {
     val moments: StateFlow<List<Moment>> = ServiceLocator.momentRepository.observeAll()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    /** Feature: link a Moment's photo to a milestone - lets [MemoryThrowbackCard] show the occasion's
+     * name instead of a generic "a memory from X ago" caption when the randomly-picked photo happens to
+     * be one someone chose to link. See Milestone.linkedMomentSyncId's own doc. */
+    val milestones: StateFlow<List<Milestone>> = ServiceLocator.milestoneRepository.observeActive()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     // Picked once per Home visit (this ViewModel instance) — a simple "throwback" surface.
     val randomMoment: MutableStateFlow<Moment?> = MutableStateFlow(null)
 
@@ -198,6 +205,7 @@ fun HomeScreen(
     val proximityState by vm.proximityState.collectAsState()
     val moments by vm.moments.collectAsState()
     val randomMoment by vm.randomMoment.collectAsState()
+    val milestones by vm.milestones.collectAsState()
     val quickLinksOrder by vm.quickLinksOrder.collectAsState()
 
     val context = LocalContext.current
@@ -436,7 +444,10 @@ fun HomeScreen(
             }
             if (randomMoment != null) {
                 item {
-                    MemoryThrowbackCard(moment = randomMoment!!, now = now)
+                    val linkedMilestoneLabel = remember(randomMoment, milestones) {
+                        milestones.firstOrNull { it.linkedMomentSyncId == randomMoment!!.syncId }?.label
+                    }
+                    MemoryThrowbackCard(moment = randomMoment!!, now = now, milestoneLabel = linkedMilestoneLabel)
                 }
             }
             if (onThisDayInfo != null) {
@@ -782,7 +793,7 @@ private fun UsStatusCard(isTogether: Boolean, openSession: TogetherSession?, now
 }
 
 @Composable
-private fun MemoryThrowbackCard(moment: Moment, now: Long) {
+private fun MemoryThrowbackCard(moment: Moment, now: Long, milestoneLabel: String? = null) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.large,
@@ -800,8 +811,17 @@ private fun MemoryThrowbackCard(moment: Moment, now: Long) {
                     .padding(end = 0.dp)
             )
             Column(modifier = Modifier.padding(start = 12.dp)) {
-                Text("📸 A memory from ${timeAgo(moment.takenAt, now)}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                Text("A little throwback for you two 💛", style = MaterialTheme.typography.bodySmall)
+                // Feature: when this randomly-picked photo happens to be one linked to a milestone (see
+                // Milestone.linkedMomentSyncId's doc), name the actual occasion instead of the generic
+                // caption - "📸 Anniversary" says more than "📸 A memory from 40 weeks ago" when we
+                // genuinely know what the photo is of.
+                if (milestoneLabel != null) {
+                    Text("📸 $milestoneLabel", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text("From ${timeAgo(moment.takenAt, now)} 💛", style = MaterialTheme.typography.bodySmall)
+                } else {
+                    Text("📸 A memory from ${timeAgo(moment.takenAt, now)}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text("A little throwback for you two 💛", style = MaterialTheme.typography.bodySmall)
+                }
             }
         }
     }

@@ -440,6 +440,7 @@ object BackupManager {
                     put("createdAt", m.createdAt)
                     put("updatedAt", m.updatedAt)
                     put("deleted", m.deleted)
+                    put("linkedMomentSyncId", m.linkedMomentSyncId)
                 })
             }
         })
@@ -1309,7 +1310,11 @@ object BackupManager {
                 year = if (o.isNull("year")) null else o.optInt("year"),
                 createdAt = o.getLong("createdAt"),
                 updatedAt = updatedAt,
-                deleted = o.optBoolean("deleted", false)
+                deleted = o.optBoolean("deleted", false),
+                // Same "just a reference, never a path" reasoning as GattSyncManager.deserializeMilestones'
+                // matching field - an old backup made before this feature existed simply won't have this
+                // key, which isNull already treats identically to an explicit null.
+                linkedMomentSyncId = if (o.isNull("linkedMomentSyncId")) null else o.getString("linkedMomentSyncId")
             )
         }
     }

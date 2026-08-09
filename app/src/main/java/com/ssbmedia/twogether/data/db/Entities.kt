@@ -184,5 +184,16 @@ data class Milestone(
     val year: Int? = null,
     val createdAt: Long,
     val updatedAt: Long,
-    val deleted: Boolean = false
+    val deleted: Boolean = false,
+    /** Optional link to a Moment's photo (Moment.syncId) so this milestone can show a specific chosen
+     * memory instead of (or alongside) MilestoneRetrospective's auto-matched "same day, any year" gallery
+     * - see MilestonesScreen's AddMilestoneDialog for where this gets set. Deliberately just a syncId
+     * reference, not a copy of the photo itself: rides the exact same photo-transfer/local-file machinery
+     * Moments already have (GattSyncManager's Feature 2 phase, Moment.photoDownloaded/localPhotoFile) -
+     * resolving this to an actual displayable image always means looking up the referenced Moment, same
+     * as MilestoneRetrospective already does today, just by a specific syncId instead of a date match. Null
+     * means "no photo chosen"; a value that no longer resolves to any local Moment (partner deleted it, or
+     * we haven't received it yet) is treated as "no photo" too - see MilestonesScreen/HomeScreen's own
+     * resolution logic. */
+    val linkedMomentSyncId: String? = null
 )

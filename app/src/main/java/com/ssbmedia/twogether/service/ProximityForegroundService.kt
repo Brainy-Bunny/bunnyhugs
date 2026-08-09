@@ -97,6 +97,7 @@ class ProximityForegroundService : LifecycleService() {
             ServiceLocator.milestoneRepository,
             ServiceLocator.timeCapsuleRepository,
             ServiceLocator.settingsStore,
+            ServiceLocator.pairingStore,
             lifecycleScope
         )
 

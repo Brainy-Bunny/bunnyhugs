@@ -2,6 +2,7 @@ package com.ssbmedia.twogether.audit
 
 import com.ssbmedia.twogether.ble.GattSyncManager
 import com.ssbmedia.twogether.data.backup.BackupManager
+import com.ssbmedia.twogether.data.datastore.PairingStore
 import com.ssbmedia.twogether.data.datastore.SettingsStore
 import com.ssbmedia.twogether.data.db.AppDatabase
 import com.ssbmedia.twogether.data.db.DateIdeaDao
@@ -60,9 +61,10 @@ class UltimateReviewRound2SpecTest {
         val milestoneRepo = MilestoneRepository(mock(MilestoneDao::class.java))
         val timeCapsuleRepo = TimeCapsuleRepository(mock(TimeCapsuleDao::class.java))
         val settingsStore = mock(SettingsStore::class.java)
+        val pairingStore = mock(PairingStore::class.java)
         return GattSyncManager(
             context, dateIdeaRepo, listCategoryRepo, sessionRepo, momentRepo,
-            momentNoteRepo, milestoneRepo, timeCapsuleRepo, settingsStore, CoroutineScope(Dispatchers.Unconfined)
+            momentNoteRepo, milestoneRepo, timeCapsuleRepo, settingsStore, pairingStore, CoroutineScope(Dispatchers.Unconfined)
         )
     }
 

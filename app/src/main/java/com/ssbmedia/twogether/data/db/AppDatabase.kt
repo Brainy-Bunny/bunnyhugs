@@ -10,7 +10,7 @@ import java.util.UUID
 
 @Database(
     entities = [TogetherSession::class, DateIdea::class, TimeCapsule::class, Moment::class, MomentNote::class, Milestone::class, ListCategory::class],
-    version = 9,
+    version = 10,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -278,6 +278,18 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /** v9 -> v10 added Milestone.linkedMomentSyncId (see Entities.kt) - nullable with no backfill
+         * needed, since no pre-existing milestone could ever have had a photo link before this feature
+         * existed. Plain ADD COLUMN with no NOT NULL/DEFAULT (unlike every migration above it) is correct
+         * here specifically because the Kotlin field itself is nullable (`String? = null`) - Room's schema
+         * validation checks the column's nullability against the entity's, not against some other
+         * migration's pattern. */
+        val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE milestones ADD COLUMN linkedMomentSyncId TEXT")
+            }
+        }
+
         /**
          * Seeds the default "Date Ideas" list (id == DEFAULT_LIST_ID) for a genuinely BRAND-NEW install -
          * i.e. no pre-existing database file at all, so Room creates the schema fresh at the CURRENT
@@ -308,7 +320,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "twogether.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10)
                     .addCallback(SEED_DEFAULT_LIST_CALLBACK)
                     // Safety net only for a FUTURE schema version we didn't write a real migration for -
                     // the 1->2 and 2->3 paths above are always handled for real, so existing users'

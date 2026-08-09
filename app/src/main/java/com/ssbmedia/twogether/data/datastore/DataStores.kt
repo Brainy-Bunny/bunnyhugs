@@ -34,7 +34,14 @@ data class PairingInfo(
     val pairPlainCode: String? = null,
     val partnerName: String = "Your Person",
     val partnerEmoji: String = "💕",
-    val pairedAt: Long = 0L
+    val pairedAt: Long = 0L,
+    /** SECURITY: trust-on-first-use device pinning - see PairingStore.pinPartnerDeviceIdIfAbsent's doc
+     * and GattSyncManager.applyPayload's use of this. Null until the first sync after pairing completes;
+     * from then on, GattSyncManager refuses to merge a payload whose sender doesn't match this id. Closes
+     * the gap documented in BleConstants' file doc where the pairing code's 10^6 keyspace alone let any
+     * device that coincidentally lands on the same code be treated as "the partner" for every future
+     * connection, not just once. */
+    val pinnedPartnerDeviceId: String? = null
 ) {
     val isPaired: Boolean get() = !pairSecretHash.isNullOrBlank()
 }
@@ -59,6 +66,8 @@ class PairingStore(private val context: Context) {
         val PARTNER_NAME = stringPreferencesKey("partner_name")
         val PARTNER_EMOJI = stringPreferencesKey("partner_emoji")
         val PAIRED_AT = longPreferencesKey("paired_at")
+        val PINNED_PARTNER_DEVICE_ID = stringPreferencesKey("pinned_partner_device_id")
+        val LAST_PINNED_PARTNER_DEVICE_ID = stringPreferencesKey("last_pinned_partner_device_id")
 
         // "Last connection" snapshot - deliberately stored under different key names in the same
         // pairingDs file (rather than a separate DataStore) so unpair() can move the active-> last
@@ -76,7 +85,8 @@ class PairingStore(private val context: Context) {
             pairPlainCode = p[Keys.PLAIN_CODE],
             partnerName = p[Keys.PARTNER_NAME] ?: "Your Person",
             partnerEmoji = p[Keys.PARTNER_EMOJI] ?: "💕",
-            pairedAt = p[Keys.PAIRED_AT] ?: 0L
+            pairedAt = p[Keys.PAIRED_AT] ?: 0L,
+            pinnedPartnerDeviceId = p[Keys.PINNED_PARTNER_DEVICE_ID]
         )
     }
 
@@ -106,6 +116,10 @@ class PairingStore(private val context: Context) {
             p[Keys.PARTNER_NAME] = partnerName.trim().ifBlank { "Your Person" }
             p[Keys.PARTNER_EMOJI] = partnerEmoji.ifBlank { "💕" }
             p[Keys.PAIRED_AT] = System.currentTimeMillis()
+            // A brand new pairing (even re-pairing with the same code by coincidence) must start with no
+            // pin, so the first real sync under THIS pairing is what does the pinning - never inherit a
+            // pin left over from whatever pairing (if any) was active before.
+            p.remove(Keys.PINNED_PARTNER_DEVICE_ID)
             p.remove(Keys.LAST_SECRET_HASH)
             p.remove(Keys.LAST_PLAIN_CODE)
             p.remove(Keys.LAST_PARTNER_NAME)
@@ -128,12 +142,19 @@ class PairingStore(private val context: Context) {
                 p[Keys.LAST_PARTNER_NAME] = p[Keys.PARTNER_NAME] ?: "Your Person"
                 p[Keys.LAST_PARTNER_EMOJI] = p[Keys.PARTNER_EMOJI] ?: "💕"
                 p[Keys.LAST_UNPAIRED_AT] = System.currentTimeMillis()
+                // Snapshotted alongside the rest of the "last connection" info (rather than dropped) so
+                // reconnectToLast() below can restore it too - it's still valid against that exact same
+                // secretHash, and re-pinning it means a quick "Reconnect to X" doesn't reopen the
+                // first-sync collision window this pin exists to close.
+                val pinned = p[Keys.PINNED_PARTNER_DEVICE_ID]
+                if (!pinned.isNullOrBlank()) p[Keys.LAST_PINNED_PARTNER_DEVICE_ID] = pinned else p.remove(Keys.LAST_PINNED_PARTNER_DEVICE_ID)
             }
             p.remove(Keys.SECRET_HASH)
             p.remove(Keys.PLAIN_CODE)
             p.remove(Keys.PARTNER_NAME)
             p.remove(Keys.PARTNER_EMOJI)
             p.remove(Keys.PAIRED_AT)
+            p.remove(Keys.PINNED_PARTNER_DEVICE_ID)
         }
     }
 
@@ -150,6 +171,22 @@ class PairingStore(private val context: Context) {
             p[Keys.PARTNER_NAME] = p[Keys.LAST_PARTNER_NAME] ?: "Your Person"
             p[Keys.PARTNER_EMOJI] = p[Keys.LAST_PARTNER_EMOJI] ?: "💕"
             p[Keys.PAIRED_AT] = System.currentTimeMillis()
+            val lastPinned = p[Keys.LAST_PINNED_PARTNER_DEVICE_ID]
+            if (!lastPinned.isNullOrBlank()) p[Keys.PINNED_PARTNER_DEVICE_ID] = lastPinned else p.remove(Keys.PINNED_PARTNER_DEVICE_ID)
+        }
+    }
+
+    /** SECURITY: trust-on-first-use device pinning - see [PairingInfo.pinnedPartnerDeviceId]'s doc for
+     * why this exists. Called by GattSyncManager.applyPayload right after the FIRST sync under the
+     * current pairing completes successfully; a no-op (first writer wins) on every call after that, so a
+     * later same-code collision can never overwrite an already-established pin. */
+    suspend fun pinPartnerDeviceIdIfAbsent(deviceId: String) {
+        if (deviceId.isBlank()) return
+        context.pairingDs.edit { p ->
+            if (p[Keys.SECRET_HASH].isNullOrBlank()) return@edit
+            if (p[Keys.PINNED_PARTNER_DEVICE_ID].isNullOrBlank()) {
+                p[Keys.PINNED_PARTNER_DEVICE_ID] = deviceId
+            }
         }
     }
 

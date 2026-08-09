@@ -578,7 +578,7 @@ class MilestoneRepository(private val dao: MilestoneDao) {
     fun observeActive(): Flow<List<Milestone>> = dao.observeActive()
     suspend fun getAll(): List<Milestone> = dao.getAll()
 
-    suspend fun add(label: String, month: Int, day: Int, year: Int?): Milestone {
+    suspend fun add(label: String, month: Int, day: Int, year: Int?, linkedMomentSyncId: String? = null): Milestone {
         val now = System.currentTimeMillis()
         val milestone = Milestone(
             id = UUID.randomUUID().toString(),
@@ -587,7 +587,8 @@ class MilestoneRepository(private val dao: MilestoneDao) {
             day = day,
             year = year,
             createdAt = now,
-            updatedAt = now
+            updatedAt = now,
+            linkedMomentSyncId = linkedMomentSyncId
         )
         dao.upsert(milestone)
         return milestone
@@ -595,6 +596,15 @@ class MilestoneRepository(private val dao: MilestoneDao) {
 
     suspend fun delete(milestone: Milestone) {
         dao.upsert(milestone.copy(deleted = true, updatedAt = System.currentTimeMillis()))
+    }
+
+    /** Changes (or clears, if [linkedMomentSyncId] is null) an already-existing milestone's linked photo -
+     * see Milestone.linkedMomentSyncId's own doc. Same whole-row dao.upsert() shape as [delete] above;
+     * milestones have no concurrent-field-clobber race to guard against the way TimeCapsule/Moment do (no
+     * OTHER field here is ever mutated independently by a background process the way e.g. unlockedAt is -
+     * see TimeCapsuleDao.tombstone's doc for that contrast), so a plain copy+upsert is correct as-is. */
+    suspend fun setLinkedMoment(milestone: Milestone, linkedMomentSyncId: String?) {
+        dao.upsert(milestone.copy(linkedMomentSyncId = linkedMomentSyncId, updatedAt = System.currentTimeMillis()))
     }
 
     /** Union+tombstone merge by id + updatedAt, same LWW shape as DateIdeaRepository.mergeRemote - these
