@@ -635,16 +635,27 @@ class ProximityForegroundService : LifecycleService() {
         val handshakeKey = BleConstants.deriveBytesFromHexHash(secretHash, BleConstants.HANDSHAKE_TOKEN_HEX_OFFSET, BleConstants.HANDSHAKE_TOKEN_BYTES)
 
         val onResult: (Boolean) -> Unit = { success ->
+            // MINOR fix (test-code-allmodels round 3, Opus - unfixed twin of the STATE_ON receiver's own
+            // fix this same round): this was the one lifecycleScope.launch in this file still missing a
+            // try/catch, despite that fix's own comment claiming to have closed "the one" - setLastSyncAt
+            // is a DataStore edit{}, which throws IOException on a real write failure (disk full,
+            // transient FS error); with no CoroutineExceptionHandler on this scope, that would crash this
+            // START_STICKY service on every completed sync attempt while the failure persists - the exact
+            // crash-loop shape every other launch in this file already guards against.
             lifecycleScope.launch {
-                if (success) ServiceLocator.settingsStore.setLastSyncAt(System.currentTimeMillis())
-                // MINOR fix (H): always emit (not just for manual=true triggers) - Date Ideas screen's
-                // "Last synced Xm ago" should refresh after ANY sync that actually completed, including
-                // the 15-minute periodic catch-all, not just a manual "Sync now" tap. Harmless when
-                // nothing is collecting (MutableSharedFlow just buffers/drops).
-                // MAJOR fix (ultimate-app-review, Fable F-4, assertion 6): a successful merge can still
-                // have dropped rows as implausible - report the count so the UI doesn't say an
-                // unqualified "Synced!" over real, silent data loss.
-                AppEvents.emitSyncCompleted(success, if (success) gattSync.lastSyncDroppedImplausibleCount else 0)
+                try {
+                    if (success) ServiceLocator.settingsStore.setLastSyncAt(System.currentTimeMillis())
+                    // MINOR fix (H): always emit (not just for manual=true triggers) - Date Ideas screen's
+                    // "Last synced Xm ago" should refresh after ANY sync that actually completed, including
+                    // the 15-minute periodic catch-all, not just a manual "Sync now" tap. Harmless when
+                    // nothing is collecting (MutableSharedFlow just buffers/drops).
+                    // MAJOR fix (ultimate-app-review, Fable F-4, assertion 6): a successful merge can still
+                    // have dropped rows as implausible - report the count so the UI doesn't say an
+                    // unqualified "Synced!" over real, silent data loss.
+                    AppEvents.emitSyncCompleted(success, if (success) gattSync.lastSyncDroppedImplausibleCount else 0)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to persist lastSyncAt / emit sync-completed event - continuing rather than crashing the service", e)
+                }
             }
         }
 

@@ -1150,7 +1150,12 @@ object BackupManager {
         // previously indistinguishable when multiple capsules were rejected from the same restore).
         val syncIdForLogging = o.optStringOrNull("syncId")?.takeIf { it.isNotBlank() } ?: "(no syncId)"
         val unlockAtHours = o.getDouble("unlockAtHours").toFloat()
-        if (!unlockAtHours.isFinite() || unlockAtHours <= 0f || unlockAtHours > TimeCapsuleRepository.MAX_UNLOCK_AT_HOURS) {
+        // MINOR fix (test-code-allmodels round 3, Haiku): this still hand-wrote the bound predicate
+        // inline after the shared TimeCapsuleRepository.isPlausibleUnlockAtHours/
+        // isPlausibleManualHoursAtCreation functions were extracted - GattSyncManager's wire path was
+        // updated to call them, this backup path was missed, exactly the drift-risk the extraction was
+        // meant to close.
+        if (!TimeCapsuleRepository.isPlausibleUnlockAtHours(unlockAtHours)) {
             Log.w(TAG, "Rejecting implausible time capsule from backup: $syncIdForLogging unlockAtHours=$unlockAtHours")
             return@mapNotNull null
         }
@@ -1167,7 +1172,7 @@ object BackupManager {
         // instant false unlock purely from a crafted backup file, or (a non-finite value) persists a row
         // that then makes every future serializeTimeCapsules() call throw and crash-loop the sync path.
         val manualHoursAtCreation = o.optDouble("manualHoursAtCreation", 0.0).toFloat()
-        if (!manualHoursAtCreation.isFinite() || manualHoursAtCreation < 0f || manualHoursAtCreation > TimeCapsuleRepository.MAX_MANUAL_HOURS_AT_CREATION) {
+        if (!TimeCapsuleRepository.isPlausibleManualHoursAtCreation(manualHoursAtCreation)) {
             Log.w(TAG, "Rejecting implausible time capsule from backup: $syncIdForLogging manualHoursAtCreation=$manualHoursAtCreation")
             return@mapNotNull null
         }
