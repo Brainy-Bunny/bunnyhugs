@@ -275,7 +275,12 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
             syncing = false
             isListeningRole = false
             val dropped = AppEvents.lastSyncDroppedCount.value
+            // MAJOR fix (ultimate-app-review round 1, Opus+Sonnet) - same reasoning as OurListsScreen's
+            // matching fix: distinguish a pinned-partner mismatch from the generic "not together" failure,
+            // since it's the one failure reason with an actual fix the user can take.
             syncMessage = when {
+                !success && AppEvents.lastSyncFailedDueToPartnerMismatch.value ->
+                    "Couldn't sync — this phone doesn't match your paired partner. Unpair, then create a new pairing code to reconnect."
                 !success -> "Couldn't sync — make sure you're together"
                 dropped > 0 -> "Synced, but $dropped item${if (dropped == 1) "" else "s"} skipped — check both phones' clocks"
                 else -> "Synced! 💛"

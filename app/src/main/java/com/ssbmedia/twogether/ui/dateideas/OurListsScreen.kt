@@ -191,7 +191,15 @@ fun OurListsScreen(onBack: () -> Unit) {
             // would hide real, silent data loss from the person who'd want to know their partner's
             // clock might be off.
             val dropped = AppEvents.lastSyncDroppedCount.value
+            // MAJOR fix (ultimate-app-review round 1, Opus+Sonnet): both independently live-reproduced a
+            // permanent sync lockout after a partner reinstall, with the generic "make sure you're
+            // together" message actively misleading the user (the devices really were together and really
+            // did connect) - see GattSyncManager.lastSyncFailedDueToPartnerMismatch's doc. This is the one
+            // failure reason worth distinguishing here, since it's the one with an actual fix the user can
+            // take (every other failure reason - not together, timeout - really is just "try again later").
             syncMessage = when {
+                !success && AppEvents.lastSyncFailedDueToPartnerMismatch.value ->
+                    "Couldn't sync — this phone doesn't match your paired partner. Unpair, then create a new pairing code to reconnect."
                 !success -> "Couldn't sync — make sure you're together"
                 dropped > 0 -> "Synced, but $dropped item${if (dropped == 1) "" else "s"} skipped — check both phones' clocks"
                 else -> "Synced! 💛"

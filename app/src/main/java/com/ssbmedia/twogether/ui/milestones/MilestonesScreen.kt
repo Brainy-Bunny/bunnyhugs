@@ -3,7 +3,6 @@ package com.ssbmedia.twogether.ui.milestones
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,8 +15,11 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -69,7 +71,11 @@ import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.notif.MilestoneAlarmScheduler
 import com.ssbmedia.twogether.ui.components.EmptyState
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.io.File
@@ -85,6 +91,19 @@ class MilestonesViewModel : ViewModel() {
     val milestones = ServiceLocator.milestoneRepository.observeActive()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val moments = ServiceLocator.momentRepository.observeAll()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    /** MAJOR fix (ultimate-app-review round 1, Opus): AddMilestoneDialog/EditMilestonePhotoDialog used to
+     * run this exact photoDownloaded+File.isFile filter directly inside composition, over the FULL moments
+     * list, on every recomposition - measured at 4-6s of main-thread blocking and 200+ skipped frames at a
+     * realistic (1000+) photo library, the same "blocking disk I/O on Main" mistake
+     * HomeViewModel.pickRandomMomentIfNeeded already explicitly guards against elsewhere in this app (see
+     * its own withContext(Dispatchers.IO) comment). Filtering here instead - off Dispatchers.IO, cached in
+     * a StateFlow - makes both dialogs' own filtering free; see MomentPhotoPicker's LazyRow fix for the
+     * other half of this (avoiding eagerly composing every result, not just avoiding I/O on Main). */
+    val availableMoments: StateFlow<List<Moment>> = moments
+        .map { list -> list.filter { it.photoDownloaded && File(it.photoUri).isFile }.sortedByDescending { it.takenAt } }
+        .flowOn(Dispatchers.IO)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     fun add(context: android.content.Context, label: String, month: Int, day: Int, year: Int?, linkedMomentSyncId: String?) {
@@ -120,6 +139,7 @@ class MilestonesViewModel : ViewModel() {
 fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onInitialMilestoneConsumed: () -> Unit = {}) {
     val vm: MilestonesViewModel = viewModel(factory = SimpleViewModelFactory { MilestonesViewModel() })
     val milestones by vm.milestones.collectAsState()
+    val availableMoments by vm.availableMoments.collectAsState()
     val moments by vm.moments.collectAsState()
     val context = LocalContext.current
     val zone = remember { ZoneId.systemDefault() }
@@ -239,7 +259,7 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onI
 
     if (showAddDialog) {
         AddMilestoneDialog(
-            moments = moments,
+            availableMoments = availableMoments,
             onDismiss = { showAddDialog = false },
             onAdd = { label, month, day, year, linkedMomentSyncId ->
                 vm.add(context, label, month, day, year, linkedMomentSyncId)
@@ -265,7 +285,7 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onI
     editingPhotoFor?.let { milestone ->
         EditMilestonePhotoDialog(
             milestone = milestone,
-            moments = moments,
+            availableMoments = availableMoments,
             onDismiss = { editingPhotoFor = null },
             onSave = { linkedMomentSyncId ->
                 vm.setLinkedMoment(milestone, linkedMomentSyncId)
@@ -277,7 +297,7 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onI
 
 @Composable
 private fun AddMilestoneDialog(
-    moments: List<Moment>,
+    availableMoments: List<Moment>,
     onDismiss: () -> Unit,
     onAdd: (label: String, month: Int, day: Int, year: Int?, linkedMomentSyncId: String?) -> Unit
 ) {
@@ -288,11 +308,6 @@ private fun AddMilestoneDialog(
     var yearText by remember { mutableStateOf("") }
     var monthMenuExpanded by remember { mutableStateOf(false) }
     var selectedMomentSyncId by remember { mutableStateOf<String?>(null) }
-    // Same photoDownloaded+file-exists gate as MilestoneRetrospective/the milestone-card thumbnail below -
-    // only ever offer a photo this device can actually display right now.
-    val availableMoments = remember(moments) {
-        moments.filter { it.photoDownloaded && File(it.photoUri).isFile }.sortedByDescending { it.takenAt }
-    }
 
     val day = dayText.toIntOrNull()
     val maxDay = remember(month) { YearMonth.of(2024, month).lengthOfMonth() } // 2024 is a leap year, so Feb 29 is always offered
@@ -383,15 +398,26 @@ private fun MomentPhotoPicker(availableMoments: List<Moment>, selectedMomentSync
         style = MaterialTheme.typography.bodyMedium,
         modifier = Modifier.padding(top = 16.dp, bottom = 6.dp)
     )
-    Row(
-        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+    // MAJOR fix (ultimate-app-review round 1, Opus): was a plain Row(...horizontalScroll...).forEach,
+    // which composed EVERY available photo eagerly regardless of scroll visibility - measured at
+    // seconds of main-thread blocking and hundreds of skipped frames at a realistic (1000+) photo
+    // library. LazyRow only composes what's actually on/near screen; see
+    // MilestonesViewModel.availableMoments' fix for the other half (the I/O filter this list already
+    // arrives pre-filtered from, off Main).
+    LazyRow(
+        modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        availableMoments.forEach { moment ->
+        itemsIndexed(availableMoments, key = { _, m -> m.syncId }) { index, moment ->
             val selected = moment.syncId == selectedMomentSyncId
+            // MINOR a11y fix (ultimate-app-review round 1, Opus): every thumbnail used to share the
+            // identical contentDescription "Pick this photo" with selection expressed only as a visual
+            // border, so a screen reader announced N indistinguishable buttons with no selected state.
+            // `selectable` reports the selected state to accessibility services itself; the index-based
+            // description at least distinguishes which photo is which.
             AsyncImage(
                 model = moment.photoUri,
-                contentDescription = "Pick this photo",
+                contentDescription = "Photo ${index + 1} of ${availableMoments.size}",
                 contentScale = ContentScale.Crop,
                 modifier = Modifier
                     .size(56.dp)
@@ -401,7 +427,7 @@ private fun MomentPhotoPicker(availableMoments: List<Moment>, selectedMomentSync
                         color = MaterialTheme.colorScheme.primary,
                         shape = RoundedCornerShape(10.dp)
                     )
-                    .clickable { onSelect(if (selected) null else moment.syncId) }
+                    .selectable(selected = selected) { onSelect(if (selected) null else moment.syncId) }
             )
         }
     }
@@ -413,10 +439,42 @@ private fun MomentPhotoPicker(availableMoments: List<Moment>, selectedMomentSync
  * supported anywhere else in this screen either, so adding it here would be scope beyond what this fix
  * needs. */
 @Composable
-private fun EditMilestonePhotoDialog(milestone: Milestone, moments: List<Moment>, onDismiss: () -> Unit, onSave: (linkedMomentSyncId: String?) -> Unit) {
+private fun EditMilestonePhotoDialog(milestone: Milestone, availableMoments: List<Moment>, onDismiss: () -> Unit, onSave: (linkedMomentSyncId: String?) -> Unit) {
+    // MAJOR fix (ultimate-app-review round 1, both reviewers independently found this): was
+    // `mutableStateOf(milestone.linkedMomentSyncId)` unconditionally - if the linked Moment had since been
+    // deleted (or its photo bytes aren't downloaded on this device), that syncId doesn't match anything in
+    // availableMoments, so the picker rendered with NOTHING visibly selected even though a link still
+    // existed - indistinguishable from "no link" in the UI, with no way to deliberately clear it (clearing
+    // requires tapping the currently-selected thumbnail, and nothing was selected). Worse, tapping Save
+    // with no changes re-persisted that same dangling id, permanently. Clearing it only once we've
+    // positively confirmed it doesn't resolve means: a resolvable link still shows selected as before, and
+    // a dangling one now honestly shows nothing selected AND Save correctly clears it (the self-healing
+    // outcome this milestone should have anyway, since the linked photo is gone).
     var selectedMomentSyncId by remember(milestone.id) { mutableStateOf(milestone.linkedMomentSyncId) }
-    val availableMoments = remember(moments) {
-        moments.filter { it.photoDownloaded && File(it.photoUri).isFile }.sortedByDescending { it.takenAt }
+    var hadDanglingLink by remember(milestone.id) { mutableStateOf(false) }
+    // MAJOR fix (ultimate-app-review round 2, Opus): the ABOVE two lines used to be a single
+    // `remember(milestone.id) { mutableStateOf(milestone.linkedMomentSyncId?.takeIf { availableMoments.any
+    // {...} }) }` - deciding dangling-or-not from whatever availableMoments happened to hold on the
+    // dialog's FIRST composition. availableMoments is a StateFlow seeded with emptyList() and filled
+    // asynchronously off Dispatchers.IO (see MilestonesViewModel.availableMoments' own doc) - at a
+    // realistic library size (live-reproduced at 8000 photos) the dialog's first frame can render before
+    // that IO-dispatched filter has ever emitted a real value, so a perfectly VALID link was
+    // indistinguishable from a dangling one at that instant, got permanently locked in as "not selected"
+    // by the one-shot remember, and a no-touch Save then silently destroyed a link that was never actually
+    // broken. This LaunchedEffect instead only ever CLEARS the selection - and only once, guarded by
+    // hadDanglingLink - the moment availableMoments has genuinely loaded something (isNotEmpty()) and that
+    // something still doesn't include this link. Until that first non-empty emission arrives, the link
+    // stays exactly as passed in, so a fast Save during the loading window persists the correct
+    // (unresolved-but-not-actually-dangling) value instead of guessing wrong. A user who has since picked
+    // a DIFFERENT photo is never affected - onSelect always sets selectedMomentSyncId to an id that's
+    // already a member of the current availableMoments, so this effect's condition can't fire for it.
+    LaunchedEffect(milestone.id, availableMoments) {
+        if (!hadDanglingLink && selectedMomentSyncId != null && availableMoments.isNotEmpty() &&
+            availableMoments.none { it.syncId == selectedMomentSyncId }
+        ) {
+            selectedMomentSyncId = null
+            hadDanglingLink = true
+        }
     }
 
     AlertDialog(
@@ -424,9 +482,20 @@ private fun EditMilestonePhotoDialog(milestone: Milestone, moments: List<Moment>
         title = { Text("Photo for \"${milestone.label}\"") },
         text = {
             Column {
+                if (hadDanglingLink) {
+                    Text(
+                        "This milestone's photo isn't available anymore — pick a new one, or tap Save to clear it.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+                }
                 if (availableMoments.isEmpty()) {
                     Text(
-                        "No photos to choose from yet - take one in Moments first.",
+                        // MINOR fix (ultimate-app-review round 1, both reviewers): was a plain hyphen -
+                        // every other user-facing string in this file (and most of the app) uses an em
+                        // dash for this kind of aside.
+                        "No photos to choose from yet — take one in Moments first.",
                         style = MaterialTheme.typography.bodyMedium
                     )
                 } else {

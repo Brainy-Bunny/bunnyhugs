@@ -612,12 +612,29 @@ class MilestoneRepository(private val dao: MilestoneDao) {
      * BUG fix: returns what was actually upserted (was Unit) - an independent audit round found that
      * unlike every OTHER way a Milestone enters the DB (a local add, a backup restore, app start, boot),
      * a milestone arriving via THIS path never got its yearly alarm armed at all until the next cold
-     * start - see this function's caller in GattSyncManager for the actual fix. */
-    suspend fun mergeRemote(remote: List<Milestone>): List<Milestone> {
+     * start - see this function's caller in GattSyncManager for the actual fix.
+     *
+     * BLOCKER fix (ultimate-app-review round 1, Opus): [missingLinkedMomentField] is the id set of any
+     * remote row whose wire payload had no "linkedMomentSyncId" key at all (a pre-this-commit partner
+     * build echoing the milestone back unmodified) - GattSyncManager.deserializeMilestones can no longer
+     * tell that apart from an explicit clear, so it deserializes both to null. Without this, a whole-row
+     * LWW win by that echoed row (the common case, since the sender didn't touch updatedAt) would
+     * silently null out a link the LOCAL user had just set, with zero user action and zero error. For
+     * exactly those ids, this function keeps the local linkedMomentSyncId instead of trusting the remote's
+     * null - every other field on the row (label/month/day/updatedAt/deleted) still comes from the remote
+     * as normal, so an explicit clear from a same-build partner (key present, value null) is unaffected
+     * and still wins on LWW like any other field change.
+     *
+     * MINOR fix (ultimate-app-review round 2, Opus): [missingLinkedMomentField] no longer defaults to
+     * emptySet() - there is exactly one production caller (GattSyncManager, already explicit) plus this
+     * class's own test suite, so the default bought nothing except letting a FUTURE second caller forget
+     * the argument and silently reintroduce round 1's BLOCKER with no compile error. */
+    suspend fun mergeRemote(remote: List<Milestone>, missingLinkedMomentField: Set<String>): List<Milestone> {
         val local = dao.getAll().associateBy { it.id }
-        val toUpsert = remote.filter { r ->
+        val toUpsert = remote.mapNotNull { r ->
             val l = local[r.id]
-            l == null || r.updatedAt > l.updatedAt
+            if (l != null && r.updatedAt <= l.updatedAt) return@mapNotNull null
+            if (l != null && r.id in missingLinkedMomentField) r.copy(linkedMomentSyncId = l.linkedMomentSyncId) else r
         }
         if (toUpsert.isNotEmpty()) dao.upsertAll(toUpsert)
         return toUpsert

@@ -40,8 +40,18 @@ object AppEvents {
     private val _lastSyncDroppedCount = MutableStateFlow(0)
     val lastSyncDroppedCount: StateFlow<Int> = _lastSyncDroppedCount.asStateFlow()
 
-    fun emitSyncCompleted(success: Boolean, droppedCount: Int = 0) {
+    /** MAJOR fix (ultimate-app-review round 1, Opus+Sonnet): true when the most recent completed sync
+     * failed specifically because the sender's device id didn't match this pairing's pinned partner (see
+     * GattSyncManager.lastSyncFailedDueToPartnerMismatch's own doc for the reinstall-lockout scenario this
+     * exists to surface) - as opposed to any other failure (not together, timeout, malformed payload).
+     * Same read-right-before-emit pattern as [lastSyncDroppedCount] above, so Settings/OurListsScreen can
+     * show an actionable message instead of the generic "make sure you're together" text. */
+    private val _lastSyncFailedDueToPartnerMismatch = MutableStateFlow(false)
+    val lastSyncFailedDueToPartnerMismatch: StateFlow<Boolean> = _lastSyncFailedDueToPartnerMismatch.asStateFlow()
+
+    fun emitSyncCompleted(success: Boolean, droppedCount: Int = 0, partnerMismatch: Boolean = false) {
         _lastSyncDroppedCount.value = droppedCount
+        _lastSyncFailedDueToPartnerMismatch.value = partnerMismatch
         _syncCompleted.tryEmit(success)
     }
 

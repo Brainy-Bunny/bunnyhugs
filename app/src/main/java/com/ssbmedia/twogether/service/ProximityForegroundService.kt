@@ -653,7 +653,14 @@ class ProximityForegroundService : LifecycleService() {
                     // MAJOR fix (ultimate-app-review, Fable F-4, assertion 6): a successful merge can still
                     // have dropped rows as implausible - report the count so the UI doesn't say an
                     // unqualified "Synced!" over real, silent data loss.
-                    AppEvents.emitSyncCompleted(success, if (success) gattSync.lastSyncDroppedImplausibleCount else 0)
+                    // MAJOR fix (ultimate-app-review round 1, Opus+Sonnet): surface WHY a failed sync
+                    // failed when it was specifically a pinned-partner mismatch, so the UI can point the
+                    // user at the fix (unpair + fresh code) instead of the misleading generic message.
+                    AppEvents.emitSyncCompleted(
+                        success,
+                        if (success) gattSync.lastSyncDroppedImplausibleCount else 0,
+                        if (!success) gattSync.lastSyncFailedDueToPartnerMismatch else false
+                    )
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to persist lastSyncAt / emit sync-completed event - continuing rather than crashing the service", e)
                 }

@@ -197,7 +197,12 @@ interface MilestoneDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertAll(milestones: List<Milestone>)
 
-    @Query("SELECT * FROM milestones WHERE deleted = 0 ORDER BY month ASC, day ASC")
+    // MINOR fix (ultimate-app-review round 1, Opus): `id` tiebreak added - upsert() is @Insert(REPLACE),
+    // which is a delete+reinsert (not an UPDATE) under the hood, so a plain "month, day" ORDER BY had no
+    // guaranteed order between two milestones sharing the same month/day once one of them was rewritten
+    // (e.g. an unrelated setLinkedMoment() photo-only edit) - the edited card could visibly jump position
+    // in the list even though nothing date-related changed. The id tiebreak makes ordering deterministic.
+    @Query("SELECT * FROM milestones WHERE deleted = 0 ORDER BY month ASC, day ASC, id ASC")
     fun observeActive(): Flow<List<Milestone>>
 
     @Query("SELECT * FROM milestones")

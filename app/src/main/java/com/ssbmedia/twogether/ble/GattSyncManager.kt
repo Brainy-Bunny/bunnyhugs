@@ -167,6 +167,13 @@ class GattSyncManager(
      * the sender's per-moment syncId/hasPhoto/takenAt snapshot (Feature 2) so the caller can decide what
      * photo bytes to push/request next, without re-parsing the raw bytes a second time. */
     private suspend fun applyPayload(bytes: ByteArray): List<RemoteMomentInfo> {
+        // MAJOR fix (ultimate-app-review round 1, Opus+Sonnet; placement corrected round 2, Opus): reset
+        // at the true FIRST line of every attempt, before anything below that can throw (device-id
+        // lookup, JSON parsing) - round 2 live-caught a real JSONTokener.syntaxError thrown from the JSON
+        // parse below with the reset still sitting after it, so a mismatch flagged by one attempt was
+        // still `true` when a LATER attempt failed for an unrelated reason (a malformed/truncated
+        // payload), and the UI told the user to unpair over what was actually a transfer/parse failure.
+        lastSyncFailedDueToPartnerMismatch = false
         val deviceId = settingsStore.getOrCreateLocalDeviceId()
         val root = JSONObject(String(bytes, Charsets.UTF_8))
         // SECURITY: trust-on-first-use device pinning (see PairingInfo.pinnedPartnerDeviceId's doc for
@@ -182,6 +189,14 @@ class GattSyncManager(
         val pinnedPartnerDeviceId = pairingStore.current().pinnedPartnerDeviceId
         if (!pinnedPartnerDeviceId.isNullOrBlank() && senderDeviceId.isNotBlank() && senderDeviceId != pinnedPartnerDeviceId) {
             Log.w(TAG, "Rejecting sync payload: sender device id did not match this pairing's pinned partner")
+            // MAJOR fix (ultimate-app-review round 1, Opus+Sonnet): both independently live-reproduced a
+            // permanent, one-directional sync lockout after a partner reinstall (fresh local device id) -
+            // the ONLY feedback was the generic "Couldn't sync - make sure you're together" message, which
+            // is actively misleading (the devices WERE together and connecting) and points the user at
+            // nothing useful, since the prominent "Reconnect to X" post-unpair button just restores this
+            // same stale pin and fails again. Flagging the reason here lets the UI say something the user
+            // can actually act on (see lastSyncFailedDueToPartnerMismatch's doc + Settings/OurListsScreen).
+            lastSyncFailedDueToPartnerMismatch = true
             throw SecurityException("Sync payload sender did not match pinned partner device")
         }
         // MAJOR fix (ultimate-app-review, Fable F-4): isPlausibleWireUpdatedAt rejects anything more
@@ -236,8 +251,8 @@ class GattSyncManager(
         // Arms only what was actually upserted here, not the whole table, for the same reason
         // BackupManager.scheduleAll is only ever called once per restore rather than on every sync.
         val milestonesArr = root.optJSONArray("milestones")
-        val milestonesParsed = deserializeMilestones(milestonesArr, peerClockOffsetMillis)
-        val upsertedMilestones = milestoneRepository.mergeRemote(milestonesParsed)
+        val (milestonesParsed, milestonesMissingLinkedMomentField) = deserializeMilestones(milestonesArr, peerClockOffsetMillis)
+        val upsertedMilestones = milestoneRepository.mergeRemote(milestonesParsed, milestonesMissingLinkedMomentField)
         MilestoneAlarmScheduler.scheduleAll(context, upsertedMilestones.filter { !it.deleted })
         // Feature: Time Capsule sync. See TimeCapsuleRepository.mergeRemote's doc for why unlockedAt is
         // never trusted from this parsed data even though the definitional fields are.
@@ -273,6 +288,19 @@ class GattSyncManager(
      * own coroutine but read from the completion callback's context. */
     @Volatile
     var lastSyncDroppedImplausibleCount: Int = 0
+        private set
+
+    /** MAJOR fix (ultimate-app-review round 1, Opus+Sonnet): set (and reset) at the start of every
+     * [applyPayload] call, true only if THIS attempt was specifically rejected by the device-pinning
+     * check above - as opposed to any other sync failure (not together, timeout, malformed payload).
+     * Read by [ProximityForegroundService] right before it emits the sync-completion event, same
+     * read-right-before-emit pattern as [lastSyncDroppedImplausibleCount] above, so the UI can show a
+     * message the user can actually act on (unpair + fresh code) instead of the generic
+     * "make sure you're together" text, which is actively misleading for this specific failure - the
+     * devices really were together and really did connect. `@Volatile` for the same cross-coroutine
+     * read/write reason as lastSyncDroppedImplausibleCount. */
+    @Volatile
+    var lastSyncFailedDueToPartnerMismatch: Boolean = false
         private set
 
     private fun serializeDateIdeas(ideas: List<DateIdea>): JSONArray {
@@ -544,9 +572,14 @@ class GattSyncManager(
         return arr
     }
 
-    private fun deserializeMilestones(arr: JSONArray?, peerClockOffsetMillis: Long = 0L): List<Milestone> {
-        if (arr == null) return emptyList()
-        return (0 until arr.length()).mapNotNull { i ->
+    /** Returns the deserialized milestones alongside the id set of any whose wire payload had NO
+     * "linkedMomentSyncId" key at all (as opposed to the key being present-and-null) - see the field's
+     * own comment below and [MilestoneRepository.mergeRemote]'s matching parameter for why this
+     * distinction has to survive past this function instead of collapsing to null here. */
+    private fun deserializeMilestones(arr: JSONArray?, peerClockOffsetMillis: Long = 0L): Pair<List<Milestone>, Set<String>> {
+        if (arr == null) return emptyList<Milestone>() to emptySet()
+        val missingLinkedMomentField = mutableSetOf<String>()
+        val list = (0 until arr.length()).mapNotNull { i ->
             val o = arr.getJSONObject(i)
             val id = o.getString("id")
             val updatedAt = o.getLong("updatedAt") - peerClockOffsetMillis
@@ -554,6 +587,7 @@ class GattSyncManager(
                 Log.w(TAG, "Dropping remote milestone $id with implausible updatedAt=$updatedAt")
                 return@mapNotNull null
             }
+            if (!o.has("linkedMomentSyncId")) missingLinkedMomentField += id
             Milestone(
                 id = id,
                 label = o.getString("label"),
@@ -571,13 +605,20 @@ class GattSyncManager(
                 createdAt = o.getLong("createdAt"),
                 updatedAt = updatedAt,
                 deleted = o.optBoolean("deleted", false),
-                // Defensive fallback (not getString) for a payload from a not-yet-updated partner build,
-                // same pattern as dateIdeas' listId above - just a reference, never a filesystem path (see
-                // Milestone.linkedMomentSyncId's own doc), so no extra validation needed beyond "missing
-                // means null".
+                // BLOCKER fix (ultimate-app-review round 1, Opus): a partner still on a pre-this-commit
+                // build echoes this milestone back with no "linkedMomentSyncId" key at all. org.json's
+                // isNull() treats "key absent" identically to "key present and null", so this used to
+                // deserialize to null unconditionally - and since the bounded clock-skew correction above
+                // usually makes an unmodified echo's updatedAt land just after ours, the whole-row LWW
+                // merge would then silently null out a link the user had just set, with zero user action
+                // and zero error. The "key genuinely absent" case is now flagged via missingLinkedMomentField
+                // (built above) so mergeRemote can preserve the local value instead of trusting this null -
+                // this line still correctly maps an EXPLICIT null (same-build partner intentionally cleared
+                // the link) to null, since only mergeRemote can tell the two cases apart.
                 linkedMomentSyncId = if (o.isNull("linkedMomentSyncId")) null else o.getString("linkedMomentSyncId")
             )
         }
+        return list to missingLinkedMomentField
     }
 
     /** MINOR fix (Opus+Sonnet+Fable all independently proposed this): `unlockedAt` used to be included
