@@ -30,6 +30,13 @@ object Notifications {
      * partially-restored phone and zero indication anything had even been attempted, since
      * TwogetherApp.onCreate silently discarded that call's result. */
     const val CHANNEL_BACKUP = "backup"
+    /** SECURITY (user-designed follow-up to the TOFU device-ID pinning): a device this phone is already
+     * locked to a partner rejected a sync from a DIFFERENT device presenting the same pairing code - see
+     * PairingStore.recordPendingResyncRequest's doc. Worth a real (not silent) notification since this is
+     * exactly the "your pin is now permanently stale and nothing will ever tell you" gap the whole
+     * device-ID pinning feature was already trying to close - a rejection nobody notices is no better
+     * than not rejecting at all. */
+    const val CHANNEL_PAIRING = "pairing"
 
     const val STATUS_NOTIFICATION_ID = 1001
     const val REMINDER_NOTIFICATION_ID = 1002
@@ -43,6 +50,7 @@ object Notifications {
     const val UPDATE_NOTIFICATION_ID = 1003
     const val BATTERY_WARNING_NOTIFICATION_ID = 1004
     const val RESTORE_GAVE_UP_NOTIFICATION_ID = 1005
+    const val RESYNC_REQUEST_NOTIFICATION_ID = 1006
     /** Base id for a milestone's yearly notification - offset by a stable per-milestone hash so
      * different milestones never clobber each other's notification (see MilestoneAlarmScheduler). Always
      * >= 2000 and (per the hash mask) always < 2000 + 0x0FFFFFFF - see the fixed IDs above for why nothing
@@ -90,12 +98,18 @@ object Notifications {
         ).apply {
             description = "Lets you know if a backup restore couldn't be completed"
         }
+        val pairingChannel = NotificationChannel(
+            CHANNEL_PAIRING, "Pairing requests", NotificationManager.IMPORTANCE_DEFAULT
+        ).apply {
+            description = "Lets you know if a device tries to sync with your paired phone that doesn't match your partner"
+        }
         manager.createNotificationChannel(statusChannel)
         manager.createNotificationChannel(reminderChannel)
         manager.createNotificationChannel(milestoneChannel)
         manager.createNotificationChannel(updatesChannel)
         manager.createNotificationChannel(batteryChannel)
         manager.createNotificationChannel(backupChannel)
+        manager.createNotificationChannel(pairingChannel)
     }
 
     fun buildStatusNotification(context: Context, contentText: String): Notification {
@@ -220,6 +234,40 @@ object Notifications {
             .build()
 
         manager.notify(RESTORE_GAVE_UP_NOTIFICATION_ID, notification)
+        return true
+    }
+
+    /** SECURITY (user-designed follow-up): posted when GattSyncManager.applyPayload records a genuinely
+     * NEW pending resync request (see PairingStore.recordPendingResyncRequest's isNewDevice return and
+     * this call's throttle at the GattSyncManager call site) - i.e. a device presenting this pairing's
+     * code that doesn't match who this device is already pinned to. Deliberately generic content with NO
+     * action buttons and no specific device identity in the text itself (per Fable's design review):
+     * approving a resync is a real security decision (it re-opens who this device trusts), so it must
+     * only ever happen after the user has actually looked at the full context - Bluetooth name, claimed
+     * partner name, request age - on the in-app review screen this deep-links to, never from a notification
+     * shade tap alone. */
+    fun showResyncRequestNotification(context: Context, partnerName: String): Boolean {
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return false
+        if (!BlePermissions.hasNotificationPermission(context)) return false
+
+        val openIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            context, RESYNC_REQUEST_NOTIFICATION_ID, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_PAIRING)
+            .setSmallIcon(R.drawable.ic_notification_heart)
+            .setContentTitle("A device tried to use your pairing code")
+            .setContentText("Tap to check if it was $partnerName")
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+
+        manager.notify(RESYNC_REQUEST_NOTIFICATION_ID, notification)
         return true
     }
 

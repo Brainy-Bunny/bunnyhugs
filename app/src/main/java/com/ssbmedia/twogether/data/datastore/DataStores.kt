@@ -13,6 +13,8 @@ import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.UUID
 
 // A torn/corrupted preferences file (e.g. a write interrupted by a crash or power loss) throws
@@ -41,10 +43,44 @@ data class PairingInfo(
      * the gap documented in BleConstants' file doc where the pairing code's 10^6 keyspace alone let any
      * device that coincidentally lands on the same code be treated as "the partner" for every future
      * connection, not just once. */
-    val pinnedPartnerDeviceId: String? = null
+    val pinnedPartnerDeviceId: String? = null,
+    /** SECURITY (user-designed follow-up to the TOFU pinning above, refined per Fable's design review):
+     * once this device is pinned to a partner, a sync attempt from any OTHER device presenting the same
+     * pairing code is rejected as before (GattSyncManager.applyPayload) - but rather than silently
+     * discarding that rejection forever (which is what let a partner's stale pin go unnoticed and
+     * unrecoverable in the original design), the rejecting device now remembers EACH distinct device
+     * that tries, here, and surfaces them as explicit "is this actually your partner?" prompts instead of
+     * resolving automatically either way. A LIST, not a single slot: Fable's review flagged that a single
+     * overwritable slot lets a second (stranger, or just a second legitimate retry racing a real one)
+     * request silently replace the one the user actually saw and meant to approve. Approving/dismissing
+     * always targets one specific entry's deviceId from this list - if that entry is no longer present
+     * (expired, already resolved) the action simply no-ops rather than ever acting on a DIFFERENT entry
+     * than the one the user looked at. See PairingStore.recordPendingResyncRequest/approvePendingResync/
+     * dismissPendingResync/PENDING_RESYNC_REQUEST_TTL_MILLIS. */
+    val pendingResyncRequests: List<PendingResyncRequest> = emptyList()
 ) {
     val isPaired: Boolean get() = !pairSecretHash.isNullOrBlank()
 }
+
+/** One distinct "a device I don't recognize tried to sync using my pairing code" event - see
+ * [PairingInfo.pendingResyncRequests]'s doc. [bluetoothName] and [theirPartnerName] are both
+ * best-effort identifying context (may be null - a permission denial, an older peer build, or a
+ * peer that simply has no partner name set yet), shown so the user can actually tell a genuine
+ * partner apart from a stranger/collision instead of approving blind:
+ * - [bluetoothName] is the OS-level Bluetooth name of the connecting device (usually the phone's
+ *   own name, e.g. "Sahil's Galaxy S23") - hardware-level, not something either app controls, so
+ *   much harder for an unrelated collision to coincidentally match than [theirPartnerName].
+ * - [theirPartnerName] is literally the requesting device's OWN "partner_name" field (what IT calls
+ *   whoever IT thinks its partner is) - carried in the sync payload envelope (see
+ *   GattSyncManager.buildPayload/applyPayload's "senderPartnerName" field). If this really is your
+ *   partner's phone, this should read back whatever nickname you gave yourself when you two paired -
+ *   a mismatch here is a real red flag, a match is real (if weak) corroboration. */
+data class PendingResyncRequest(
+    val deviceId: String,
+    val bluetoothName: String? = null,
+    val theirPartnerName: String? = null,
+    val requestedAt: Long = 0L
+)
 
 /** Snapshot of the most recently torn-down pairing, kept around after unpair() so PairingScreen can
  * offer a one-tap "Reconnect to X" that restores it without re-entering the code - see
@@ -68,6 +104,11 @@ class PairingStore(private val context: Context) {
         val PAIRED_AT = longPreferencesKey("paired_at")
         val PINNED_PARTNER_DEVICE_ID = stringPreferencesKey("pinned_partner_device_id")
         val LAST_PINNED_PARTNER_DEVICE_ID = stringPreferencesKey("last_pinned_partner_device_id")
+        // JSON-encoded array of PendingResyncRequest, same org.json serialization convention already
+        // used throughout GattSyncManager/BackupManager - Preferences DataStore has no native list-of-
+        // objects type, and a handful of records at a time doesn't justify a whole new Room table/
+        // migration for this.
+        val PENDING_RESYNC_REQUESTS_JSON = stringPreferencesKey("pending_resync_requests_json")
 
         // "Last connection" snapshot - deliberately stored under different key names in the same
         // pairingDs file (rather than a separate DataStore) so unpair() can move the active-> last
@@ -86,7 +127,12 @@ class PairingStore(private val context: Context) {
             partnerName = p[Keys.PARTNER_NAME] ?: "Your Person",
             partnerEmoji = p[Keys.PARTNER_EMOJI] ?: "💕",
             pairedAt = p[Keys.PAIRED_AT] ?: 0L,
-            pinnedPartnerDeviceId = p[Keys.PINNED_PARTNER_DEVICE_ID]
+            pinnedPartnerDeviceId = p[Keys.PINNED_PARTNER_DEVICE_ID],
+            // Fable review: expired entries are filtered at READ time (here), not just pruned lazily on
+            // the next write - so a request that's aged out disappears from the UI/notification the
+            // moment it's stale, not only the next time recordPendingResyncRequest happens to run.
+            pendingResyncRequests = decodePendingResyncRequests(p[Keys.PENDING_RESYNC_REQUESTS_JSON])
+                .filter { System.currentTimeMillis() - it.requestedAt < PENDING_RESYNC_REQUEST_TTL_MILLIS }
         )
     }
 
@@ -111,6 +157,15 @@ class PairingStore(private val context: Context) {
      * the most recent prior pairing, never an arbitrarily old one. */
     suspend fun savePairing(secretHash: String, plainCode: String, partnerName: String, partnerEmoji: String) {
         context.pairingDs.edit { p ->
+            // Fix #6 (Fable review): if this is the SAME code this device was last paired with, carry the
+            // old pin forward instead of starting unpinned - this is exactly the user's originally-reported
+            // scenario (unpair, then re-pair with the same code): both sides end up pinned to the same
+            // device id they always were, symmetrically, with no popup ever needed. Only applies when the
+            // hash matches (a genuinely different code means a genuinely different/reset partner pairing,
+            // where inheriting the old pin would be wrong) and must be read BEFORE the block below clears
+            // LAST_SECRET_HASH/LAST_PINNED_PARTNER_DEVICE_ID.
+            val isSameAsLastCode = !p[Keys.LAST_SECRET_HASH].isNullOrBlank() && p[Keys.LAST_SECRET_HASH] == secretHash
+            val carriedPin = if (isSameAsLastCode) p[Keys.LAST_PINNED_PARTNER_DEVICE_ID] else null
             p[Keys.SECRET_HASH] = secretHash
             p[Keys.PLAIN_CODE] = plainCode
             p[Keys.PARTNER_NAME] = partnerName.trim().ifBlank { "Your Person" }
@@ -118,13 +173,19 @@ class PairingStore(private val context: Context) {
             p[Keys.PAIRED_AT] = System.currentTimeMillis()
             // A brand new pairing (even re-pairing with the same code by coincidence) must start with no
             // pin, so the first real sync under THIS pairing is what does the pinning - never inherit a
-            // pin left over from whatever pairing (if any) was active before.
-            p.remove(Keys.PINNED_PARTNER_DEVICE_ID)
+            // pin left over from whatever pairing (if any) was active before. EXCEPT when carriedPin says
+            // this is a same-code rejoin, per Fix #6 above.
+            if (!carriedPin.isNullOrBlank()) p[Keys.PINNED_PARTNER_DEVICE_ID] = carriedPin else p.remove(Keys.PINNED_PARTNER_DEVICE_ID)
             p.remove(Keys.LAST_SECRET_HASH)
             p.remove(Keys.LAST_PLAIN_CODE)
             p.remove(Keys.LAST_PARTNER_NAME)
             p.remove(Keys.LAST_PARTNER_EMOJI)
             p.remove(Keys.LAST_UNPAIRED_AT)
+            p.remove(Keys.LAST_PINNED_PARTNER_DEVICE_ID)
+            // A pending resync request only ever means something against the pairing that received it -
+            // starting a brand new one makes any old request meaningless (it was about a device trying to
+            // reach the PREVIOUS pairing, not this one).
+            p.remove(Keys.PENDING_RESYNC_REQUESTS_JSON)
         }
     }
 
@@ -155,6 +216,8 @@ class PairingStore(private val context: Context) {
             p.remove(Keys.PARTNER_EMOJI)
             p.remove(Keys.PAIRED_AT)
             p.remove(Keys.PINNED_PARTNER_DEVICE_ID)
+            // Same reasoning as savePairing() - a pending request belongs to the pairing being torn down.
+            p.remove(Keys.PENDING_RESYNC_REQUESTS_JSON)
         }
     }
 
@@ -173,6 +236,7 @@ class PairingStore(private val context: Context) {
             p[Keys.PAIRED_AT] = System.currentTimeMillis()
             val lastPinned = p[Keys.LAST_PINNED_PARTNER_DEVICE_ID]
             if (!lastPinned.isNullOrBlank()) p[Keys.PINNED_PARTNER_DEVICE_ID] = lastPinned else p.remove(Keys.PINNED_PARTNER_DEVICE_ID)
+            p.remove(Keys.PENDING_RESYNC_REQUESTS_JSON)
         }
     }
 
@@ -188,6 +252,125 @@ class PairingStore(private val context: Context) {
                 p[Keys.PINNED_PARTNER_DEVICE_ID] = deviceId
             }
         }
+    }
+
+    /** SECURITY (user-designed follow-up, refined per Fable's design review): called by
+     * GattSyncManager.applyPayload the moment a payload is rejected for a mismatched sender WHILE this
+     * device is genuinely pinned to someone - i.e. the "I'm already locked to a specific partner and
+     * something else just tried my code" case, not a brand-new first-time pairing (that path never has a
+     * pin yet, so this is never reached for it). Upserts by deviceId (dedupes a peer's own retry loop
+     * into a refreshed timestamp on the SAME entry rather than growing unboundedly) and caps the list at
+     * [MAX_PENDING_RESYNC_REQUESTS], dropping the oldest first - a genuinely large number of distinct
+     * devices hitting this at once is itself a signal something's wrong, not a case to build unbounded
+     * storage for. Returns true only when [deviceId] is a genuinely NEW entry (not previously pending) -
+     * Fix #5 (Fable review, notification throttle): the caller uses this to decide whether to fire a
+     * notification, so a peer's own retry loop (which calls this every few seconds) refreshes its
+     * timestamp silently instead of re-notifying the user on every single attempt. */
+    suspend fun recordPendingResyncRequest(deviceId: String, bluetoothName: String?, theirPartnerName: String?): Boolean {
+        if (deviceId.isBlank()) return false
+        var isNewDevice = false
+        context.pairingDs.edit { p ->
+            val now = System.currentTimeMillis()
+            val existing = decodePendingResyncRequests(p[Keys.PENDING_RESYNC_REQUESTS_JSON])
+            isNewDevice = existing.none { it.deviceId == deviceId }
+            val updated = existing.filterNot { it.deviceId == deviceId } +
+                PendingResyncRequest(deviceId, bluetoothName, theirPartnerName, now)
+            val capped = updated.sortedByDescending { it.requestedAt }.take(MAX_PENDING_RESYNC_REQUESTS)
+            p[Keys.PENDING_RESYNC_REQUESTS_JSON] = encodePendingResyncRequests(capped)
+        }
+        return isNewDevice
+    }
+
+    /** SECURITY (user-designed follow-up, refined per Fable's design review): the user's explicit "yes,
+     * that's my partner" response to ONE SPECIFIC pending request, identified by [deviceId] - the id the
+     * user actually saw and chose from the rendered list, never "whatever's currently pending" (that
+     * ambiguity is exactly the race Fable's review flagged: a second request silently replacing the one
+     * the user meant to approve). If [deviceId] is no longer in the list (expired, already resolved, or
+     * simply never existed), this is a deliberate no-op rather than falling back to approving something
+     * else. Pins DIRECTLY to the requesting device's id - deliberately NOT a bare
+     * `p.remove(PINNED_PARTNER_DEVICE_ID)` that reopens a plain pinPartnerDeviceIdIfAbsent-style
+     * trust-on-first-use window, since we already know exactly which device asked. Returns true if a pin
+     * change actually happened (so the caller knows whether to kick off an immediate retry sync). */
+    suspend fun approvePendingResync(deviceId: String): Boolean {
+        var approved = false
+        context.pairingDs.edit { p ->
+            val existing = decodePendingResyncRequests(p[Keys.PENDING_RESYNC_REQUESTS_JSON])
+            if (existing.none { it.deviceId == deviceId }) return@edit
+            p[Keys.PINNED_PARTNER_DEVICE_ID] = deviceId
+            p[Keys.PENDING_RESYNC_REQUESTS_JSON] = encodePendingResyncRequests(existing.filterNot { it.deviceId == deviceId })
+            approved = true
+        }
+        return approved
+    }
+
+    /** SECURITY (user-designed follow-up): the user's explicit "no, that's not my partner" response (or
+     * simply dismissing that one entry) - removes just this one request with no change to the pin, so the
+     * next attempt from that same unrecognized device is rejected (and re-recorded) exactly as before.
+     * Other still-pending requests, if any, are untouched. */
+    suspend fun dismissPendingResync(deviceId: String) {
+        context.pairingDs.edit { p ->
+            val existing = decodePendingResyncRequests(p[Keys.PENDING_RESYNC_REQUESTS_JSON])
+            p[Keys.PENDING_RESYNC_REQUESTS_JSON] = encodePendingResyncRequests(existing.filterNot { it.deviceId == deviceId })
+        }
+    }
+
+    /** Fable review: the strongest available signal that a pending request is NOT the real partner is the
+     * real partner demonstrably still being alive - if a sync with the CURRENTLY pinned partner succeeds
+     * after a request was recorded, every pending entry recorded before that point is now stale (the real
+     * partner never lost their pin, so whoever's still asking almost certainly isn't them) and gets
+     * cleared automatically, without waiting for the TTL or a manual dismiss. Called from
+     * GattSyncManager.applyPayload right after a successful (non-rejected) merge. Entries recorded AFTER
+     * the successful sync are left alone - they're a separate, still-unresolved event. */
+    suspend fun clearPendingResyncRequestsOlderThan(cutoffMillis: Long) {
+        context.pairingDs.edit { p ->
+            val existing = decodePendingResyncRequests(p[Keys.PENDING_RESYNC_REQUESTS_JSON])
+            if (existing.none { it.requestedAt <= cutoffMillis }) return@edit
+            p[Keys.PENDING_RESYNC_REQUESTS_JSON] = encodePendingResyncRequests(existing.filter { it.requestedAt > cutoffMillis })
+        }
+    }
+
+    private fun decodePendingResyncRequests(json: String?): List<PendingResyncRequest> {
+        if (json.isNullOrBlank()) return emptyList()
+        return try {
+            val arr = JSONArray(json)
+            (0 until arr.length()).mapNotNull { i ->
+                val o = arr.optJSONObject(i) ?: return@mapNotNull null
+                val deviceId = o.optString("deviceId", "")
+                if (deviceId.isBlank()) return@mapNotNull null
+                PendingResyncRequest(
+                    deviceId = deviceId,
+                    bluetoothName = if (o.isNull("bluetoothName")) null else o.optString("bluetoothName"),
+                    theirPartnerName = if (o.isNull("theirPartnerName")) null else o.optString("theirPartnerName"),
+                    requestedAt = o.optLong("requestedAt", 0L)
+                )
+            }
+        } catch (e: Exception) {
+            // A torn/corrupt list here must never crash the sync path that reads it - worst case, prior
+            // pending requests are silently lost, same self-healing philosophy as corruptionHandler above.
+            emptyList()
+        }
+    }
+
+    private fun encodePendingResyncRequests(list: List<PendingResyncRequest>): String {
+        val arr = JSONArray()
+        for (r in list) {
+            arr.put(JSONObject().apply {
+                put("deviceId", r.deviceId)
+                put("bluetoothName", r.bluetoothName ?: JSONObject.NULL)
+                put("theirPartnerName", r.theirPartnerName ?: JSONObject.NULL)
+                put("requestedAt", r.requestedAt)
+            })
+        }
+        return arr.toString()
+    }
+
+    companion object {
+        /** Fable review: an unanswered pending request from weeks ago risks being approved on faith by a
+         * user who no longer remembers the context - expiring it means the only thing left to approve is
+         * recent enough to plausibly still be reasoned about, and a genuinely still-trying partner simply
+         * gets re-recorded by their own retry loop, so nothing real is lost by expiring. */
+        const val PENDING_RESYNC_REQUEST_TTL_MILLIS = 72 * 60 * 60 * 1000L // 72 hours
+        const val MAX_PENDING_RESYNC_REQUESTS = 5
     }
 
     /** Full raw restore used by Feature 4's backup restore flow - writes every field (including the

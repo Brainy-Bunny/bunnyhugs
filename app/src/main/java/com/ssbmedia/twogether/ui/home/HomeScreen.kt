@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -144,6 +145,30 @@ class HomeViewModel : ViewModel() {
     val quickLinksOrder: StateFlow<List<String>> = ServiceLocator.settingsStore.settings
         .map { reconcileQuickLinkOrder(it.quickLinksOrder) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), DEFAULT_QUICK_LINK_ORDER)
+
+    /** SECURITY (user-designed follow-up): the user's explicit "yes, that's my partner" response to one
+     * specific [PendingResyncRequest], identified by [deviceId] (see PairingStore.approvePendingResync's
+     * doc for why this must always target a specific id, never "whatever's pending"). Per the user's own
+     * explicit ask, a successful approval immediately nudges a real retry - the request that was rejected
+     * moments ago should now succeed since the pin was just re-pointed at it - rather than the user having
+     * to wait for the next natural proximity cycle or manually back out to Our Lists and tap "Sync now". */
+    fun approvePendingResync(deviceId: String) {
+        viewModelScope.launch {
+            val approved = ServiceLocator.pairingStore.approvePendingResync(deviceId)
+            if (approved) {
+                repeat(15) {
+                    AppEvents.requestManualSync()
+                    delay(1_000)
+                }
+            }
+        }
+    }
+
+    /** The user's explicit "no, that's not my partner" response (or simply dismissing that one entry) -
+     * see PairingStore.dismissPendingResync's doc. Leaves any other still-pending requests untouched. */
+    fun dismissPendingResync(deviceId: String) {
+        viewModelScope.launch { ServiceLocator.pairingStore.dismissPendingResync(deviceId) }
+    }
 
     fun setQuickLinksOrder(order: List<String>) {
         viewModelScope.launch { ServiceLocator.settingsStore.setQuickLinksOrder(order) }
@@ -303,17 +328,20 @@ fun HomeScreen(
         }
     }
 
-    // MINOR fix (ultimate-app-review, user-requested follow-up): "Reconnect to X" on the pairing
-    // screen restores a pin that can be stale (partner reinstalled since last pairing) with no
-    // feedback - the user just lands in the app and only finds out later, if at all, from a subtle
-    // Settings-screen subtitle change. See AppEvents.justReconnected's own doc for why this check has
-    // to live HERE (Home), not on the pairing screen where the reconnect actually happened.
+    // MINOR fix (ultimate-app-review, user-requested follow-up): completing a pairing action - either
+    // "Reconnect to X" OR finishing Create/Join Pair (PairingViewModel.finishPairing()) - can leave
+    // this device holding a stale device-ID pin with no feedback: the user just lands in the app and
+    // only finds out later, if at all, from a subtle Settings-screen subtitle change. Live-caught via
+    // BOTH routes - "Reconnect" during this fix's own testing, and separately Unpair -> Join Pair ->
+    // re-entering the partner's still-displayed code during the user's own manual testing (same
+    // underlying one-sided-stale-pin risk, different button). See AppEvents.justPaired's own doc for
+    // why this check has to live HERE (Home), not on the pairing screen where the action happened.
     var reconnectVerifying by remember { mutableStateOf(false) }
     var reconnectMismatch by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
-        AppEvents.justReconnected.collect { justReconnected ->
-            if (!justReconnected) return@collect
-            AppEvents.consumeJustReconnected()
+        AppEvents.justPaired.collect { justPaired ->
+            if (!justPaired) return@collect
+            AppEvents.consumeJustPaired()
             reconnectVerifying = true
             // Same "retry every second, cancel on the first real result" shape as OurListsScreen's
             // manual sync button, but a much longer window (live-measured, not guessed): unlike an
@@ -571,12 +599,12 @@ fun HomeScreen(
     if (reconnectVerifying) {
         AlertDialog(
             onDismissRequest = {},
-            title = { Text("Reconnecting…") },
+            title = { Text("Checking connection…") },
             text = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     CircularProgressIndicator(modifier = Modifier.size(24.dp))
                     Spacer(modifier = Modifier.width(12.dp))
-                    Text("Checking that your partner's phone is still there.")
+                    Text("Making sure this pairing is set up correctly.")
                 }
             },
             confirmButton = {}
@@ -586,7 +614,7 @@ fun HomeScreen(
     if (reconnectMismatch) {
         AlertDialog(
             onDismissRequest = { reconnectMismatch = false },
-            title = { Text("Couldn't reconnect") },
+            title = { Text("Pairing didn't work") },
             text = {
                 Text(
                     "This doesn't look like ${pairingInfo?.partnerName?.ifBlank { "your partner" } ?: "your partner"}'s " +
@@ -595,6 +623,59 @@ fun HomeScreen(
                 )
             },
             confirmButton = { TextButton(onClick = { reconnectMismatch = false }) { Text("Okay") } }
+        )
+    }
+
+    // SECURITY (user-designed follow-up): pairingInfo.pendingResyncRequests is the reactive source of
+    // truth (a StateFlow read straight from DataStore, see HomeViewModel.pairingInfo) - no separate local
+    // "is this dialog open" state needed, since approving/dismissing the last entry naturally shrinks the
+    // list back to empty and this dialog just stops rendering on its own. Deliberately a single dialog
+    // listing every pending entry (not one dialog per request) so a user who gets multiple simultaneous
+    // requests can compare them side by side, per the user's own "so I can filter my partner by name"
+    // request that shaped this list-based design in the first place.
+    if (pairingInfo.pendingResyncRequests.isNotEmpty()) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Is this your partner?") },
+            text = {
+                Column {
+                    Text(
+                        "A device tried to use your pairing code but doesn't match who ${
+                            pairingInfo.partnerName.ifBlank { "your partner" }
+                        } was last known as. Only approve one of these if you're sure it's really them " +
+                            "(e.g. they reinstalled the app or reset their phone)."
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    pairingInfo.pendingResyncRequests.forEach { req ->
+                        val ageMinutes = ((now - req.requestedAt) / 60_000L).coerceAtLeast(0L)
+                        val ageText = when {
+                            ageMinutes < 1 -> "just now"
+                            ageMinutes < 60 -> "${ageMinutes}m ago"
+                            ageMinutes < 24 * 60 -> "${ageMinutes / 60}h ago"
+                            else -> "${ageMinutes / (24 * 60)}d ago"
+                        }
+                        Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Text(
+                                    req.bluetoothName?.ifBlank { null } ?: "Unknown Bluetooth device",
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    "Calls their partner: ${req.theirPartnerName?.ifBlank { null } ?: "unknown"}",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                                Text("Requested $ageText", style = MaterialTheme.typography.bodySmall)
+                                Row(modifier = Modifier.padding(top = 8.dp)) {
+                                    TextButton(onClick = { vm.dismissPendingResync(req.deviceId) }) { Text("Not my partner") }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    TextButton(onClick = { vm.approvePendingResync(req.deviceId) }) { Text("Yes, resync") }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {}
         )
     }
 }

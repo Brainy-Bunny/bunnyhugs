@@ -19,6 +19,7 @@ import com.ssbmedia.twogether.data.db.DateIdea
 import com.ssbmedia.twogether.data.db.ListCategory
 import com.ssbmedia.twogether.data.db.Milestone
 import com.ssbmedia.twogether.notif.MilestoneAlarmScheduler
+import com.ssbmedia.twogether.notif.Notifications
 import com.ssbmedia.twogether.data.db.Moment
 import com.ssbmedia.twogether.data.db.MomentNote
 import com.ssbmedia.twogether.data.db.TogetherSession
@@ -149,6 +150,11 @@ class GattSyncManager(
         // SECURITY: lets the receiver's applyPayload pin (or verify against an already-pinned) sender
         // identity - see PairingStore.pinPartnerDeviceIdIfAbsent's doc.
         obj.put("senderDeviceId", deviceId)
+        // Identifying context for the receiver's pending-resync-request UI (see PendingResyncRequest's
+        // doc) - lets a user who gets an unexpected resync request tell it apart from their real partner
+        // by name, not just a bare device id. Best-effort only: whatever this device's own partnerName
+        // currently is (may be the still-default "Your Person" if the user never set one).
+        obj.put("senderPartnerName", pairingStore.current().partnerName)
         obj.put("dateIdeas", serializeDateIdeas(dateIdeaRepository.getAll()))
         obj.put("listCategories", serializeListCategories(listCategoryRepository.getAll()))
         obj.put("sessions", serializeSessions(sessionRepository.getAllIncludingDeleted().filter { it.endedAt != null }))
@@ -166,7 +172,7 @@ class GattSyncManager(
      * repository's mergeRemote / mergeRemoteSessions / mergeRemoteStubs doc for why they differ). Returns
      * the sender's per-moment syncId/hasPhoto/takenAt snapshot (Feature 2) so the caller can decide what
      * photo bytes to push/request next, without re-parsing the raw bytes a second time. */
-    private suspend fun applyPayload(bytes: ByteArray): List<RemoteMomentInfo> {
+    private suspend fun applyPayload(bytes: ByteArray, remoteDevice: BluetoothDevice? = null): List<RemoteMomentInfo> {
         // MAJOR fix (ultimate-app-review round 1, Opus+Sonnet; placement corrected round 2, Opus): reset
         // at the true FIRST line of every attempt, before anything below that can throw (device-id
         // lookup, JSON parsing) - round 2 live-caught a real JSONTokener.syntaxError thrown from the JSON
@@ -181,13 +187,18 @@ class GattSyncManager(
         // code - it says nothing about WHICH device that is, so a second couple who coincidentally landed
         // on the same 6-digit code would otherwise pass the handshake exactly like our real partner would.
         // Checked here, before a single row of any table below gets merged: once a pin exists, a payload
-        // from any other device is rejected outright rather than partially applied. A blank senderDeviceId
-        // (a payload from a build that predates this field) is treated as "unknown, not necessarily
-        // hostile" and allowed through unpinned rather than breaking sync for an already-paired couple
-        // where one side hasn't updated yet.
+        // from any other device is rejected outright rather than partially applied.
         val senderDeviceId = root.optString("senderDeviceId", "")
-        val pinnedPartnerDeviceId = pairingStore.current().pinnedPartnerDeviceId
-        if (!pinnedPartnerDeviceId.isNullOrBlank() && senderDeviceId.isNotBlank() && senderDeviceId != pinnedPartnerDeviceId) {
+        val senderPartnerName = root.optString("senderPartnerName", "").ifBlank { null }
+        val currentPairing = pairingStore.current()
+        val pinnedPartnerDeviceId = currentPairing.pinnedPartnerDeviceId
+        // SECURITY (Fix #2, Fable review - closes Gap B): a blank senderDeviceId USED TO be treated as
+        // "unknown, not necessarily hostile" and allowed through unpinned once this device was already
+        // pinned - meant as backward compatibility for a payload from a build that predates this field,
+        // but in practice this was a standing bypass of the entire pinning invariant: anyone who simply
+        // omitted senderDeviceId skipped the check outright. Once a pin exists, EVERY sender - blank id
+        // included - is now compared against it, so the comparison below no longer exempts blank.
+        if (!pinnedPartnerDeviceId.isNullOrBlank() && senderDeviceId != pinnedPartnerDeviceId) {
             Log.w(TAG, "Rejecting sync payload: sender device id did not match this pairing's pinned partner")
             // MAJOR fix (ultimate-app-review round 1, Opus+Sonnet): both independently live-reproduced a
             // permanent, one-directional sync lockout after a partner reinstall (fresh local device id) -
@@ -197,6 +208,31 @@ class GattSyncManager(
             // same stale pin and fails again. Flagging the reason here lets the UI say something the user
             // can actually act on (see lastSyncFailedDueToPartnerMismatch's doc + Settings/OurListsScreen).
             lastSyncFailedDueToPartnerMismatch = true
+            // SECURITY (user-designed follow-up): the rejection above never used to be remembered
+            // anywhere - a permanently-stale pin (this device's partner reinstalled, or someone unpaired
+            // and rejoined leaving THIS side's pin looking at a now-dead identity) had no path back to
+            // working except the user stumbling onto Settings' subtitle text and manually unpairing. This
+            // records who just tried so the user can be asked directly "is this actually your partner?"
+            // instead of the attempt just silently vanishing - see PairingStore.recordPendingResyncRequest's
+            // own doc, and Home's pending-resync dialog for where this gets surfaced. A blank senderDeviceId
+            // has nothing to record against (recordPendingResyncRequest itself no-ops on blank) or notify
+            // about, but is still rejected above by the comparison itself - Fix #2 closes the security gap
+            // even though there's no actionable identity to surface to the user in that case.
+            if (senderDeviceId.isNotBlank()) {
+                // Best-effort Bluetooth device name - requires BLUETOOTH_CONNECT on API 31+, which this
+                // sync path already implicitly required to get this far (see BlePermissions.hasBlePermissions
+                // gating both connectAsClient and the server accept path); wrapped defensively anyway since
+                // reading .name specifically can still throw on some OEM/permission-timing edge cases.
+                val bluetoothName = try { remoteDevice?.name } catch (e: SecurityException) { null }
+                // Fix #5 (Fable review, notification throttle): only notify on a genuinely NEW pending
+                // device, not on every retry of an already-known one - a rejected peer's own retry loop
+                // (this app's own Home reconnect-verification included) fires every few seconds, and
+                // re-notifying on each attempt would be spam for something the user already saw once.
+                val isNewPendingDevice = pairingStore.recordPendingResyncRequest(senderDeviceId, bluetoothName, senderPartnerName)
+                if (isNewPendingDevice) {
+                    Notifications.showResyncRequestNotification(context, currentPairing.partnerName)
+                }
+            }
             throw SecurityException("Sync payload sender did not match pinned partner device")
         }
         // MAJOR fix (ultimate-app-review, Fable F-4): isPlausibleWireUpdatedAt rejects anything more
@@ -272,6 +308,12 @@ class GattSyncManager(
             (notesArr?.length() ?: 0) - notesParsed.size +
             (milestonesArr?.length() ?: 0) - milestonesParsed.size +
             (timeCapsulesArr?.length() ?: 0) - timeCapsulesParsed.size
+        // SECURITY (Fix #3, Fable review): reaching this line at all means the sender passed the pin check
+        // above (or there was no pin yet) and every table finished merging - the strongest available
+        // signal that any OTHER device's earlier pending resync request is stale, since the real partner
+        // just proved they're still alive and reachable under this pairing. See
+        // PairingStore.clearPendingResyncRequestsOlderThan's doc; a no-op when the list is already empty.
+        pairingStore.clearPendingResyncRequestsOlderThan(System.currentTimeMillis())
         // SECURITY: only pin once the whole payload has genuinely merged successfully (a no-op after the
         // first time - see pinPartnerDeviceIdIfAbsent's doc). A blank senderDeviceId (old-build peer, see
         // this function's own check above) is simply never pinned, which is fine - unauthenticated pairs
@@ -1117,7 +1159,7 @@ class GattSyncManager(
                     }
                     scope.launch {
                         try {
-                            applyPayload(raw)
+                            applyPayload(raw, remoteDevice = device)
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Exception) {
@@ -1737,7 +1779,7 @@ class GattSyncManager(
                     metadataResponseSignal?.complete(Unit)
                     scope.launch {
                         val remoteMomentInfo = try {
-                            applyPayload(raw)
+                            applyPayload(raw, remoteDevice = gatt.device)
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Exception) {

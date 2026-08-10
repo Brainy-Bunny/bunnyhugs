@@ -81,28 +81,36 @@ object AppEvents {
         _unpaired.tryEmit(Unit)
     }
 
-    /** onboarding -> Home: "Reconnect to X" was just tapped (PairingViewModel.reconnect()) - see that
-     * function's own doc for why the verification this triggers can't happen ON the pairing screen
-     * itself: MainActivity's top-level routing reactively swaps away from PairingScreen the INSTANT
-     * reconnectToLast() flips PairingInfo.isPaired, before any check running there could ever complete
-     * or show anything (live-confirmed empirically). Home is the first screen guaranteed to actually
-     * stick around afterward, so it's the one that verifies the reconnect actually worked and tells the
-     * user if it didn't. A `StateFlow`, not a `SharedFlow`, deliberately - Home's own collector starts
-     * only once IT mounts, which happens strictly after this is set (Home doesn't exist until
-     * MainActivity's routing has already left PairingScreen); a replay=0 SharedFlow would drop the
-     * event exactly the same way the original bug did, which is the whole thing this design has to
-     * avoid. consumeJustReconnected() resets it back to false so it doesn't refire on every later Home
-     * recomposition (rotation, backgrounding, etc.) - same one-shot latch shape as NavGraph's own
+    /** onboarding -> Home: a pairing action that could produce a stale/mismatched device-ID pin was
+     * just completed - either "Reconnect to X" (PairingViewModel.reconnect()) or finishing a fresh
+     * Create-Pair/Join-Pair flow (PairingViewModel.finishPairing()). Both share the same underlying
+     * risk: re-pairing (by any route) resets THIS device's own pin, but if the other phone in the
+     * pairing never went through its own reset, it keeps trusting whatever device ID it saw last -
+     * live-confirmed by the user hitting exactly this via Unpair -> Join Pair -> re-entering the
+     * partner's still-displayed code, not just via "Reconnect". A genuinely first-time pairing between
+     * two devices that have never met is harmless to check too - neither side has a pin yet, so the
+     * verification below simply can't find a mismatch and stays silent.
+     * See PairingViewModel.reconnect()'s own doc for why the verification this triggers can't happen ON
+     * the pairing screen itself: MainActivity's top-level routing reactively swaps away from
+     * PairingScreen the INSTANT the pairing flip lands, before any check running there could ever
+     * complete or show anything (live-confirmed empirically). Home is the first screen guaranteed to
+     * actually stick around afterward, so it's the one that verifies the pairing actually works and
+     * tells the user if it didn't. A `StateFlow`, not a `SharedFlow`, deliberately - Home's own
+     * collector starts only once IT mounts, which happens strictly after this is set (Home doesn't
+     * exist until MainActivity's routing has already left PairingScreen); a replay=0 SharedFlow would
+     * drop the event exactly the same way the original bug did, which is the whole thing this design
+     * has to avoid. consumeJustPaired() resets it back to false so it doesn't refire on every later
+     * Home recomposition (rotation, backgrounding, etc.) - same one-shot latch shape as NavGraph's own
      * latchedMilestoneId. */
-    private val _justReconnected = MutableStateFlow(false)
-    val justReconnected: StateFlow<Boolean> = _justReconnected.asStateFlow()
+    private val _justPaired = MutableStateFlow(false)
+    val justPaired: StateFlow<Boolean> = _justPaired.asStateFlow()
 
-    fun emitJustReconnected() {
-        _justReconnected.value = true
+    fun emitJustPaired() {
+        _justPaired.value = true
     }
 
-    fun consumeJustReconnected() {
-        _justReconnected.value = false
+    fun consumeJustPaired() {
+        _justPaired.value = false
     }
 
     /** service -> UI: syncIds of Moments this device is CURRENTLY in the middle of requesting/receiving

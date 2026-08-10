@@ -74,21 +74,22 @@ class PairingViewModel(private val pairingStore: PairingStore) : ViewModel() {
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), LastConnectionInfo())
 
     /** MINOR fix (ultimate-app-review, user-requested follow-up): restores the previous pairing as
-     * before, but also fires AppEvents.emitJustReconnected() so HomeScreen - not this screen - can
-     * verify it actually worked and tell the user if it didn't (see AppEvents.justReconnected's own
-     * doc for why the check has to happen there, not here). Tried first as a check running ON this
-     * screen before proceeding: doesn't work architecturally - MainActivity's own top-level routing
-     * reactively swaps away from PairingScreen entirely the INSTANT reconnectToLast() flips
-     * PairingInfo.isPaired (see MainActivity.kt's `!loadedPairing.isPaired -> PairingScreen(...)`
-     * branch), independent of whatever onDone() does - so this screen (and any ViewModel-owned
-     * coroutine still running on it, including a would-be "wait up to 8s" check) gets torn down before
-     * it could ever show anything, live-confirmed empirically (no dialog ever appeared, not even once,
-     * across repeated attempts). Threading a "still verifying" gate into that routing (which also
-     * guards the PIN lock) was too invasive a change for what this fix needs. */
+     * before, but also fires AppEvents.emitJustPaired() so HomeScreen - not this screen - can verify it
+     * actually worked and tell the user if it didn't (see AppEvents.justPaired's own doc for why the
+     * check has to happen there, not here, and why it also covers finishPairing() below, not just this
+     * function). Tried first as a check running ON this screen before proceeding: doesn't work
+     * architecturally - MainActivity's own top-level routing reactively swaps away from PairingScreen
+     * entirely the INSTANT reconnectToLast() flips PairingInfo.isPaired (see MainActivity.kt's
+     * `!loadedPairing.isPaired -> PairingScreen(...)` branch), independent of whatever onDone() does -
+     * so this screen (and any ViewModel-owned coroutine still running on it, including a would-be "wait
+     * up to 8s" check) gets torn down before it could ever show anything, live-confirmed empirically (no
+     * dialog ever appeared, not even once, across repeated attempts). Threading a "still verifying" gate
+     * into that routing (which also guards the PIN lock) was too invasive a change for what this fix
+     * needs. */
     fun reconnect(onDone: () -> Unit) {
         viewModelScope.launch {
             pairingStore.reconnectToLast()
-            AppEvents.emitJustReconnected()
+            AppEvents.emitJustPaired()
             onDone()
         }
     }
@@ -122,11 +123,21 @@ class PairingViewModel(private val pairingStore: PairingStore) : ViewModel() {
         step = PairStep.LANDING
     }
 
+    /** MINOR fix (ultimate-app-review, user-requested follow-up): also fires AppEvents.emitJustPaired()
+     * - live-caught by the user testing the exact same stale-pin gap reconnect() above closes, but
+     * reached via Unpair -> Join Pair -> re-entering the partner's still-displayed code instead of
+     * tapping "Reconnect". savePairing() always clears THIS device's own pin (fresh pairing = fresh
+     * pin, see its own doc), so re-joining via a code the partner's phone already had active reproduces
+     * the identical one-sided-stale-pin risk reconnect() has - this covers it via the same check,
+     * rather than needing a second, parallel verification path. Harmless on a genuinely first-time
+     * pairing between two devices that have never met before - neither side has a pin yet, so the
+     * check simply can't find a mismatch and stays silent. */
     fun finishPairing(onDone: () -> Unit) {
         viewModelScope.launch {
             // BLOCKER fix: off Main - see PinUtil.hash's doc, same 600k-round PBKDF2 cost applies here.
             val hash = withContext(Dispatchers.Default) { Hashing.strengthenedPairingCodeHex(pendingCode) }
             pairingStore.savePairing(hash, pendingCode, partnerName, partnerEmoji)
+            AppEvents.emitJustPaired()
             onDone()
         }
     }
