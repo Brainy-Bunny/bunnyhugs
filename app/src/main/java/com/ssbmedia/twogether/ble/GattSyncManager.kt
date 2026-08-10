@@ -178,7 +178,11 @@ class GattSyncManager(
      * repository's mergeRemote / mergeRemoteSessions / mergeRemoteStubs doc for why they differ). Returns
      * the sender's per-moment syncId/hasPhoto/takenAt snapshot (Feature 2) so the caller can decide what
      * photo bytes to push/request next, without re-parsing the raw bytes a second time. */
-    private suspend fun applyPayload(bytes: ByteArray, remoteDevice: BluetoothDevice? = null): List<RemoteMomentInfo> {
+    /** [handshakeVerifiedDeviceId] is the identity the mutual handshake already cryptographically proved
+     * for this connection (see checkPinOrRecordPending's own call sites) - see this function's own
+     * SECURITY comment below for why it, not the JSON body's self-reported field, is what the pin check
+     * and pin write must actually trust. */
+    private suspend fun applyPayload(bytes: ByteArray, remoteDevice: BluetoothDevice? = null, handshakeVerifiedDeviceId: String): List<RemoteMomentInfo> {
         // MAJOR fix (ultimate-app-review round 1, Opus+Sonnet; placement corrected round 2, Opus): reset
         // at the true FIRST line of every attempt, before anything below that can throw (device-id
         // lookup, JSON parsing) - round 2 live-caught a real JSONTokener.syntaxError thrown from the JSON
@@ -188,23 +192,31 @@ class GattSyncManager(
         lastSyncFailedDueToPartnerMismatch = false
         val deviceId = settingsStore.getOrCreateLocalDeviceId()
         val root = JSONObject(String(bytes, Charsets.UTF_8))
-        // SECURITY: trust-on-first-use device pinning (see PairingInfo.pinnedPartnerDeviceId's doc for
-        // the collision this closes). The GATT handshake above only proves the sender knows our pairing
-        // code - it says nothing about WHICH device that is, so a second couple who coincidentally landed
-        // on the same 6-digit code would otherwise pass the handshake exactly like our real partner would.
-        // Checked here, before a single row of any table below gets merged: once a pin exists, a payload
-        // from any other device is rejected outright rather than partially applied.
-        val senderDeviceId = root.optString("senderDeviceId", "")
+        // SECURITY (test-code-allmodels round 3, Sonnet + Opus independently, clean-room): this used to
+        // read `senderDeviceId` from the JSON body itself (`root.optString("senderDeviceId", "")`) for
+        // BOTH the pin check below AND the pin write later in this function - but that field is completely
+        // unauthenticated (never bound into the handshake's HMAC), unlike `handshakeVerifiedDeviceId`
+        // (the caller's parameter), which the mutual handshake already cryptographically proved for this
+        // exact connection before applyPayload was ever reached. A peer that legitimately passes the
+        // handshake with its real id could still put a DIFFERENT, arbitrary value in this JSON field -
+        // defeating the entire point of binding identity into the HMAC, and on first pairing (no pin yet)
+        // could get this device to pin to a value that matches neither the peer nor any real partner,
+        // permanently breaking future syncs. Now sourced exclusively from the parameter for every
+        // security-relevant purpose (the check below, and the write near this function's end); the JSON
+        // field itself is no longer read here at all.
         val senderPartnerName = root.optString("senderPartnerName", "").ifBlank { null }
         val currentPairing = pairingStore.current()
         val pinnedPartnerDeviceId = currentPairing.pinnedPartnerDeviceId
-        // SECURITY (Fix #2, Fable review - closes Gap B): a blank senderDeviceId USED TO be treated as
+        // SECURITY (Fix #2, Fable review - closes Gap B): a blank sender id USED TO be treated as
         // "unknown, not necessarily hostile" and allowed through unpinned once this device was already
         // pinned - meant as backward compatibility for a payload from a build that predates this field,
         // but in practice this was a standing bypass of the entire pinning invariant: anyone who simply
-        // omitted senderDeviceId skipped the check outright. Once a pin exists, EVERY sender - blank id
-        // included - is now compared against it, so the comparison below no longer exempts blank.
-        if (!pinnedPartnerDeviceId.isNullOrBlank() && senderDeviceId != pinnedPartnerDeviceId) {
+        // omitted it skipped the check outright. Once a pin exists, EVERY sender - blank id included - is
+        // now compared against it, so the comparison below no longer exempts blank. (A blank
+        // handshakeVerifiedDeviceId can't actually reach here in practice - checkPinOrRecordPending
+        // already rejects the connection before applyPayload runs if the handshake-bound id doesn't match
+        // an existing pin, blank included - but the comparison stays correct/defensive either way.)
+        if (!pinnedPartnerDeviceId.isNullOrBlank() && handshakeVerifiedDeviceId != pinnedPartnerDeviceId) {
             Log.w(TAG, "Rejecting sync payload: sender device id did not match this pairing's pinned partner")
             // MAJOR fix (ultimate-app-review round 1, Opus+Sonnet): both independently live-reproduced a
             // permanent, one-directional sync lockout after a partner reinstall (fresh local device id) -
@@ -220,11 +232,14 @@ class GattSyncManager(
             // working except the user stumbling onto Settings' subtitle text and manually unpairing. This
             // records who just tried so the user can be asked directly "is this actually your partner?"
             // instead of the attempt just silently vanishing - see PairingStore.recordPendingResyncRequest's
-            // own doc, and Home's pending-resync dialog for where this gets surfaced. A blank senderDeviceId
-            // has nothing to record against (recordPendingResyncRequest itself no-ops on blank) or notify
-            // about, but is still rejected above by the comparison itself - Fix #2 closes the security gap
-            // even though there's no actionable identity to surface to the user in that case.
-            if (senderDeviceId.isNotBlank()) {
+            // own doc, and Home's pending-resync dialog for where this gets surfaced. A blank
+            // handshakeVerifiedDeviceId has nothing to record against (recordPendingResyncRequest itself
+            // no-ops on blank) or notify about, but is still rejected above by the comparison itself.
+            // NOTE: this whole branch is now defense-in-depth only, not the primary enforcement point -
+            // checkPinOrRecordPending (run during the handshake, before this function is ever called)
+            // already rejects a mismatched connection earlier and records the SAME pending-resync entry;
+            // reaching this branch at all would mean that earlier check was somehow bypassed.
+            if (handshakeVerifiedDeviceId.isNotBlank()) {
                 // Best-effort Bluetooth device name - requires BLUETOOTH_CONNECT on API 31+, which this
                 // sync path already implicitly required to get this far (see BlePermissions.hasBlePermissions
                 // gating both connectAsClient and the server accept path); wrapped defensively anyway since
@@ -234,7 +249,7 @@ class GattSyncManager(
                 // device, not on every retry of an already-known one - a rejected peer's own retry loop
                 // (this app's own Home reconnect-verification included) fires every few seconds, and
                 // re-notifying on each attempt would be spam for something the user already saw once.
-                val isNewPendingDevice = pairingStore.recordPendingResyncRequest(senderDeviceId, bluetoothName, senderPartnerName)
+                val isNewPendingDevice = pairingStore.recordPendingResyncRequest(handshakeVerifiedDeviceId, bluetoothName, senderPartnerName)
                 if (isNewPendingDevice) {
                     Notifications.showResyncRequestNotification(context, currentPairing.partnerName)
                 }
@@ -328,10 +343,13 @@ class GattSyncManager(
         // PairingStore.clearPendingResyncRequestsOlderThan's doc; a no-op when the list is already empty.
         pairingStore.clearPendingResyncRequestsOlderThan(System.currentTimeMillis())
         // SECURITY: only pin once the whole payload has genuinely merged successfully (a no-op after the
-        // first time - see pinPartnerDeviceIdIfAbsent's doc). A blank senderDeviceId (old-build peer, see
-        // this function's own check above) is simply never pinned, which is fine - unauthenticated pairs
-        // still get the exact pre-pinning behavior they always had.
-        if (senderDeviceId.isNotBlank()) pairingStore.pinPartnerDeviceIdIfAbsent(senderDeviceId)
+        // first time - see pinPartnerDeviceIdIfAbsent's doc), and only pin the HANDSHAKE-VERIFIED identity
+        // (see this function's own SECURITY comment near its start for why - this is the fix, not just
+        // the check above: pinning must never trust the unauthenticated JSON body for the value that
+        // becomes this device's permanent trust anchor for the relationship). A blank
+        // handshakeVerifiedDeviceId (old-build peer) is simply never pinned, which is fine -
+        // unauthenticated pairs still get the exact pre-pinning behavior they always had.
+        if (handshakeVerifiedDeviceId.isNotBlank()) pairingStore.pinPartnerDeviceIdIfAbsent(handshakeVerifiedDeviceId)
         return parseRemoteMomentInfo(momentsArr)
     }
 
@@ -1139,6 +1157,23 @@ class GattSyncManager(
     // moment that device's handshake response is verified - see the nonce/HMAC handshake doc at the top
     // of this file.
     private val serverNonces = HashMap<String, ByteArray>()
+    // SECURITY (test-code-allmodels round 3, Sonnet + Opus): the identity the mutual handshake
+    // cryptographically proved for this specific connection - stashed here (keyed by addr, set the
+    // moment authentication succeeds, read when the client's actual JSON payload arrives later on this
+    // same connection) so applyPayload's pin check/pin write can trust THIS instead of the payload's own
+    // unauthenticated, self-reported "senderDeviceId" JSON field. Cleared alongside every other per-addr
+    // map on disconnect.
+    private val serverAuthenticatedDeviceIds = HashMap<String, String>()
+    // SECURITY (test-code-allmodels round 3, Opus, clean-room): before this rework, authenticatedDevices
+    // was populated SYNCHRONOUSLY on the binder thread, so it could never outlive the connection that
+    // earned it. Now that acceptance requires a suspend call (checkPinOrRecordPending reads DataStore),
+    // the commit happens from a scope.launch that can resume AFTER the connection has already dropped and
+    // been cleaned up by onConnectionStateChange(DISCONNECTED) - re-adding a stale "authenticated" entry
+    // for a now-dead connection. If a LATER connection then arrives from the same address, it would
+    // wrongly be treated as already-authenticated (skipping the nonce/handshake entirely) purely because
+    // of that leftover entry. Tracks which addresses currently have a LIVE connection, checked right
+    // before the coroutine commits - see its own call site for the exact re-check.
+    private val serverConnectedAddrs = HashSet<String>()
     // SECURITY (mutual-handshake follow-up): reassembly buffer for message 2 (the client's own
     // nonce+proof+identity, see HandshakeProofMessage) and the outgoing chunk queue for message 3 (this
     // server's own proof+identity reply, see HandshakeReplyMessage) - kept SEPARATE from
@@ -1226,9 +1261,16 @@ class GattSyncManager(
 
         val callback = object : BluetoothGattServerCallback() {
             override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
-                if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    val addr = device.address
+                val addr = device.address
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    // SECURITY (test-code-allmodels round 3, Opus): see serverConnectedAddrs' own doc -
+                    // this is the liveness marker the handshake-completion coroutine re-checks before
+                    // committing authenticatedDevices.add, to detect a connection that already dropped
+                    // while that coroutine was suspended.
+                    synchronized(serverLock) { serverConnectedAddrs.add(addr) }
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     synchronized(serverLock) {
+                        serverConnectedAddrs.remove(addr)
                         authenticatedDevices.remove(addr)
                         serverIncoming.remove(addr)
                         serverOutQueue.remove(addr)
@@ -1238,6 +1280,7 @@ class GattSyncManager(
                         serverNonces.remove(addr)
                         serverHandshakeIncoming.remove(addr)
                         serverHandshakeOutQueue.remove(addr)
+                        serverAuthenticatedDeviceIds.remove(addr)
                     }
                 }
             }
@@ -1254,6 +1297,21 @@ class GattSyncManager(
                 val isAuthenticated = synchronized(serverLock) { authenticatedDevices.contains(addr) }
 
                 if (!isAuthenticated) {
+                    // MINOR fix (test-code-allmodels round 3, Opus, clean-room): an unauthenticated write
+                    // on the PHOTO characteristic used to fall through into the handshake-reassembly logic
+                    // below (which never checked which characteristic it was on) - self-inflicted only
+                    // (same address, fails at the HMAC either way), but the post-auth branch further down
+                    // DOES check the characteristic, so this branch should too for the same reason.
+                    if (characteristic.uuid != BleConstants.SYNC_CHARACTERISTIC_UUID) {
+                        Log.w(TAG, "Rejecting GATT write from unauthenticated device $addr - wrong characteristic")
+                        if (responseNeeded) {
+                            try {
+                                gattServer?.sendResponse(device, requestId, android.bluetooth.BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION, offset, null)
+                            } catch (e: SecurityException) { Log.w(TAG, "sendResponse failed", e) }
+                        }
+                        try { gattServer?.cancelConnection(device) } catch (e: SecurityException) { /* ignore */ }
+                        return
+                    }
                     // SECURITY (mutual-handshake follow-up, per multi-round advisory review): the
                     // client's own proof (message 2 - HandshakeProofMessage) is chunked like everything
                     // else past the default MTU (see this file's "mutual-handshake wire framing" doc) -
@@ -1330,13 +1388,37 @@ class GattSyncManager(
                         try {
                             if (!checkPinOrRecordPending(clientDeviceId, device, clientPartnerName)) {
                                 try { gattServer?.cancelConnection(device) } catch (e: SecurityException) { /* ignore */ }
+                                // MINOR fix (test-code-allmodels round 3, Opus, clean-room): the sibling
+                                // HMAC-rejection branch above already removes the now-useless nonce; this
+                                // branch didn't. Hygiene only (a nonce is worthless without the key
+                                // regardless), but inconsistent with that branch and with stopServer()'s
+                                // own stated discipline of leaving no stale per-device state behind.
+                                synchronized(serverLock) { serverNonces.remove(addr) }
+                                activeServerOnSyncDone(false)
+                                return@launch
+                            }
+                            // SECURITY (test-code-allmodels round 3, Opus): re-check the connection is
+                            // still actually live before committing anything - this coroutine just
+                            // suspended (checkPinOrRecordPending reads DataStore), and the connection could
+                            // have dropped (and been cleaned up by onConnectionStateChange) while it was
+                            // suspended. Committing a stale "authenticated" entry for a now-dead connection
+                            // would let a LATER connection from the same address skip the handshake
+                            // entirely - see serverConnectedAddrs' own doc.
+                            val stillConnected = synchronized(serverLock) { addr in serverConnectedAddrs }
+                            if (!stillConnected) {
+                                Log.w(TAG, "Connection $addr dropped mid-handshake - not committing authentication")
                                 activeServerOnSyncDone(false)
                                 return@launch
                             }
                             // Identity accepted - mark authenticated NOW (before replying) so a stray
                             // write arriving mid-reply is routed to the post-auth JSON path, never back
-                            // into this handshake branch.
-                            synchronized(serverLock) { authenticatedDevices.add(addr); serverNonces.remove(addr) }
+                            // into this handshake branch. Also stash the verified identity itself (see
+                            // serverAuthenticatedDeviceIds' own doc) for when the JSON payload arrives.
+                            synchronized(serverLock) {
+                                authenticatedDevices.add(addr)
+                                serverNonces.remove(addr)
+                                serverAuthenticatedDeviceIds[addr] = clientDeviceId
+                            }
                             val serverDeviceId = settingsStore.getOrCreateLocalDeviceId().toHandshakeFieldBytes()
                             val serverPartnerName = pairingStore.current().partnerName.toHandshakeFieldBytes()
                             val responseS = BleConstants.computeMutualHandshakeResponse(
@@ -1386,9 +1468,10 @@ class GattSyncManager(
                         serverIncoming.remove(addr)
                         buffer.toByteArray()
                     }
+                    val handshakeVerifiedDeviceId = synchronized(serverLock) { serverAuthenticatedDeviceIds[addr] } ?: ""
                     scope.launch {
                         try {
-                            applyPayload(raw, remoteDevice = device)
+                            applyPayload(raw, remoteDevice = device, handshakeVerifiedDeviceId = handshakeVerifiedDeviceId)
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Exception) {
@@ -1658,11 +1741,22 @@ class GattSyncManager(
             // but a stopped server should leave no more stale per-device state here than anywhere else.
             serverHandshakeIncoming.clear()
             serverHandshakeOutQueue.clear()
+            serverAuthenticatedDeviceIds.clear()
+            serverConnectedAddrs.clear()
         }
     }
 
     // ---- CLIENT side ----
 
+    // SECURITY (test-code-allmodels round 3, Sonnet, clean-room): also doubles as the per-attempt
+    // liveness discriminator for the shared class-level buffers below (clientIncoming,
+    // clientHandshakeIncoming, clientPhotoIncoming, clientOutQueue, clientPhotoOutQueue,
+    // metadataResponseSignal, clientChunkPayload/clientPhotoChunkPayload) - a callback belonging to an
+    // OLDER BluetoothGatt object (superseded by a newer connectAsClient() call reassigning this field)
+    // can still fire asynchronously and would otherwise corrupt whatever the newer attempt is
+    // reassembling into those same shared fields. Every callback that touches them checks
+    // `gatt !== clientGatt` first and bails out if it's stale - see onMtuChanged/onCharacteristicWrite/
+    // onCharacteristicChanged below.
     private var clientGatt: BluetoothGatt? = null
     private val clientIncoming = ByteArrayOutputStream()
     private var clientOutQueue: MutableList<ByteArray> = mutableListOf()
@@ -1809,6 +1903,13 @@ class GattSyncManager(
         // have genuinely succeeded - onCharacteristicChanged's fallback branches must check THIS, not the
         // deferred's completion state, before ever treating incoming bytes as real payload/photo data.
         var clientHandshakeVerified = false
+        // SECURITY (test-code-allmodels round 3, Sonnet + Opus): the identity the mutual handshake
+        // cryptographically proved for THIS connection - stashed the moment verification succeeds (see
+        // clientHandshakeVerified's own doc for the exact point), read later when the server's actual
+        // JSON payload arrives, so applyPayload's pin check/pin write can trust THIS instead of the
+        // payload's own unauthenticated, self-reported "senderDeviceId" JSON field. Guarded by clientLock
+        // alongside clientHandshakeVerified.
+        var serverHandshakeVerifiedDeviceId: String? = null
 
         // Guards against calling onSyncDone() twice (e.g. once from a failure path and again from the
         // disconnect that follows it) and makes sure a connection that drops before completing - GATT
@@ -1854,6 +1955,12 @@ class GattSyncManager(
             }
 
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                // SECURITY (test-code-allmodels round 3, Sonnet, clean-room): a stale callback belonging
+                // to an abandoned/superseded connectAsClient() attempt (its BluetoothGatt object is no
+                // longer the current clientGatt) must not be allowed to write shared class-level state on
+                // behalf of a NEWER attempt that's already using it - see clientGatt's own field doc and
+                // the identical guard in onCharacteristicWrite/onCharacteristicChanged below.
+                if (gatt !== clientGatt) return
                 clientChunkPayload = effectiveChunkPayload(mtu, status)
                 clientPhotoChunkPayload = effectiveChunkPayload(mtu, status, BleConstants.MAX_CHUNK_PAYLOAD_PHOTO)
                 Log.d(TAG, "MTU negotiated: $mtu (status=$status) -> chunk payload $clientChunkPayload (photo $clientPhotoChunkPayload)")
@@ -1921,6 +2028,14 @@ class GattSyncManager(
                 scope.launch {
                     val nonceS = withTimeoutOrNull(HANDSHAKE_NONCE_TIMEOUT_MILLIS) { nonceDeferred.await() }
                     if (nonceS == null) {
+                        // SECURITY (test-code-allmodels round 3, Opus): if a NEWER connectAsClient() attempt
+                        // has already superseded this one (clientGatt reassigned), don't call finish(false)
+                        // at all - this attempt's own onSyncDone is a wrapper that also releases
+                        // ProximityForegroundService's single shared clientSyncAttemptInProgress guard, and
+                        // firing it this late (up to HANDSHAKE_NONCE_TIMEOUT_MILLIS after this attempt was
+                        // abandoned) could otherwise release it while a newer, genuinely in-flight attempt
+                        // still holds it.
+                        if (gatt !== clientGatt) return@launch
                         Log.w(TAG, "Timed out waiting for server's handshake nonce")
                         finish(false)
                         // MEDIUM fix: without this, a connection that times out waiting for the nonce
@@ -1968,6 +2083,8 @@ class GattSyncManager(
             }
 
             override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+                // SECURITY (test-code-allmodels round 3, Sonnet, clean-room): see clientGatt's own doc.
+                if (gatt !== clientGatt) return
                 if (characteristic.uuid == BleConstants.PHOTO_CHARACTERISTIC_UUID) {
                     if (status != android.bluetooth.BluetoothGatt.GATT_SUCCESS) {
                         Log.w(TAG, "Photo characteristic write failed with status $status")
@@ -2023,6 +2140,9 @@ class GattSyncManager(
                             val nonceC = synchronized(clientLock) { clientNonceC }
                             val replyRaw = withTimeoutOrNull(HANDSHAKE_NONCE_TIMEOUT_MILLIS) { handshakeReplyDeferred.await() }
                             if (replyRaw == null || nonceS == null || nonceC == null) {
+                                // SECURITY (test-code-allmodels round 3, Opus): see the nonce-timeout
+                                // branch's identical guard above for why this check matters here too.
+                                if (gatt !== clientGatt) return@launch
                                 Log.w(TAG, "Timed out waiting for server's mutual handshake reply")
                                 finish(false)
                                 try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
@@ -2066,7 +2186,10 @@ class GattSyncManager(
                             // BOTH genuinely passed - only now does onCharacteristicChanged's fallback
                             // routing start accepting incoming bytes as real payload/photo data. See
                             // clientHandshakeVerified's own doc for the race this closes.
-                            synchronized(clientLock) { clientHandshakeVerified = true }
+                            synchronized(clientLock) {
+                                clientHandshakeVerified = true
+                                serverHandshakeVerifiedDeviceId = serverDeviceId
+                            }
                             // Mutual auth + identity check both passed - proceed exactly as the
                             // pre-existing post-handshake flow (stall watchdog + build/send real payload).
                             // BUG fix: see metadataResponseSignal's own doc - without this watchdog, a
@@ -2134,6 +2257,11 @@ class GattSyncManager(
 
             @Suppress("DEPRECATION")
             override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+                // SECURITY (test-code-allmodels round 3, Sonnet, clean-room): see clientGatt's own doc -
+                // this is the most important of the three guards, since this callback is the one that
+                // writes into every shared reassembly buffer (clientHandshakeIncoming/clientIncoming/
+                // clientPhotoIncoming) and completes metadataResponseSignal.
+                if (gatt !== clientGatt) return
                 val value = characteristic.value ?: return
                 if (value.isEmpty()) return
 
@@ -2143,6 +2271,14 @@ class GattSyncManager(
                     // no chunk-flag framing, since the server won't send this device anything else until
                     // AFTER it has both authenticated this device's message 2 AND accepted its identity
                     // (see checkPinOrRecordPending's own doc).
+                    // MINOR fix (test-code-allmodels round 3, Opus, clean-room): a wrong-length value here
+                    // used to be accepted as-is - harmless in practice (computeMutualHandshakeResponse
+                    // still derives freshness from the verifier's OWN nonce regardless of the prover's
+                    // length, so this was never actually exploitable), but S1's doc claims fixed-length
+                    // nonces, and this is what makes that claim true by construction rather than by
+                    // accident. A wrong-length value is simply ignored (not completed) - the existing
+                    // HANDSHAKE_NONCE_TIMEOUT_MILLIS wait handles a server that never sends a valid one.
+                    if (value.size != BleConstants.HANDSHAKE_NONCE_BYTES) return
                     nonceDeferred.complete(value)
                     return
                 }
@@ -2230,9 +2366,10 @@ class GattSyncManager(
                     val raw = clientIncoming.toByteArray()
                     clientIncoming.reset()
                     metadataResponseSignal?.complete(Unit)
+                    val handshakeVerifiedDeviceId = synchronized(clientLock) { serverHandshakeVerifiedDeviceId } ?: ""
                     scope.launch {
                         val remoteMomentInfo = try {
-                            applyPayload(raw, remoteDevice = gatt.device)
+                            applyPayload(raw, remoteDevice = gatt.device, handshakeVerifiedDeviceId = handshakeVerifiedDeviceId)
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Exception) {
