@@ -51,6 +51,21 @@ import javax.crypto.spec.SecretKeySpec
  * genuinely obtained the pairing code (not merely a random collision) is not excluded by this mechanism
  * at all, since they can complete the mutual proof honestly. Considered an acceptable residual risk given
  * this app's real threat model (see the Stage 1/Stage 2 design review), not a claim that it's closed.
+ *
+ * KNOWN ACCEPTED RESIDUAL (test-code-allmodels, clean-room round 2, Opus): the handshake is not
+ * symmetric in WHEN each side reveals its identity. Message 2 (the client's proof) carries this device's
+ * deviceId and partnerName in cleartext, sent as soon as the server's nonce notification arrives - before
+ * the server has proved anything back. A party that knows nothing but the replayable advertised prefix
+ * (see the KNOWN ACCEPTED LIMITATION above) can exploit this cheaply: force the victim into the client
+ * role via the attacker-chosen tie-break byte, expose a fake server, and simply notify 16 random bytes as
+ * a "nonce" - the victim's real client will send message 2 back regardless, since it can't yet tell a
+ * real server from a fake one. This discloses the victim's stable per-install device UUID and the
+ * nickname they call their partner, with zero knowledge of the actual pairing code - no payload data, but
+ * real metadata. The server side is not symmetric here: it only discloses its own identity in message 3,
+ * strictly after verifying the client. This is inherent to a 3-message design without a real key
+ * exchange (the client necessarily proves itself first), and is not fixable within Stage 1's scope - a
+ * PAKE-derived session key (Stage 2) would let identity disclosure happen only after mutual, not
+ * one-sided, trust is established.
  */
 object BleConstants {
     /** Shared by every Twogether install so the scanner can find any Twogether beacon at the OS filter level. */

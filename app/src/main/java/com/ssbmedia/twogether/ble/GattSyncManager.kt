@@ -1350,9 +1350,33 @@ class GattSyncManager(
                     // connection: that connection's next write is treated as unauthenticated, rejected
                     // (serverNonces[addr] is already null post-auth), and the peer's own retry/reconnect
                     // logic recovers it - fail-closed, not silent corruption.
+                    // SECURITY (test-code-allmodels, clean-room round 2, Fable): the two trust maps
+                    // above are NOT the only state that must be cleared here. onNotificationSent below
+                    // pumps serverOutQueue/serverPhotoOutQueue/serverHandshakeOutQueue purely by address,
+                    // with NO authentication check of its own - it trusts that anything queued there was
+                    // legitimately queued for whoever is currently connected at that address. If the
+                    // ORIGINAL authenticated connection's real payload was still mid-send (queued chunks)
+                    // when its STATE_DISCONNECTED was missed, those leftover chunks would otherwise still
+                    // be sitting in the queue for this NEW connection at the same address - and the very
+                    // next notification confirmation for it (e.g. its own handshake nonce, sent moments
+                    // from now in onDescriptorWriteRequest) would drain them straight through. Clearing
+                    // every per-address buffer here, not just the two trust maps, closes that: for a
+                    // genuinely NEW connection none of these buffers legitimately hold anything yet, so
+                    // this is safe even in the false-positive case where STATE_CONNECTED spuriously
+                    // refires on an already-genuinely-connected device - it just forces a fail-closed
+                    // reassembly restart, not a bypass. Deliberately NOT clearing serverNonces here (see
+                    // its own doc) or deviceMtus (not security-relevant) - serverNonces is load-bearing
+                    // for a legitimate in-flight handshake's atomic commit check, and clearing it out from
+                    // under a real in-progress handshake would self-inflict a spurious rejection.
                     synchronized(serverLock) {
                         authenticatedDevices.remove(addr)
                         serverAuthenticatedDeviceIds.remove(addr)
+                        serverIncoming.remove(addr)
+                        serverOutQueue.remove(addr)
+                        serverPhotoIncoming.remove(addr)
+                        serverPhotoOutQueue.remove(addr)
+                        serverHandshakeIncoming.remove(addr)
+                        serverHandshakeOutQueue.remove(addr)
                     }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     synchronized(serverLock) {
@@ -1735,9 +1759,20 @@ class GattSyncManager(
 
     /** SECURITY (mutual-handshake follow-up): sends message 3 (this server's own proof+identity reply,
      * see HandshakeReplyMessage) - chunked exactly like sendToClient's post-auth payload, just queued
-     * separately (serverHandshakeOutQueue, pumped first by onNotificationSent) since this always
-     * happens strictly before the device is marked authenticated. */
+     * separately (serverHandshakeOutQueue, pumped first by onNotificationSent). By the time this is
+     * called the device IS already marked authenticated (the atomic commit block adds it to
+     * authenticatedDevices before calling this) - the caller still suspends twice after that commit
+     * (getOrCreateLocalDeviceId, pairingStore.current()) building the reply contents, so, same as
+     * sendToClient/respondToPhotoRequest, re-verify liveness immediately before sending (test-code-
+     * allmodels, clean-room round 2, Opus) rather than trusting the commit is still valid this much
+     * later. Message 3 itself carries no real payload (only this device's own deviceId/partnerName/
+     * proof, useless to anyone but the exact dead connection its MAC is bound to), so this is a
+     * consistency hardening rather than a top-invariant fix. */
     private fun sendHandshakeReplyToClient(device: BluetoothDevice, message: ByteArray) {
+        if (!synchronized(serverLock) { authenticatedDevices.contains(device.address) }) {
+            Log.w(TAG, "Not sending handshake reply - ${device.address} is no longer an authenticated connection")
+            return
+        }
         val mtu = synchronized(serverLock) { deviceMtus[device.address] } ?: DEFAULT_ATT_MTU
         val chunkPayload = effectiveChunkPayload(mtu, BluetoothGatt.GATT_SUCCESS)
         val chunks = toChunks(message, chunkPayload).toMutableList()
@@ -2020,17 +2055,26 @@ class GattSyncManager(
         // rather than silently reusing whatever a previous, unrelated attempt happened to negotiate.
         clientChunkPayload = effectiveChunkPayload(DEFAULT_ATT_MTU, android.bluetooth.BluetoothGatt.GATT_FAILURE)
         clientPhotoChunkPayload = effectiveChunkPayload(DEFAULT_ATT_MTU, android.bluetooth.BluetoothGatt.GATT_FAILURE, BleConstants.MAX_CHUNK_PAYLOAD_PHOTO)
-        // Both of these are mutated from BluetoothGattCallback methods, which run on binder threads (not
-        // necessarily the same thread, and not guaranteed not to interleave) - just like
+        // Mutated from BluetoothGattCallback methods, which run on binder threads (not necessarily the
+        // same thread, and not guaranteed not to interleave) - just like
         // serverIncoming/serverOutQueue/authenticatedDevices/deviceMtus on the server side above, a
         // plain unguarded var here is a real race: two callback invocations landing close together could
         // both observe the pre-flip value and both proceed (e.g. both pass `if (completed) return`,
-        // double-invoking the sync-completion path; or both pass the handshakeAcked check and each
-        // independently kick off sending the local ideas list). Guarded by clientLock, the same lock
-        // already used below for clientOutQueue.
+        // double-invoking the sync-completion path). Guarded by clientLock, the same lock already used
+        // below for clientOutQueue.
         var completed = false
-        // Set once both the sync AND photo characteristics have enabled notifications, so the handshake
-        // (the actual start of real data exchange) never races ahead of either subscription being ready.
+        // SECURITY (test-code-allmodels, clean-room round 2, Opus - doc accuracy): unlike `completed`
+        // above, this one is genuinely NOT lock-guarded (read/written directly from onDescriptorWrite, a
+        // binder-thread callback, with no synchronized(clientLock) around either access) - an earlier
+        // version of this comment incorrectly implied it was. Left unguarded deliberately rather than
+        // fixed: a torn/stale read here can only cause onDescriptorWrite's `!syncCccdDone &&
+        // descriptor.characteristic.uuid == SYNC_CHARACTERISTIC_UUID` branch to be skipped or re-entered
+        // at most once, and the two effects that branch has (enabling photo notifications, moving on to
+        // the handshake) are each themselves idempotent/one-shot-latched elsewhere - it cannot loop or
+        // double-launch the handshake proof coroutine (that latch is `clientHandshakeOutQueue`, under
+        // clientLock). Set once both the sync AND photo characteristics have enabled notifications, so
+        // the handshake (the actual start of real data exchange) never races ahead of either subscription
+        // being ready.
         var syncCccdDone = false
         // Completed by onCharacteristicChanged the moment the server's handshake nonce notification
         // arrives (always the very first notification on the sync characteristic - see this file's
