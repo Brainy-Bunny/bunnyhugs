@@ -922,6 +922,32 @@ class GattSyncManager(
         // path, and a stale `true` left over from an EARLIER, unrelated failed attempt could otherwise
         // still be sitting there when THIS attempt's result is read.
         lastSyncFailedDueToPartnerMismatch = false
+        // SECURITY (test-code-allmodels round 4, Opus - blocker): a blank deviceId has no legitimate
+        // sender (getOrCreateLocalDeviceId() is never blank) - previously this passed trivially
+        // whenever no pin existed yet (via the pinned.isNullOrBlank() fast-path below), and a blank id
+        // is also never pinned afterward (see applyPayload's own guard), so that pairing would stay
+        // stuck in trust-on-first-use forever. Reject outright rather than silently accepting an
+        // identity that can never be pinned.
+        if (remoteDeviceId.isBlank()) {
+            Log.w(TAG, "Rejecting handshake: peer's proven deviceId was blank")
+            lastSyncFailedDueToPartnerMismatch = true
+            return false
+        }
+        // SECURITY (test-code-allmodels round 4, Opus - BLOCKER): same-role handshake reflection. One
+        // phone holds BOTH GATT roles at once (its own server, plus its own client on the periodic
+        // tick/manual "Sync now"), sharing the same handshakeKey - so an attacker who relays a message
+        // THIS device's own client produced (proving this device's identity) back to this device's own
+        // server (or vice versa) hands over a handshake message the HMAC genuinely verifies, without
+        // the attacker ever knowing the shared secret. Every message a device signs always carries its
+        // OWN deviceId (see computeMutualHandshakeResponse's call sites), so a peer that "proves"
+        // itself using OUR OWN deviceId can only be a reflected copy of our own signature - a real
+        // partner always signs with its own, different, deviceId. Reject unconditionally, before the
+        // pin check below, so this can never fall through the "no pin yet" fast-path and self-pin.
+        if (remoteDeviceId == settingsStore.getOrCreateLocalDeviceId()) {
+            Log.w(TAG, "Rejecting handshake: peer's proven deviceId is our own device id (reflection)")
+            lastSyncFailedDueToPartnerMismatch = true
+            return false
+        }
         if (pinned.isNullOrBlank() || remoteDeviceId == pinned) return true
         Log.w(TAG, "Rejecting handshake: connecting device did not match this pairing's pinned partner")
         // MAJOR fix (test-code-allmodels round 1, Opus): this rejection now happens BEFORE applyPayload
@@ -1164,16 +1190,30 @@ class GattSyncManager(
     // unauthenticated, self-reported "senderDeviceId" JSON field. Cleared alongside every other per-addr
     // map on disconnect.
     private val serverAuthenticatedDeviceIds = HashMap<String, String>()
-    // SECURITY (test-code-allmodels round 3, Opus, clean-room): before this rework, authenticatedDevices
-    // was populated SYNCHRONOUSLY on the binder thread, so it could never outlive the connection that
-    // earned it. Now that acceptance requires a suspend call (checkPinOrRecordPending reads DataStore),
-    // the commit happens from a scope.launch that can resume AFTER the connection has already dropped and
-    // been cleaned up by onConnectionStateChange(DISCONNECTED) - re-adding a stale "authenticated" entry
-    // for a now-dead connection. If a LATER connection then arrives from the same address, it would
-    // wrongly be treated as already-authenticated (skipping the nonce/handshake entirely) purely because
-    // of that leftover entry. Tracks which addresses currently have a LIVE connection, checked right
-    // before the coroutine commits - see its own call site for the exact re-check.
-    private val serverConnectedAddrs = HashSet<String>()
+    // SECURITY (test-code-allmodels round 3 Opus, round 4 Sonnet + Opus - three successive refinements
+    // of the same finding): before this rework, authenticatedDevices was populated SYNCHRONOUSLY on the
+    // binder thread, so it could never outlive the connection that earned it. Now that acceptance
+    // requires a suspend call (checkPinOrRecordPending reads DataStore), the commit happens from a
+    // scope.launch that can resume AFTER the connection has already dropped and been cleaned up by
+    // onConnectionStateChange(DISCONNECTED). A plain "is this address currently connected" set (round 3's
+    // fix) closes the case where the address is connected AT ALL, but round 4 Sonnet correctly pointed
+    // out that's not enough: BLE addresses are reused across connections (no per-connection identifier
+    // exists at the BluetoothGattServerCallback level), so a SECOND, genuinely different connection could
+    // reconnect at the SAME address while the first one's coroutine is still suspended - the address-only
+    // check would then wrongly see "connected" and commit the FIRST connection's proven identity on
+    // behalf of the SECOND (different) connection, which never itself proved anything. An intermediate
+    // fix (a per-address HashMap<String, Any> token minted in onConnectionStateChange(CONNECTED)) closed
+    // that, but round 4 Opus then pointed out that fix depended on STATE_CONNECTED actually being
+    // delivered - not guaranteed on every Android/OEM BLE stack for a passive GATT server that never
+    // itself calls gattServer.connect() (this one doesn't). The FINAL fix below has no such dependency:
+    // it reuses the per-connection nonce object (serverNonces[addr], see its own doc) as the identity
+    // token instead. A nonce is issued in onDescriptorWriteRequest - guaranteed to fire, since the whole
+    // handshake already depends on it - fresh ByteArray per connection (so `!==` is a true per-connection
+    // discriminator), and already removed on disconnect / replaced on a fresh subscribe. The
+    // handshake-completion coroutine below captures its own connection's nonce reference before
+    // suspending and, in the same synchronized block as the commit, re-checks that serverNonces[addr]
+    // still IS that exact object - never true again once this connection has dropped or a different one
+    // has reconnected at the same address. See the coroutine's own call site.
     // SECURITY (mutual-handshake follow-up): reassembly buffer for message 2 (the client's own
     // nonce+proof+identity, see HandshakeProofMessage) and the outgoing chunk queue for message 3 (this
     // server's own proof+identity reply, see HandshakeReplyMessage) - kept SEPARATE from
@@ -1263,14 +1303,12 @@ class GattSyncManager(
             override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
                 val addr = device.address
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    // SECURITY (test-code-allmodels round 3, Opus): see serverConnectedAddrs' own doc -
-                    // this is the liveness marker the handshake-completion coroutine re-checks before
-                    // committing authenticatedDevices.add, to detect a connection that already dropped
-                    // while that coroutine was suspended.
-                    synchronized(serverLock) { serverConnectedAddrs.add(addr) }
+                    // No-op: the per-connection identity discriminator is now serverNonces[addr]'s own
+                    // object reference (see serverAuthenticatedDeviceIds' neighboring doc above), issued
+                    // in onDescriptorWriteRequest - deliberately NOT tied to STATE_CONNECTED being
+                    // delivered here, since that isn't guaranteed on every stack (round 4, Opus).
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     synchronized(serverLock) {
-                        serverConnectedAddrs.remove(addr)
                         authenticatedDevices.remove(addr)
                         serverIncoming.remove(addr)
                         serverOutQueue.remove(addr)
@@ -1393,31 +1431,54 @@ class GattSyncManager(
                                 // branch didn't. Hygiene only (a nonce is worthless without the key
                                 // regardless), but inconsistent with that branch and with stopServer()'s
                                 // own stated discipline of leaving no stale per-device state behind.
-                                synchronized(serverLock) { serverNonces.remove(addr) }
+                                // SECURITY (test-code-allmodels round 4, Opus follow-up): guarded to only
+                                // remove OUR OWN nonce (`nonceS`, captured before this coroutine suspended
+                                // in checkPinOrRecordPending) - an unconditional removal here could delete
+                                // a genuinely different, still-live connection's nonce if one reconnected
+                                // at this same address while this (rejected) attempt's coroutine was
+                                // suspended, spuriously failing that unrelated connection's own handshake.
+                                synchronized(serverLock) { if (serverNonces[addr] === nonceS) serverNonces.remove(addr) }
                                 activeServerOnSyncDone(false)
                                 return@launch
                             }
-                            // SECURITY (test-code-allmodels round 3, Opus): re-check the connection is
-                            // still actually live before committing anything - this coroutine just
-                            // suspended (checkPinOrRecordPending reads DataStore), and the connection could
-                            // have dropped (and been cleaned up by onConnectionStateChange) while it was
-                            // suspended. Committing a stale "authenticated" entry for a now-dead connection
-                            // would let a LATER connection from the same address skip the handshake
-                            // entirely - see serverConnectedAddrs' own doc.
-                            val stillConnected = synchronized(serverLock) { addr in serverConnectedAddrs }
-                            if (!stillConnected) {
+                            // SECURITY (test-code-allmodels round 4, Fable + Sonnet + Opus, three combined
+                            // fixes - see serverAuthenticatedDeviceIds' neighboring doc for the full
+                            // history): (1) Fable: re-check liveness and commit the authentication in the
+                            // SAME synchronized block - this coroutine just suspended
+                            // (checkPinOrRecordPending reads DataStore), and the connection could have
+                            // dropped (and been cleaned up by onConnectionStateChange, running on a
+                            // different thread) while it was suspended. A separate check-then-commit left a
+                            // TOCTOU gap where a disconnect landing in between two blocks could still let
+                            // this coroutine re-add a stale entry. (2) Sonnet: checking mere address
+                            // PRESENCE isn't enough either, even atomically - a second, genuinely different
+                            // connection could reconnect at the SAME address while this coroutine was
+                            // suspended, and an address-only check can't tell them apart; needs a real
+                            // per-connection identity token. (3) Opus: that per-connection token must not
+                            // itself depend on STATE_CONNECTED being delivered (not guaranteed on every
+                            // stack) - so reuse `nonceS` (captured above, before this coroutine was
+                            // launched) as the token instead: a fresh ByteArray issued in
+                            // onDescriptorWriteRequest for every connection, so `!==` genuinely
+                            // discriminates THIS connection from any earlier or later one at the same
+                            // address, without relying on connection-state callbacks at all.
+                            val committed = synchronized(serverLock) {
+                                if (serverNonces[addr] !== nonceS) {
+                                    false
+                                } else {
+                                    // Identity accepted - mark authenticated NOW (before replying) so a
+                                    // stray write arriving mid-reply is routed to the post-auth JSON path,
+                                    // never back into this handshake branch. Also stash the verified
+                                    // identity itself (see serverAuthenticatedDeviceIds' own doc) for when
+                                    // the JSON payload arrives.
+                                    authenticatedDevices.add(addr)
+                                    serverNonces.remove(addr)
+                                    serverAuthenticatedDeviceIds[addr] = clientDeviceId
+                                    true
+                                }
+                            }
+                            if (!committed) {
                                 Log.w(TAG, "Connection $addr dropped mid-handshake - not committing authentication")
                                 activeServerOnSyncDone(false)
                                 return@launch
-                            }
-                            // Identity accepted - mark authenticated NOW (before replying) so a stray
-                            // write arriving mid-reply is routed to the post-auth JSON path, never back
-                            // into this handshake branch. Also stash the verified identity itself (see
-                            // serverAuthenticatedDeviceIds' own doc) for when the JSON payload arrives.
-                            synchronized(serverLock) {
-                                authenticatedDevices.add(addr)
-                                serverNonces.remove(addr)
-                                serverAuthenticatedDeviceIds[addr] = clientDeviceId
                             }
                             val serverDeviceId = settingsStore.getOrCreateLocalDeviceId().toHandshakeFieldBytes()
                             val serverPartnerName = pairingStore.current().partnerName.toHandshakeFieldBytes()
@@ -1742,7 +1803,6 @@ class GattSyncManager(
             serverHandshakeIncoming.clear()
             serverHandshakeOutQueue.clear()
             serverAuthenticatedDeviceIds.clear()
-            serverConnectedAddrs.clear()
         }
     }
 
@@ -1757,6 +1817,13 @@ class GattSyncManager(
     // reassembling into those same shared fields. Every callback that touches them checks
     // `gatt !== clientGatt` first and bails out if it's stale - see onMtuChanged/onCharacteristicWrite/
     // onCharacteristicChanged below.
+    // SECURITY (test-code-allmodels round 4, Sonnet): written from the service coroutine
+    // (connectAsClient/disconnectClient) and read, with no lock, as the very first statement of every
+    // GATT binder-thread callback above - @Volatile is what actually guarantees a write here is visible
+    // to those reads across threads (object-identity comparison itself is already sound on its own,
+    // since connectGatt() always allocates a fresh BluetoothGatt instance, but without this a stale read
+    // could make the guard wrongly pass for an abandoned gatt or wrongly fail for the current one).
+    @Volatile
     private var clientGatt: BluetoothGatt? = null
     private val clientIncoming = ByteArrayOutputStream()
     private var clientOutQueue: MutableList<ByteArray> = mutableListOf()
@@ -1940,16 +2007,32 @@ class GattSyncManager(
                         try { gatt.discoverServices() } catch (e2: SecurityException) { finish(false) }
                     }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    // Feature 2: unblock anything still awaiting a photo-phase signal so that coroutine
-                    // can proceed to its own cleanup promptly instead of sitting until
-                    // PHOTO_PHASE_TIMEOUT_MILLIS elapses for no reason - CompletableDeferred.complete()
-                    // is a safe no-op if already completed.
-                    synchronized(clientLock) { clientPhotoOutQueue.clear() }
-                    clientPhotoIncoming.reset()
-                    clientPhotoSendComplete?.complete(Unit)
-                    photoDoneSignal?.complete(Unit)
-                    metadataResponseSignal?.complete(Unit)
-                    finish(false)
+                    // SECURITY (test-code-allmodels round 4, Sonnet + Fable, independently converged):
+                    // this callback belongs to a SPECIFIC BluetoothGatt object and can still fire
+                    // asynchronously after a NEWER connectAsClient() call has already reassigned
+                    // clientGatt (both connectAsClient and disconnectClient explicitly disconnect()+
+                    // close() any old gatt before superseding it, but ITS OWN async DISCONNECTED
+                    // callback can still arrive later) - every other client callback in this file
+                    // already guards against exactly this (see clientGatt's own doc), but this one
+                    // didn't. Completing shared clientPhotoSendComplete/photoDoneSignal/
+                    // metadataResponseSignal or clearing shared clientPhotoOutQueue/clientPhotoIncoming
+                    // on behalf of a stale attempt could resolve/corrupt state belonging to a newer,
+                    // still-in-flight attempt; calling finish(false) could release the shared
+                    // clientSyncAttemptInProgress guard on behalf of an attempt that isn't this one.
+                    // gatt.close() below still runs unconditionally regardless - it's always safe/
+                    // idempotent and is exactly the right cleanup for THIS gatt object either way.
+                    if (gatt === clientGatt) {
+                        // Feature 2: unblock anything still awaiting a photo-phase signal so that
+                        // coroutine can proceed to its own cleanup promptly instead of sitting until
+                        // PHOTO_PHASE_TIMEOUT_MILLIS elapses for no reason - CompletableDeferred.complete()
+                        // is a safe no-op if already completed.
+                        synchronized(clientLock) { clientPhotoOutQueue.clear() }
+                        clientPhotoIncoming.reset()
+                        clientPhotoSendComplete?.complete(Unit)
+                        photoDoneSignal?.complete(Unit)
+                        metadataResponseSignal?.complete(Unit)
+                        finish(false)
+                    }
                     try { gatt.close() } catch (e: SecurityException) { /* ignore */ }
                 }
             }
@@ -2148,6 +2231,16 @@ class GattSyncManager(
                                 try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
                                 return@launch
                             }
+                            // SECURITY (test-code-allmodels round 4, Opus): the await() above is this
+                            // coroutine's first suspension point - a NEWER connectAsClient() attempt could
+                            // have superseded this one (clientGatt reassigned) while it was suspended. The
+                            // entry-time guard on gatt !== clientGatt (checked when this whole scope.launch
+                            // was first dispatched, back in onCharacteristicWrite) does NOT cover this -
+                            // it only proves this was the current attempt BEFORE suspending, not after.
+                            // Re-check before touching anything below on behalf of a possibly-abandoned
+                            // attempt; every subsequent suspension point in this coroutine gets the same
+                            // re-check for the same reason.
+                            if (gatt !== clientGatt) return@launch
                             // SECURITY (mutual-handshake follow-up): verifies message 3 (the server's own
                             // proof+identity reply) BEFORE this device ever builds/sends its real payload -
                             // see BleConstants.computeMutualHandshakeResponse's own doc. A fake "server"
@@ -2177,7 +2270,12 @@ class GattSyncManager(
                             // ever handing its own data to a rejected identity in the first place).
                             val serverDeviceId = String(decoded.deviceId, Charsets.UTF_8)
                             val serverPartnerName = String(decoded.partnerName, Charsets.UTF_8)
-                            if (!checkPinOrRecordPending(serverDeviceId, device, serverPartnerName)) {
+                            val identityOk = checkPinOrRecordPending(serverDeviceId, device, serverPartnerName)
+                            // SECURITY (test-code-allmodels round 4, Opus): checkPinOrRecordPending above
+                            // suspends (DataStore I/O) - re-check staleness, see the identical comment
+                            // after the earlier await() above.
+                            if (gatt !== clientGatt) return@launch
+                            if (!identityOk) {
                                 finish(false)
                                 try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
                                 return@launch
@@ -2240,12 +2338,20 @@ class GattSyncManager(
                                 }
                             }
                             val payload = buildPayload()
+                            // SECURITY (test-code-allmodels round 4, Opus): buildPayload above suspends
+                            // (Room I/O) - re-check staleness before overwriting the shared clientOutQueue
+                            // a NEWER attempt may already be pumping from.
+                            if (gatt !== clientGatt) return@launch
                             synchronized(clientLock) { clientOutQueue = toChunks(payload, clientChunkPayload).toMutableList() }
                             sendNextClientChunk(gatt, characteristic)
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Exception) {
                             Log.w(TAG, "Failed to complete mutual handshake / build outgoing sync payload as client", e)
+                            // SECURITY (test-code-allmodels round 4, Opus): this catch can be reached after
+                            // any of the suspension points above - don't call finish()/disconnect() on
+                            // behalf of an attempt that's no longer current.
+                            if (gatt !== clientGatt) return@launch
                             finish(false)
                             try { gatt.disconnect() } catch (e2: SecurityException) { /* ignore */ }
                         }
@@ -2374,10 +2480,19 @@ class GattSyncManager(
                             throw e
                         } catch (e: Exception) {
                             Log.w(TAG, "Failed to parse incoming sync payload - reporting failure instead of a silent empty merge", e)
+                            // SECURITY (test-code-allmodels round 4, Opus): applyPayload above suspends
+                            // (Room I/O) - don't call finish()/disconnect() on behalf of an attempt a
+                            // newer connectAsClient() call may have already superseded. See clientGatt's
+                            // own doc.
+                            if (gatt !== clientGatt) return@launch
                             finish(false)
                             try { gatt.disconnect() } catch (e2: SecurityException) { /* ignore */ }
                             return@launch
                         }
+                        // SECURITY (test-code-allmodels round 4, Opus): re-check staleness after
+                        // applyPayload's suspension before touching finish()/the shared
+                        // clientSyncAttemptInProgress guard below.
+                        if (gatt !== clientGatt) return@launch
                         // Feature 2: metadata sync succeeded - now attempt the photo phase over this same
                         // authenticated connection before disconnecting. A failure/timeout here must never
                         // undo the metadata sync that already genuinely succeeded above.
@@ -2388,6 +2503,10 @@ class GattSyncManager(
                         } catch (e: Exception) {
                             Log.w(TAG, "Photo phase failed - metadata sync itself already succeeded", e)
                         }
+                        // SECURITY (test-code-allmodels round 4, Opus): runPhotoPhaseAsClient above also
+                        // suspends extensively (network I/O) - re-check once more before the final
+                        // finish(true)/disconnect.
+                        if (gatt !== clientGatt) return@launch
                         finish(true)
                         try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
                     }
