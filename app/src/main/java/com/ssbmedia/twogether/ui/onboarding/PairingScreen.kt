@@ -48,6 +48,7 @@ import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.ble.BlePermissions
 import com.ssbmedia.twogether.data.datastore.LastConnectionInfo
 import com.ssbmedia.twogether.data.datastore.PairingStore
+import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
 import com.ssbmedia.twogether.util.Hashing
 import kotlinx.coroutines.Dispatchers
@@ -72,10 +73,22 @@ class PairingViewModel(private val pairingStore: PairingStore) : ViewModel() {
     val lastConnection = pairingStore.lastConnection
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), LastConnectionInfo())
 
-    /** Restores the previous pairing instantly (no code re-entry) - see PairingStore.reconnectToLast(). */
+    /** MINOR fix (ultimate-app-review, user-requested follow-up): restores the previous pairing as
+     * before, but also fires AppEvents.emitJustReconnected() so HomeScreen - not this screen - can
+     * verify it actually worked and tell the user if it didn't (see AppEvents.justReconnected's own
+     * doc for why the check has to happen there, not here). Tried first as a check running ON this
+     * screen before proceeding: doesn't work architecturally - MainActivity's own top-level routing
+     * reactively swaps away from PairingScreen entirely the INSTANT reconnectToLast() flips
+     * PairingInfo.isPaired (see MainActivity.kt's `!loadedPairing.isPaired -> PairingScreen(...)`
+     * branch), independent of whatever onDone() does - so this screen (and any ViewModel-owned
+     * coroutine still running on it, including a would-be "wait up to 8s" check) gets torn down before
+     * it could ever show anything, live-confirmed empirically (no dialog ever appeared, not even once,
+     * across repeated attempts). Threading a "still verifying" gate into that routing (which also
+     * guards the PIN lock) was too invasive a change for what this fix needs. */
     fun reconnect(onDone: () -> Unit) {
         viewModelScope.launch {
             pairingStore.reconnectToLast()
+            AppEvents.emitJustReconnected()
             onDone()
         }
     }

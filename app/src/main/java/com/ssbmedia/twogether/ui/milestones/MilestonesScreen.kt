@@ -146,7 +146,12 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onI
 
     var showAddDialog by remember { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<Milestone?>(null) }
-    var editingPhotoFor by remember { mutableStateOf<Milestone?>(null) }
+    // MINOR fix (ultimate-app-review round 3, user-requested follow-up): was
+    // `remember { mutableStateOf<Milestone?>(null) }` - rotating the device with the edit-photo dialog
+    // open silently closed it (no crash/data loss, just an inconsistency with retrospectiveForId right
+    // below, which already survives rotation). Same fix, same reasoning: store only the milestone's ID
+    // via rememberSaveable and derive the actual Milestone from the already-loaded list.
+    var editingPhotoForId by rememberSaveable { mutableStateOf<String?>(null) }
     // BUG fix: was `var retrospectiveFor by remember { mutableStateOf<Milestone?>(null) }` - a further
     // review round found that plain `remember` here defeated the ROTATION half of the fix below (making
     // NavGraph's latchedMilestoneId `rememberSaveable`): the caller's latch is nulled via
@@ -160,6 +165,7 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onI
     // rotation too.
     var retrospectiveForId by rememberSaveable { mutableStateOf<String?>(null) }
     val retrospectiveFor = milestones.firstOrNull { it.id == retrospectiveForId }
+    val editingPhotoFor = milestones.firstOrNull { it.id == editingPhotoForId }
 
     // BUG fix: an independent review round found the caller-side latch (NavGraph.kt's
     // latchedMilestoneId, which this screen's initialMilestoneId is fed from) was never cleared after
@@ -243,7 +249,7 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onI
                                 }
                             }
                             Row {
-                                IconButton(onClick = { editingPhotoFor = milestone }) {
+                                IconButton(onClick = { editingPhotoForId = milestone.id }) {
                                     Icon(Icons.Filled.Edit, contentDescription = "Edit photo")
                                 }
                                 IconButton(onClick = { pendingDelete = milestone }) {
@@ -286,10 +292,10 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onI
         EditMilestonePhotoDialog(
             milestone = milestone,
             availableMoments = availableMoments,
-            onDismiss = { editingPhotoFor = null },
+            onDismiss = { editingPhotoForId = null },
             onSave = { linkedMomentSyncId ->
                 vm.setLinkedMoment(milestone, linkedMomentSyncId)
-                editingPhotoFor = null
+                editingPhotoForId = null
             }
         )
     }
@@ -482,7 +488,13 @@ private fun EditMilestonePhotoDialog(milestone: Milestone, availableMoments: Lis
         title = { Text("Photo for \"${milestone.label}\"") },
         text = {
             Column {
-                if (hadDanglingLink) {
+                // MINOR fix (ultimate-app-review round 3, Opus): was just `if (hadDanglingLink)` - that
+                // flag is a one-time latch (see the LaunchedEffect above) and never resets, so once a
+                // dangling link got cleared, this warning stayed on screen even after the user picked a
+                // perfectly valid replacement photo. Save always persisted the correct value regardless
+                // (this was cosmetic only), but also require selectedMomentSyncId == null so the warning
+                // disappears the instant there's a real selection to show instead.
+                if (hadDanglingLink && selectedMomentSyncId == null) {
                     Text(
                         "This milestone's photo isn't available anymore — pick a new one, or tap Save to clear it.",
                         style = MaterialTheme.typography.bodySmall,

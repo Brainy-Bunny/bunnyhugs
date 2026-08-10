@@ -81,6 +81,30 @@ object AppEvents {
         _unpaired.tryEmit(Unit)
     }
 
+    /** onboarding -> Home: "Reconnect to X" was just tapped (PairingViewModel.reconnect()) - see that
+     * function's own doc for why the verification this triggers can't happen ON the pairing screen
+     * itself: MainActivity's top-level routing reactively swaps away from PairingScreen the INSTANT
+     * reconnectToLast() flips PairingInfo.isPaired, before any check running there could ever complete
+     * or show anything (live-confirmed empirically). Home is the first screen guaranteed to actually
+     * stick around afterward, so it's the one that verifies the reconnect actually worked and tells the
+     * user if it didn't. A `StateFlow`, not a `SharedFlow`, deliberately - Home's own collector starts
+     * only once IT mounts, which happens strictly after this is set (Home doesn't exist until
+     * MainActivity's routing has already left PairingScreen); a replay=0 SharedFlow would drop the
+     * event exactly the same way the original bug did, which is the whole thing this design has to
+     * avoid. consumeJustReconnected() resets it back to false so it doesn't refire on every later Home
+     * recomposition (rotation, backgrounding, etc.) - same one-shot latch shape as NavGraph's own
+     * latchedMilestoneId. */
+    private val _justReconnected = MutableStateFlow(false)
+    val justReconnected: StateFlow<Boolean> = _justReconnected.asStateFlow()
+
+    fun emitJustReconnected() {
+        _justReconnected.value = true
+    }
+
+    fun consumeJustReconnected() {
+        _justReconnected.value = false
+    }
+
     /** service -> UI: syncIds of Moments this device is CURRENTLY in the middle of requesting/receiving
      * photo bytes for over GATT (Feature 2), so MomentsScreen can show a "Receiving photo…" progress
      * indicator instead of the old static "photo is on your partner's phone" placeholder while a

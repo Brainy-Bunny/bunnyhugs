@@ -32,12 +32,23 @@ import javax.crypto.spec.SecretKeySpec
  * like the real partner would, for as long as both phones kept running the background proximity
  * service - not just once. PairingStore.pinPartnerDeviceIdIfAbsent + GattSyncManager.applyPayload's use
  * of it now close most of that: the first sync after pairing pins whichever device we synced with as
- * the trusted partner, and every later sync from a different device id is rejected outright. This is
+ * the trusted partner, and every later sync from a different device id is rejected outright - no data
+ * from that payload is EVER merged into our own DB, unconditionally, regardless of role. This is
  * trust-on-first-use, not a full fix - if a colliding stranger's phone happens to win the race to be
  * first to sync (needs matching code + BLE range + beating the real partner to it), that stranger gets
  * pinned instead. Considered an acceptable residual risk for the same reason the rest of this file's
  * gaps are: closing it completely would need a longer code and/or a manual confirm-on-first-connect
  * step, out of scope for this pass.
+ *
+ * PRECISION NOTE (ultimate-app-review round 2, Opus): "rejected outright" above is airtight for the
+ * INBOUND merge (the guarantee this whole mechanism exists for) - it is not equally proven for our OWN
+ * OUTBOUND send while we're in the CLIENT role. The pin check runs inside applyPayload, a separate
+ * coroutine from the one that resumes the client's send/watchdog flow on chunk receipt, so there is no
+ * structural guarantee our own payload can't start sending before that coroutine has evaluated the
+ * mismatch. Empirically the connection tears down before any send completes once a mismatch is
+ * detected (observed live, repeatedly), but that's current behavior, not a proven ordering invariant -
+ * don't read "rejected outright" as covering the CLIENT role's outbound send with the same certainty it
+ * covers the merge.
  */
 object BleConstants {
     /** Shared by every Twogether install so the scanner can find any Twogether beacon at the OS filter level. */

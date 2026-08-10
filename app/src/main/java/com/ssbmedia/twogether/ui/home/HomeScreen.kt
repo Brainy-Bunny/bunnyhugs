@@ -15,6 +15,8 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.lazy.LazyRow
@@ -22,15 +24,18 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.animation.core.animateOffsetAsState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -82,14 +87,17 @@ import com.ssbmedia.twogether.ui.components.SectionHeader
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
 import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** Stable ids for each Home "Quick links" chip - persisted as the drag-and-drop reorder preference
  * (SettingsStore.setQuickLinksOrder) instead of the display label, which could change wording later
@@ -292,6 +300,65 @@ fun HomeScreen(
         AppEvents.reunionEvents.collect {
             showReunion = true
             ServiceLocator.proximityStateStore.update { it.copy(pendingReunionCelebration = false) }
+        }
+    }
+
+    // MINOR fix (ultimate-app-review, user-requested follow-up): "Reconnect to X" on the pairing
+    // screen restores a pin that can be stale (partner reinstalled since last pairing) with no
+    // feedback - the user just lands in the app and only finds out later, if at all, from a subtle
+    // Settings-screen subtitle change. See AppEvents.justReconnected's own doc for why this check has
+    // to live HERE (Home), not on the pairing screen where the reconnect actually happened.
+    var reconnectVerifying by remember { mutableStateOf(false) }
+    var reconnectMismatch by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        AppEvents.justReconnected.collect { justReconnected ->
+            if (!justReconnected) return@collect
+            AppEvents.consumeJustReconnected()
+            reconnectVerifying = true
+            // Same "retry every second, cancel on the first real result" shape as OurListsScreen's
+            // manual sync button, but a much longer window (live-measured, not guessed): unlike an
+            // ordinary "Sync now" tap during an ALREADY-established together session (what the 8s
+            // window elsewhere is tuned for), this fires right after the proximity service has just
+            // cold-restarted (unpair -> reconnect) and has to rediscover the partner's phone over BLE
+            // from scratch - live-measured on this project's own test setup at up to ~2 minutes from
+            // service restart to the two phones showing as "together" at all, let alone completing a
+            // sync. 30s is a compromise: long enough to have a real chance of catching a cold discovery
+            // without feeling hung, short of the multi-minute worst case - a genuinely slow
+            // reconnect still correctly falls through to silence (see the null-check below) rather
+            // than a false "couldn't reconnect".
+            // BUG fix (live-caught with debug logging during manual verification): plain .first() took
+            // whatever syncCompleted(false) arrived FIRST as "the" result - but startGattSyncIfNeeded
+            // has several early-exit paths (a tie-break byte collision, the service not fully up yet
+            // right after a cold restart) that emit syncCompleted(false) almost instantly, structurally
+            // unrelated to whether the partner's identity actually matches. That spurious early false
+            // was resolving this check in single-digit milliseconds, long before a real BLE connection
+            // could possibly complete, and (since lastSyncFailedDueToPartnerMismatch was correctly still
+            // false for it) never triggered a false dialog - but it also meant the 30s retry window was
+            // being thrown away on the very first structural hiccup instead of ever getting a chance to
+            // observe a REAL attempt. first { predicate } instead of first() skips exactly those - it
+            // only resolves on a genuine success, or a failure specifically flagged as a partner
+            // mismatch, and keeps waiting (letting the retry loop keep nudging) through anything else.
+            val success = withTimeoutOrNull(30_000) {
+                coroutineScope {
+                    val retryJob = launch {
+                        while (true) {
+                            AppEvents.requestManualSync()
+                            delay(1_000)
+                        }
+                    }
+                    val result = AppEvents.syncCompleted.first { s -> s || AppEvents.lastSyncFailedDueToPartnerMismatch.value }
+                    retryJob.cancel()
+                    result
+                }
+            }
+            reconnectVerifying = false
+            // success == null means the window elapsed with no qualifying result at all (couple not
+            // together right now to test it) - genuinely ambiguous, not evidence of failure, so stay
+            // silent rather than false-alarm; the existing Settings/Our Lists messaging still catches a
+            // real mismatch whenever a sync eventually does run.
+            if (success == false && AppEvents.lastSyncFailedDueToPartnerMismatch.value) {
+                reconnectMismatch = true
+            }
         }
     }
 
@@ -499,6 +566,36 @@ fun HomeScreen(
         if (showReunion) {
             ReunionOverlay(onDismiss = { showReunion = false })
         }
+    }
+
+    if (reconnectVerifying) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Reconnecting…") },
+            text = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text("Checking that your partner's phone is still there.")
+                }
+            },
+            confirmButton = {}
+        )
+    }
+
+    if (reconnectMismatch) {
+        AlertDialog(
+            onDismissRequest = { reconnectMismatch = false },
+            title = { Text("Couldn't reconnect") },
+            text = {
+                Text(
+                    "This doesn't look like ${pairingInfo?.partnerName?.ifBlank { "your partner" } ?: "your partner"}'s " +
+                        "phone anymore — it may have been reset or reinstalled. Ask them for a fresh pairing code, " +
+                        "then go to Settings to unpair and create a new one."
+                )
+            },
+            confirmButton = { TextButton(onClick = { reconnectMismatch = false }) { Text("Okay") } }
+        )
     }
 }
 
