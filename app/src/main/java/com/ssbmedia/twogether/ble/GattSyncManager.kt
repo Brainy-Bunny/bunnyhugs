@@ -42,6 +42,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.security.MessageDigest
 import java.security.SecureRandom
 
 /**
@@ -1452,7 +1453,11 @@ class GattSyncManager(
                         Log.w(TAG, "Failed to compute expected handshake response", e)
                         null
                     }
-                    if (decoded == null || expectedResponse == null || !expectedResponse.contentEquals(decoded.response)) {
+                    // SECURITY (test-code-allmodels, clean-room final pass, Opus + Fable, S1): constant-time
+                    // comparison rather than contentEquals' byte-wise early exit - a fresh nonce per
+                    // connection already makes an adaptive timing oracle impractical here, but this costs
+                    // nothing and removes the argument entirely.
+                    if (decoded == null || expectedResponse == null || !MessageDigest.isEqual(expectedResponse, decoded.response)) {
                         Log.w(TAG, "Rejecting GATT write from unauthenticated device $addr - missing/invalid handshake")
                         try { gattServer?.cancelConnection(device) } catch (e: SecurityException) { /* ignore */ }
                         // SECURITY (test-code-allmodels round 5, Sonnet): guarded to only remove OUR OWN
@@ -1702,7 +1707,23 @@ class GattSyncManager(
         }
     }
 
+    // SECURITY (test-code-allmodels, clean-room final pass, Opus - TOP INVARIANT): the caller
+    // (onCharacteristicWriteRequest's post-auth LAST branch) suspends for buildPayload() - real Room
+    // I/O across every table, easily hundreds of ms - between reading the incoming payload and calling
+    // this. Nothing previously re-checked that `device`'s address was STILL an authenticated connection
+    // once that suspension resolved: an ordinary mid-sync disconnect (no attacker needed) followed by a
+    // different device reconnecting at the same address (a spoofed clone, or Android reusing/rotating a
+    // random BLE address) would otherwise receive this device's full real payload with no re-proof of
+    // the shared secret at all, since notifyCharacteristicChanged targets whatever central currently
+    // holds that address, not the specific session that was originally authenticated. Re-checking here,
+    // right before the send, closes it: authenticatedDevices/serverAuthenticatedDeviceIds are cleared on
+    // disconnect and (see onConnectionStateChange's STATE_CONNECTED doc) on a new connection replacing a
+    // stale one, so a dropped-and-replaced address fails this check and the send is silently skipped.
     private fun sendToClient(device: BluetoothDevice, payload: ByteArray) {
+        if (!synchronized(serverLock) { authenticatedDevices.contains(device.address) }) {
+            Log.w(TAG, "Not sending sync response - ${device.address} is no longer an authenticated connection")
+            return
+        }
         val mtu = synchronized(serverLock) { deviceMtus[device.address] } ?: DEFAULT_ATT_MTU
         val chunkPayload = effectiveChunkPayload(mtu, BluetoothGatt.GATT_SUCCESS)
         val chunks = toChunks(payload, chunkPayload).toMutableList()
@@ -1726,14 +1747,27 @@ class GattSyncManager(
         sendRawNotification(device, first)
     }
 
+    // SECURITY (test-code-allmodels, clean-room final pass, Opus - TOP INVARIANT): serverCharacteristic
+    // is ONE object shared by every connected central, not per-connection - the deprecated 3-arg
+    // notifyCharacteristicChanged reads characteristic.getValue() internally when it marshals the
+    // binder call, so "set .value, then notify" is a genuine race between ANY two calls to this
+    // function for DIFFERENT devices (this server accepts multiple simultaneous centrals - nothing
+    // restricts it to one). Without a lock around the whole set+notify pair, one device's chunk could
+    // be sent to a DIFFERENT device's notify() call - either handing a real payload chunk to a
+    // never-authenticated peer, or corrupting the intended recipient's stream. synchronized(serverLock)
+    // here forces every notification (across every device, every characteristic-send call site) to
+    // fully complete its set+notify before the next one can begin, closing the race at its root instead
+    // of trying to special-case which callers can overlap.
     private fun sendRawNotification(device: BluetoothDevice, chunk: ByteArray) {
-        val characteristic = serverCharacteristic ?: return
-        characteristic.value = chunk
-        try {
-            @Suppress("DEPRECATION")
-            gattServer?.notifyCharacteristicChanged(device, characteristic, false)
-        } catch (e: SecurityException) {
-            Log.w(TAG, "Missing permission to notify", e)
+        synchronized(serverLock) {
+            val characteristic = serverCharacteristic ?: return
+            characteristic.value = chunk
+            try {
+                @Suppress("DEPRECATION")
+                gattServer?.notifyCharacteristicChanged(device, characteristic, false)
+            } catch (e: SecurityException) {
+                Log.w(TAG, "Missing permission to notify", e)
+            }
         }
     }
 
@@ -1806,6 +1840,13 @@ class GattSyncManager(
         }
         framesToSend += buildPhotoDoneFrame()
 
+        // SECURITY (test-code-allmodels, clean-room final pass, Opus - TOP INVARIANT): see sendToClient's
+        // own doc for the identical hazard - the loop above suspends per photo file read, easily longer
+        // than buildPayload's own suspension, so this re-check matters at least as much here.
+        if (!synchronized(serverLock) { authenticatedDevices.contains(device.address) }) {
+            Log.w(TAG, "Not sending photo response - ${device.address} is no longer an authenticated connection")
+            return
+        }
         val mtu = synchronized(serverLock) { deviceMtus[device.address] } ?: DEFAULT_ATT_MTU
         val chunkPayload = effectiveChunkPayload(mtu, BluetoothGatt.GATT_SUCCESS, BleConstants.MAX_CHUNK_PAYLOAD_PHOTO)
         val allChunks = framesToSend.flatMap { toChunks(it, chunkPayload) }.toMutableList()
@@ -1815,14 +1856,17 @@ class GattSyncManager(
         sendRawPhotoNotification(device, first)
     }
 
+    // SECURITY: see sendRawNotification's own doc - identical shared-characteristic race, same fix.
     private fun sendRawPhotoNotification(device: BluetoothDevice, chunk: ByteArray) {
-        val characteristic = serverPhotoCharacteristic ?: return
-        characteristic.value = chunk
-        try {
-            @Suppress("DEPRECATION")
-            gattServer?.notifyCharacteristicChanged(device, characteristic, false)
-        } catch (e: SecurityException) {
-            Log.w(TAG, "Missing permission to notify (photo)", e)
+        synchronized(serverLock) {
+            val characteristic = serverPhotoCharacteristic ?: return
+            characteristic.value = chunk
+            try {
+                @Suppress("DEPRECATION")
+                gattServer?.notifyCharacteristicChanged(device, characteristic, false)
+            } catch (e: SecurityException) {
+                Log.w(TAG, "Missing permission to notify (photo)", e)
+            }
         }
     }
 
@@ -2256,6 +2300,12 @@ class GattSyncManager(
                 if (status != android.bluetooth.BluetoothGatt.GATT_SUCCESS) {
                     Log.w(TAG, "Characteristic write failed with status $status")
                     finish(false)
+                    // MINOR fix (test-code-allmodels, clean-room final pass, Opus + Fable): unlike every
+                    // sibling failure branch in this file, this one left the link itself open -
+                    // finish(false) only resolves the caller's result, it doesn't tear down the
+                    // connection, so the dead link (and, server-side, its authenticated-device
+                    // slot/nonce entry) would linger until something else eventually closed it.
+                    try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
                     return
                 }
                 // SECURITY (mutual-handshake follow-up): still pumping message 2 (this device's own
@@ -2275,6 +2325,9 @@ class GattSyncManager(
                     } catch (e: SecurityException) {
                         Log.w(TAG, "Missing permission to write characteristic", e)
                         finish(false)
+                        // MINOR fix (test-code-allmodels, clean-room final pass, Opus + Fable): same
+                        // dead-link hazard as the status-failure branch above - see its comment.
+                        try { gatt.disconnect() } catch (e2: SecurityException) { /* ignore */ }
                     }
                     return
                 }
@@ -2329,7 +2382,9 @@ class GattSyncManager(
                                     handshakeKey, BleConstants.HANDSHAKE_ROLE_SERVER, nonceC, nonceS, it.deviceId, it.partnerName
                                 )
                             }
-                            if (decoded == null || expected == null || !expected.contentEquals(decoded.response)) {
+                            // SECURITY: see the server-side verification's identical comment - constant-time
+                            // comparison, same reasoning.
+                            if (decoded == null || expected == null || !MessageDigest.isEqual(expected, decoded.response)) {
                                 Log.w(TAG, "Rejecting server's handshake reply - missing/invalid mutual proof")
                                 finish(false)
                                 try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
