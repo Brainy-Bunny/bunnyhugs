@@ -1177,6 +1177,24 @@ class GattSyncManager(
     // a single connection (the photo phase only ever starts after the JSON round trip is fully done).
     private val serverPhotoIncoming = HashMap<String, ByteArrayOutputStream>()
     private val serverPhotoOutQueue = HashMap<String, MutableList<ByteArray>>()
+    // KNOWN ACCEPTED RESIDUAL (test-code-allmodels round 5, Opus - reviewed and consciously deferred,
+    // not an oversight): this set's ONLY clear path is onConnectionStateChange(STATE_DISCONNECTED) -
+    // the very callback round 5 already treats as unreliable on some Android/OEM stacks for its
+    // STATE_CONNECTED counterpart (see serverAuthenticatedDeviceIds' neighboring doc). If a disconnect
+    // is ever missed here, an attacker who can spoof the exact BLE address of an address whose entry is
+    // still (stale-)present could skip the handshake entirely - onCharacteristicWriteRequest's
+    // `isAuthenticated` check is address-keyed with no further liveness proof. Considered fixing this by
+    // always reissuing a fresh nonce on every CCCD re-subscribe (self-healing a stale entry the same way
+    // the nonce-identity commit check does) - but onDescriptorWriteRequest's own doc explains why that
+    // exact approach was deliberately avoided: it would let a spurious mid-sync re-subscribe (an OEM
+    // quirk, not attacker-controlled) inject a raw notification into an otherwise-authenticated
+    // connection's JSON/photo stream, corrupting an ACTIVE legitimate sync - trading one narrow gap for
+    // a different, more easily triggered one. A structurally sound fix needs a real per-connection
+    // cryptographic binding that survives regardless of which connection-state callbacks fire - which is
+    // exactly what Stage 2's real key exchange (see BleConstants.kt's own doc) is for. Exploiting this
+    // TODAY requires MAC-spoofing the exact partner device AND a missed disconnect callback AND winning
+    // a race before the real partner reconnects - reviewed with the user and explicitly accepted as a
+    // narrow, Stage-2-scope residual rather than blocking Stage 1 on it.
     private val authenticatedDevices = HashSet<String>()
     private val deviceMtus = HashMap<String, Int>()
     // Per-device nonce issued at CCCD-subscribe time (see onDescriptorWriteRequest) and consumed the
