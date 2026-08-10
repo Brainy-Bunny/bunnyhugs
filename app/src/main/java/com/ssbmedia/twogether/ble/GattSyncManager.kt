@@ -155,6 +155,12 @@ class GattSyncManager(
         // by name, not just a bare device id. Best-effort only: whatever this device's own partnerName
         // currently is (may be the still-default "Your Person" if the user never set one).
         obj.put("senderPartnerName", pairingStore.current().partnerName)
+        // UX (user-requested follow-up): lets the receiver adopt whichever of the two live "together
+        // since" moments is earlier - see SessionRepository.adoptEarlierOpenSessionStart's doc. Never
+        // an actual session row (still deliberately excluded, see the class doc above) - just the raw
+        // moment, so the receiver's own already-open session (if it has one) can be timestamp-corrected
+        // rather than a duplicate row being created.
+        obj.put("openSessionStartedAt", sessionRepository.getOpenSession()?.startedAt ?: JSONObject.NULL)
         obj.put("dateIdeas", serializeDateIdeas(dateIdeaRepository.getAll()))
         obj.put("listCategories", serializeListCategories(listCategoryRepository.getAll()))
         obj.put("sessions", serializeSessions(sessionRepository.getAllIncludingDeleted().filter { it.endedAt != null }))
@@ -275,6 +281,13 @@ class GattSyncManager(
         val sessionsArr = root.optJSONArray("sessions")
         val sessionsParsed = deserializeSessions(sessionsArr, peerClockOffsetMillis)
         sessionRepository.mergeRemoteSessions(sessionsParsed)
+        // UX (user-requested follow-up): see SessionRepository.adoptEarlierOpenSessionStart's doc. Only
+        // runs on an already-trusted payload (below the pin-mismatch check above), same as every other
+        // merge in this function - corrected into OUR clock's frame with the same peerClockOffsetMillis
+        // every other timestamp here uses.
+        if (!root.isNull("openSessionStartedAt")) {
+            sessionRepository.adoptEarlierOpenSessionStart(root.optLong("openSessionStartedAt", 0L) - peerClockOffsetMillis)
+        }
         val momentsArr = root.optJSONArray("moments")
         val momentsParsed = deserializeMoments(momentsArr, peerClockOffsetMillis)
         momentRepository.mergeRemoteStubs(momentsParsed)

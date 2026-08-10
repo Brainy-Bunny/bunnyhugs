@@ -112,6 +112,38 @@ class SessionRepository(private val dao: TogetherSessionDao) {
             }
         }
     }
+
+    /** UX (user-requested follow-up): each phone's live OPEN session is deliberately never sent to the
+     * partner as a full row (see mergeRemoteSessions' own doc for why - it would let two devices each
+     * own a different "currently open" copy). But the two phones independently timestamping "together
+     * since" from their own BLE detection can legitimately disagree by anywhere from a few seconds
+     * (normal discovery jitter) to a few minutes (e.g. right after an unpair/reconnect cycle, where
+     * each phone rediscovers the other at its own pace) - live-observed by the user as two visibly
+     * different "Together for Xm" numbers that read as a bug even though nothing was wrong. This adopts
+     * the EARLIER of the two candidates as canonical on both sides: whoever noticed first is the more
+     * accurate "together since" anyway (the other phone's later detection was just slower to notice a
+     * moment that had already started). Deliberately a plain min() - clamping is one-directional
+     * (never moves LATER), so once both sides agree they stay agreed regardless of which one calls
+     * this next, and there's no oscillation. [candidateStartedAt] is clamped to no earlier than
+     * [MAX_ADOPT_EARLIER_WINDOW_MILLIS] before this device's own value, so a wildly implausible or
+     * spoofed remote value (e.g. from a device that hasn't been pinned yet) can't make this device
+     * claim an absurd multi-year "together" duration - genuine discovery drift is minutes, not years.
+     * A no-op if this device has no open session of its own right now: this device's OWN local
+     * proximity detection is still the sole authority on whether IT considers itself "together" -
+     * receiving a peer's open-session hint is never enough to fabricate a local session that doesn't
+     * already exist. */
+    suspend fun adoptEarlierOpenSessionStart(candidateStartedAt: Long) {
+        val open = dao.getOpenSession() ?: return
+        val earliestPlausible = open.startedAt - MAX_ADOPT_EARLIER_WINDOW_MILLIS
+        val clamped = candidateStartedAt.coerceAtLeast(earliestPlausible)
+        if (clamped < open.startedAt) {
+            dao.update(open.copy(startedAt = clamped, updatedAt = System.currentTimeMillis()))
+        }
+    }
+
+    companion object {
+        private const val MAX_ADOPT_EARLIER_WINDOW_MILLIS = 24 * 60 * 60 * 1000L
+    }
 }
 
 class DateIdeaRepository(private val dao: DateIdeaDao) {

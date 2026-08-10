@@ -338,10 +338,21 @@ fun HomeScreen(
     // why this check has to live HERE (Home), not on the pairing screen where the action happened.
     var reconnectVerifying by remember { mutableStateOf(false) }
     var reconnectMismatch by remember { mutableStateOf(false) }
+    // UX (user-requested follow-up): the 30s check below used to just go silent when neither a genuine
+    // success nor a locally-detected mismatch showed up in time - coded identically to "partner's
+    // simply not in range right now" even though this specific case (rejoining with a code someone
+    // else is already pinned against) can ALSO produce exactly this same silent-timeout signature from
+    // the joining device's own point of view (the rejecting side stops the exchange before ever
+    // sending anything back, so the joiner never gets a chance to observe its own mismatch flag - see
+    // GattSyncManager's onCharacteristicWriteRequest rejection branch). Silently closing the dialog in
+    // that case reads as "you're all set" when nothing has actually been confirmed - this banner is the
+    // honest alternative: say plainly that it's still unconfirmed instead of saying nothing.
+    var pairingUnconfirmed by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         AppEvents.justPaired.collect { justPaired ->
             if (!justPaired) return@collect
             AppEvents.consumeJustPaired()
+            pairingUnconfirmed = false
             reconnectVerifying = true
             // Same "retry every second, cancel on the first real result" shape as OurListsScreen's
             // manual sync button, but a much longer window (live-measured, not guessed): unlike an
@@ -380,13 +391,30 @@ fun HomeScreen(
                 }
             }
             reconnectVerifying = false
-            // success == null means the window elapsed with no qualifying result at all (couple not
-            // together right now to test it) - genuinely ambiguous, not evidence of failure, so stay
-            // silent rather than false-alarm; the existing Settings/Our Lists messaging still catches a
-            // real mismatch whenever a sync eventually does run.
             if (success == false && AppEvents.lastSyncFailedDueToPartnerMismatch.value) {
                 reconnectMismatch = true
+            } else if (success == null) {
+                // success == null means the window elapsed with no qualifying result at all - genuinely
+                // ambiguous (could be "couple not together right now to test it", could be a rejection
+                // this device never got direct feedback on, see this var's own doc above). No longer
+                // silent: shows the honest "not confirmed yet" banner below instead of pretending
+                // everything's settled.
+                pairingUnconfirmed = true
             }
+        }
+    }
+
+    // Keeps watching in the background, even after the 30s active-retry window above has ended, so the
+    // banner doesn't just sit there stale once the real answer eventually becomes known (the couple
+    // comes back in range, or a later attempt gets definitively rejected) - passive only (no retry loop
+    // of its own), since the app's normal periodic/manual sync paths already keep trying on their own
+    // cadence regardless of whether this banner is showing.
+    LaunchedEffect(pairingUnconfirmed) {
+        if (!pairingUnconfirmed) return@LaunchedEffect
+        val result = AppEvents.syncCompleted.first { s -> s || AppEvents.lastSyncFailedDueToPartnerMismatch.value }
+        pairingUnconfirmed = false
+        if (!result && AppEvents.lastSyncFailedDueToPartnerMismatch.value) {
+            reconnectMismatch = true
         }
     }
 
@@ -495,6 +523,14 @@ fun HomeScreen(
                             val perm = BlePermissions.notificationPermission()
                             if (perm != null) notificationPermissionLauncher.launch(perm)
                         }
+                    )
+                }
+            }
+            if (pairingUnconfirmed) {
+                item {
+                    PairingUnconfirmedWarningCard(
+                        partnerName = pairingInfo.partnerName,
+                        onDismiss = { pairingUnconfirmed = false }
                     )
                 }
             }
@@ -903,6 +939,38 @@ private fun NotificationPermissionWarningCard(onGrantClick: () -> Unit) {
                 modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
             )
             Button(onClick = onGrantClick) { Text("Grant access") }
+        }
+    }
+}
+
+/** UX (user-requested follow-up): shown instead of silently doing nothing when the post-pairing check
+ * (see pairingUnconfirmed's own doc above) can't tell within 30s whether this pairing is genuinely
+ * working - deliberately a dismissible, non-blocking banner rather than another modal dialog: the user
+ * can still use the rest of the app while this resolves itself in the background (see the
+ * LaunchedEffect(pairingUnconfirmed) watcher), unlike the stronger "block until confirmed" alternative
+ * that was considered and deliberately not built for this pass. */
+@Composable
+private fun PairingUnconfirmedWarningCard(partnerName: String, onDismiss: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.large,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                "Still confirming this pairing",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onTertiaryContainer
+            )
+            Text(
+                "We couldn't confirm this pairing with ${partnerName.ifBlank { "your partner" }}'s phone yet. " +
+                    "Make sure you're both nearby with Bluetooth on - we'll update this automatically once it's confirmed.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
+            )
+            TextButton(onClick = onDismiss) { Text("Dismiss") }
         }
     }
 }
