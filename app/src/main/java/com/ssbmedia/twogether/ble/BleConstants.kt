@@ -6,49 +6,51 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 /**
- * KNOWN ACCEPTED MVP LIMITATION (not fixed in this pass): the advertisement broadcast by
- * AdvertiserManager is a static, replayable, unauthenticated payload with no rolling identifier or
- * nonce - a sniffed advertisement could theoretically be replayed later to fake a "together"
- * detection, and the small keyspace of the underlying pairing code (10^6) means the broadcast prefix
- * bytes could be brute-forced back toward candidate codes given enough captures. A full fix (rolling
- * identifiers, real key exchange) is out of scope here; GattSyncManager's connection-level handshake
- * and the strengthened pairing-code hash (see util/Hashing.kt) close the two most exploitable paths -
- * with one important asymmetry: the handshake only authenticates the CLIENT to the SERVER (a
- * connecting device must prove it knows the pair secret before the server accepts anything from it),
- * not the reverse. It stops a passive/naive unauthenticated device from writing to or reading from our
- * GATT *server* role. It does NOT protect a client connecting to an impersonated server - an active
- * attacker posing as the partner's server could still receive a real client's data. Reversal of an
- * extracted raw pairing-code hash is still meaningfully harder thanks to the strengthened hash.
+ * KNOWN ACCEPTED LIMITATION (not fixed in this pass - this is exactly what a later PAKE-based rework,
+ * "Stage 2", exists to close): the advertisement broadcast by AdvertiserManager is a static, replayable,
+ * unauthenticated payload with no rolling identifier or nonce - a sniffed advertisement could
+ * theoretically be replayed later to fake a "together" detection, and the small keyspace of the
+ * underlying pairing code (10^6) means the broadcast prefix bytes could be brute-forced back toward
+ * candidate codes given enough captures (independently reproduced during design review: well under two
+ * minutes on a single consumer GPU against this file's own strengthened, 600,000-iteration hash).
+ * Reversal of an extracted raw pairing-code hash is still meaningfully harder thanks to that
+ * strengthening (see util/Hashing.kt), but it does not change the underlying keyspace.
  *
- * The GATT handshake itself is nonce/HMAC-based (see computeHandshakeResponse below, and
- * GattSyncManager's class doc), NOT a static bearer token - a captured handshake response is worthless
- * replayed against a later connection, since the server issues a brand new random nonce every time a
- * device subscribes to the sync characteristic and only that exact nonce's HMAC is accepted.
+ * SECURITY (mutual handshake): GattSyncManager's connection-level handshake is nonce/HMAC-based (see
+ * computeMutualHandshakeResponse below, and GattSyncManager's class doc), NOT a static bearer token - a
+ * captured handshake message is worthless replayed against a later connection, since fresh nonces are
+ * generated every connection and only an HMAC over that exact nonce pair is accepted. As of the
+ * mutual-handshake rework, BOTH sides prove knowledge of the shared secret to each other - and BOTH
+ * sides check the connecting/connected identity against this pairing's pinned partner (see
+ * checkPinOrRecordPending) - before EITHER side transmits a byte of real payload. This closes the
+ * asymmetry an earlier version of this file used to document here: previously only the CLIENT proved
+ * itself to the SERVER, so a fake "server" that knew nothing about the shared secret could still receive
+ * a real client's full data payload. That specific gap is closed.
+ *
+ * What this does NOT do: derive an actual session key or encrypt the subsequent payload channel. Both
+ * sides proving they know the SAME pre-existing shared secret is not the same guarantee as a real key
+ * exchange - an active on-path relay that simply forwards bytes between a genuine client and a genuine
+ * server (rather than impersonating either one outright) is not something a mutual proof of shared-secret
+ * knowledge alone can detect, and the payload itself is still sent in the clear. Closing that requires a
+ * real key-exchange protocol (a PAKE run once over the pairing code, deriving a session key everything
+ * else - including the advertised identifier and the payload channel - is then rekeyed off), which is
+ * exactly Stage 2's scope, not this pass's.
  *
  * SECURITY (device-ID pinning): the handshake above only proves a connecting device knows OUR pairing
- * code - it says nothing about WHICH device that is. Before this, a second couple who coincidentally
- * landed on the same 6-digit code (1-in-a-million per pairing, non-negligible if many couples pair
- * nearby around the same time - a crowded venue, say) would pass the handshake and sync data exactly
- * like the real partner would, for as long as both phones kept running the background proximity
- * service - not just once. PairingStore.pinPartnerDeviceIdIfAbsent + GattSyncManager.applyPayload's use
- * of it now close most of that: the first sync after pairing pins whichever device we synced with as
- * the trusted partner, and every later sync from a different device id is rejected outright - no data
- * from that payload is EVER merged into our own DB, unconditionally, regardless of role. This is
- * trust-on-first-use, not a full fix - if a colliding stranger's phone happens to win the race to be
- * first to sync (needs matching code + BLE range + beating the real partner to it), that stranger gets
- * pinned instead. Considered an acceptable residual risk for the same reason the rest of this file's
- * gaps are: closing it completely would need a longer code and/or a manual confirm-on-first-connect
- * step, out of scope for this pass.
- *
- * PRECISION NOTE (ultimate-app-review round 2, Opus): "rejected outright" above is airtight for the
- * INBOUND merge (the guarantee this whole mechanism exists for) - it is not equally proven for our OWN
- * OUTBOUND send while we're in the CLIENT role. The pin check runs inside applyPayload, a separate
- * coroutine from the one that resumes the client's send/watchdog flow on chunk receipt, so there is no
- * structural guarantee our own payload can't start sending before that coroutine has evaluated the
- * mismatch. Empirically the connection tears down before any send completes once a mismatch is
- * detected (observed live, repeatedly), but that's current behavior, not a proven ordering invariant -
- * don't read "rejected outright" as covering the CLIENT role's outbound send with the same certainty it
- * covers the merge.
+ * code - it says nothing on its own about WHICH device that is. Before device-ID pinning existed, a
+ * second couple who coincidentally landed on the same 6-digit code (1-in-a-million per pairing,
+ * non-negligible if many couples pair nearby around the same time - a crowded venue, say) would pass the
+ * handshake and sync data exactly like the real partner would, for as long as both phones kept running
+ * the background proximity service - not just once. PairingStore.pinPartnerDeviceIdIfAbsent +
+ * checkPinOrRecordPending's use of it now close most of that: the first sync after pairing pins whichever
+ * device we synced with as the trusted partner, and every later connection from a different device id -
+ * checked mutually, during the handshake itself, on BOTH sides, before either side transmits anything
+ * real - is rejected outright. This is trust-on-first-use, not a full fix - if a colliding stranger's
+ * phone happens to win the race to be first to sync (needs matching code + BLE range + beating the real
+ * partner to it), that stranger gets pinned instead; and, per the paragraph above, a party who has
+ * genuinely obtained the pairing code (not merely a random collision) is not excluded by this mechanism
+ * at all, since they can complete the mutual proof honestly. Considered an acceptable residual risk given
+ * this app's real threat model (see the Stage 1/Stage 2 design review), not a claim that it's closed.
  */
 object BleConstants {
     /** Shared by every Twogether install so the scanner can find any Twogether beacon at the OS filter level. */
@@ -69,7 +71,7 @@ object BleConstants {
 
     /**
      * How many hex chars of the pair-code hash we use to derive the shared GATT handshake KEY (see
-     * GattSyncManager / computeHandshakeResponse below) - taken from a hex range that starts right AFTER
+     * GattSyncManager / computeMutualHandshakeResponse below) - taken from a hex range that starts right AFTER
      * the bytes used for SECRET_PREFIX_BYTES above, so this key material is never overlapping with the
      * (unauthenticated, public) BLE advertisement's own prefix bytes. This key is never itself put on the
      * air - only a per-connection random nonce and its HMAC response are - so, unlike the old static-token
@@ -84,26 +86,10 @@ object BleConstants {
      * connection, so a captured handshake response can never be replayed against a later one. */
     const val HANDSHAKE_NONCE_BYTES = 16
 
-    /** Truncation length of the HMAC-SHA256 handshake response - see computeHandshakeResponse. 16 bytes
-     * (128 bits) of MAC output is comfortably beyond brute-force reach while staying well under any BLE
-     * MTU, so it never needs its own chunking. */
+    /** Truncation length of the HMAC-SHA256 handshake response - see computeMutualHandshakeResponse. 16
+     * bytes (128 bits) of MAC output is comfortably beyond brute-force reach while staying well under any
+     * BLE MTU, so it never needs its own chunking. */
     const val HANDSHAKE_RESPONSE_BYTES = 16
-
-    /**
-     * Computes the handshake response both sides independently derive for one connection:
-     * HMAC-SHA256(handshakeKey, nonce), truncated to HANDSHAKE_RESPONSE_BYTES. The CLIENT computes this
-     * once it receives the server's nonce and writes it as its first characteristic write; the SERVER
-     * computes its own expected value from the same handshakeKey and the nonce IT generated, then compares
-     * in onCharacteristicWriteRequest. Neither side ever transmits handshakeKey itself - only the public
-     * nonce and this one-way MAC of it - so observing any number of past handshakes never helps forge a
-     * future one (a fresh nonce makes every response unique), unlike the previous static-token scheme
-     * this replaces.
-     */
-    fun computeHandshakeResponse(handshakeKey: ByteArray, nonce: ByteArray): ByteArray {
-        val mac = Mac.getInstance("HmacSHA256")
-        mac.init(SecretKeySpec(handshakeKey, "HmacSHA256"))
-        return mac.doFinal(nonce).copyOf(HANDSHAKE_RESPONSE_BYTES)
-    }
 
     /** SECURITY (mutual-handshake follow-up, per multi-round advisory review): the ONE-WAY handshake
      * above only ever proves the CLIENT to the SERVER - a fake "server" that knows nothing can still

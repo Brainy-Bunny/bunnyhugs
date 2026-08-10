@@ -56,18 +56,18 @@ import java.security.SecureRandom
  * connection/handshake/MTU-negotiation machinery below exactly as it was for the original date-ideas-only
  * version - only serialize()/deserialize() and what happens with the parsed result changed.
  *
- * Every connection must first prove it knows the shared pair secret before any real chunk data is
- * accepted - without this, any nearby stranger's GATT client could connect to our open server and read
- * back the couple's data, or write a forged tombstone to delete a real item (merge is last-write-wins
- * with no origin check otherwise). This is a nonce/HMAC challenge-response, NOT a static bearer token:
- * the moment a client subscribes to the sync characteristic's notifications, the server generates a
- * fresh random nonce (BleConstants.HANDSHAKE_NONCE_BYTES) and notifies it back immediately, before
- * authenticating anything; the client's first characteristic WRITE is then
- * BleConstants.computeHandshakeResponse(handshakeKey, thatNonce) rather than the key itself, which the
- * server independently recomputes from its own copy of handshakeKey (both sides derive the same key from
- * the shared pairing code, see BleConstants.HANDSHAKE_TOKEN_*) and the nonce it issued, and compares. A
- * fresh nonce every connection means a captured response can never be replayed against a later
- * connection - see startServer/connectAsClient below and BleConstants' class doc.
+ * SECURITY (mutual handshake): every connection must prove BOTH ways - each side proves it knows the
+ * shared pair secret to the OTHER, and each side's identity is checked against this pairing's pinned
+ * partner (see checkPinOrRecordPending) - before EITHER side transmits a byte of real chunk data. This
+ * closes a gap an earlier one-way version of this handshake had: a fake "server" that knew nothing about
+ * the shared secret could still receive a real client's full payload, since the client used to send it
+ * the moment its own handshake write locally succeeded, without ever checking the other side proved
+ * anything back. See BleConstants.computeMutualHandshakeResponse's own doc for the wire protocol (message
+ * 2: the client's nonce + proof + identity; message 3: the server's proof + identity, no nonce needed
+ * since both are already known by then) and BleConstants' class doc for what this mutual proof does and
+ * does not guarantee (notably: no session key is derived, so this is not the same as an encrypted
+ * channel). A fresh nonce every connection means a captured message can never be replayed against a later
+ * connection - see startServer/connectAsClient below.
  *
  * FEATURE 2 (photo sync): once the metadata JSON round-trip above completes, the CLIENT side (the only
  * side that ever actively initiates anything, matching the existing central/peripheral role split) also
@@ -892,8 +892,27 @@ class GattSyncManager(
     private suspend fun checkPinOrRecordPending(remoteDeviceId: String, remoteDevice: BluetoothDevice?, remotePartnerName: String): Boolean {
         val currentPairing = pairingStore.current()
         val pinned = currentPairing.pinnedPartnerDeviceId
-        if (pinned.isNullOrBlank() || remoteDeviceId.isBlank() || remoteDeviceId == pinned) return true
+        // SECURITY (test-code-allmodels round 1, Haiku): a blank remoteDeviceId must NOT be treated as
+        // an automatic pass once a pin exists - that's exactly the blank-senderDeviceId bypass this
+        // session already closed once in applyPayload's own check (see its own SECURITY comment); this
+        // helper had accidentally reintroduced an equivalent gap. Blank is only ever a pass when there's
+        // no pin yet at all (the legitimate first-pairing case) - once pinned, blank is compared like any
+        // other id and correctly fails (blank never equals a real pinned id).
+        // MAJOR fix (test-code-allmodels round 1, Opus): reset here, at the top of every call, exactly
+        // like applyPayload's own reset at its first line - since a handshake-time rejection now means
+        // applyPayload is never reached at all for this attempt, its reset alone no longer covers every
+        // path, and a stale `true` left over from an EARLIER, unrelated failed attempt could otherwise
+        // still be sitting there when THIS attempt's result is read.
+        lastSyncFailedDueToPartnerMismatch = false
+        if (pinned.isNullOrBlank() || remoteDeviceId == pinned) return true
         Log.w(TAG, "Rejecting handshake: connecting device did not match this pairing's pinned partner")
+        // MAJOR fix (test-code-allmodels round 1, Opus): this rejection now happens BEFORE applyPayload
+        // ever runs, so applyPayload's own `lastSyncFailedDueToPartnerMismatch = true` (which used to be
+        // the only place this got set) never fires for this case anymore. Without setting it here too,
+        // Home's post-pairing verification and Settings/OurListsScreen's messaging would regress to the
+        // generic "make sure you're together" text for the exact case (a stale/reinstalled partner) that
+        // fix was built to give an actionable message for.
+        lastSyncFailedDueToPartnerMismatch = true
         val bluetoothName = try { remoteDevice?.name } catch (e: SecurityException) { null }
         val isNewPendingDevice = pairingStore.recordPendingResyncRequest(remoteDeviceId, bluetoothName, remotePartnerName.ifBlank { null })
         if (isNewPendingDevice) {
@@ -1274,10 +1293,22 @@ class GattSyncManager(
                     if (flag != BleConstants.CHUNK_FLAG_LAST) return
                     val raw = synchronized(serverLock) { serverHandshakeIncoming.remove(addr); buffer.toByteArray() }
                     val decoded = decodeHandshakeProofMessage(raw)
-                    val expectedResponse = decoded?.let {
-                        BleConstants.computeMutualHandshakeResponse(
-                            expectedHandshakeKey, BleConstants.HANDSHAKE_ROLE_CLIENT, nonceS, it.nonce, it.deviceId, it.partnerName
-                        )
+                    // MINOR fix (test-code-allmodels round 2, Opus): this HMAC computation runs directly on
+                    // the GATT binder thread, not inside a coroutine - the client's equivalent computation
+                    // was deliberately wrapped for exactly this reason (an unsupported-algorithm JCE
+                    // failure on some OEM's crypto provider), but an uncaught throw HERE doesn't just fail
+                    // one coroutine, it kills the whole process. HmacSHA256 is effectively always present
+                    // on Android in practice, so this is a consistency/robustness fix, not a live crash
+                    // path - any failure is treated the same as a genuinely invalid response (reject).
+                    val expectedResponse = try {
+                        decoded?.let {
+                            BleConstants.computeMutualHandshakeResponse(
+                                expectedHandshakeKey, BleConstants.HANDSHAKE_ROLE_CLIENT, nonceS, it.nonce, it.deviceId, it.partnerName
+                            )
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to compute expected handshake response", e)
+                        null
                     }
                     if (decoded == null || expectedResponse == null || !expectedResponse.contentEquals(decoded.response)) {
                         Log.w(TAG, "Rejecting GATT write from unauthenticated device $addr - missing/invalid handshake")
@@ -1619,6 +1650,14 @@ class GattSyncManager(
             // authenticated against (a successful auth already removes its own entry), so this isn't
             // exploitable either way, but a stopped server shouldn't leave stale per-device state behind.
             serverNonces.clear()
+            // MINOR fix (test-code-allmodels round 2, Fable): this block predates the mutual-handshake
+            // rework and missed clearing the two new handshake maps it added - a peer mid-handshake when
+            // stopServer() runs (unpair, BT toggle, apart transition) could otherwise leave stale chunks
+            // that get pumped/reassembled into the NEXT session's genuinely-new handshake attempt for the
+            // same address, corrupting it. Fails closed either way (garbage can never pass the HMAC check),
+            // but a stopped server should leave no more stale per-device state here than anywhere else.
+            serverHandshakeIncoming.clear()
+            serverHandshakeOutQueue.clear()
         }
     }
 
@@ -1628,7 +1667,14 @@ class GattSyncManager(
     private val clientIncoming = ByteArrayOutputStream()
     private var clientOutQueue: MutableList<ByteArray> = mutableListOf()
     private val clientLock = Any()
-    private var clientChunkPayload = BleConstants.MAX_CHUNK_PAYLOAD
+    // MINOR fix (test-code-allmodels round 1, Opus): written from onMtuChanged (a binder-thread GATT
+    // callback) and read from coroutines building/sending the handshake proof and the real payload - the
+    // same cross-thread-visibility reasoning as every other @Volatile field in this class already
+    // documents, but these two were missed when they were introduced. If requestMtu() throws and
+    // onMtuChanged never fires (see this file's own comment at the requestMtu call site), a stale value
+    // from a PRIOR attempt could otherwise be used for this one without even the visibility guarantee to
+    // ensure the write from that prior attempt (if any) is seen at all.
+    @Volatile private var clientChunkPayload = BleConstants.MAX_CHUNK_PAYLOAD
     // SECURITY (mutual-handshake follow-up): reassembly buffer for message 3 (the server's own
     // proof+identity reply, see HandshakeReplyMessage) - kept separate from clientIncoming (the
     // post-auth JSON buffer), same reasoning as clientPhotoIncoming's own separation. Reset at the top
@@ -1639,7 +1685,7 @@ class GattSyncManager(
     // connection attempt must never see leftovers from a previous one), and cleared again on disconnect.
     private val clientPhotoIncoming = ByteArrayOutputStream()
     private var clientPhotoOutQueue: MutableList<ByteArray> = mutableListOf()
-    private var clientPhotoChunkPayload = BleConstants.MAX_CHUNK_PAYLOAD_PHOTO
+    @Volatile private var clientPhotoChunkPayload = BleConstants.MAX_CHUNK_PAYLOAD_PHOTO
     private var clientPhotoSendComplete: CompletableDeferred<Unit>? = null
     private var photoDoneSignal: CompletableDeferred<Unit>? = null
     private var clientPhotoReceivedCount = 0
@@ -1690,6 +1736,13 @@ class GattSyncManager(
         clientIncoming.reset()
         clientHandshakeIncoming.reset()
         clientPhotoIncoming.reset()
+        // MINOR fix (test-code-allmodels round 1, Opus): clientOutQueue was the one piece of per-attempt
+        // mutable state this reset block missed - a previous attempt's leftover real-payload chunks
+        // would otherwise survive into this one. Not currently reachable (the handshake queue is drained
+        // first and a later write to clientOutQueue always happens before any payload send), but that
+        // safety depended entirely on call-ordering rather than an explicit reset, which is one guard too
+        // few to rely on given everything else in this block is reset explicitly.
+        synchronized(clientLock) { clientOutQueue = mutableListOf() }
         synchronized(clientLock) { clientPhotoOutQueue = mutableListOf() }
         clientPhotoSendComplete = null
         photoDoneSignal = null
@@ -1697,6 +1750,17 @@ class GattSyncManager(
         clientPhotoExpectedCount = 0
         metadataResponseSignal = null
         metadataLastActivityAtMillis = 0L
+        // MINOR fix (test-code-allmodels round 2, Opus): @Volatile alone only fixed this pair's
+        // cross-thread VISIBILITY, not staleness - a value negotiated by a PRIOR attempt (e.g. a large
+        // granted MTU) could still be reused for this one if onMtuChanged never fires this time (see the
+        // requestMtu() SecurityException fallback below, which skips straight to discoverServices()).
+        // Resetting to the SAME conservative value onMtuChanged itself would compute for a non-negotiated
+        // link (not MAX_CHUNK_PAYLOAD, which is the CEILING a successful large-MTU negotiation produces -
+        // reusing that would be exactly the stale-oversized-chunk bug this is meant to prevent) means a
+        // missing onMtuChanged this attempt always degrades to a size that's safe at the default ATT MTU,
+        // rather than silently reusing whatever a previous, unrelated attempt happened to negotiate.
+        clientChunkPayload = effectiveChunkPayload(DEFAULT_ATT_MTU, android.bluetooth.BluetoothGatt.GATT_FAILURE)
+        clientPhotoChunkPayload = effectiveChunkPayload(DEFAULT_ATT_MTU, android.bluetooth.BluetoothGatt.GATT_FAILURE, BleConstants.MAX_CHUNK_PAYLOAD_PHOTO)
         // Both of these are mutated from BluetoothGattCallback methods, which run on binder threads (not
         // necessarily the same thread, and not guaranteed not to interleave) - just like
         // serverIncoming/serverOutQueue/authenticatedDevices/deviceMtus on the server side above, a
@@ -1732,6 +1796,19 @@ class GattSyncManager(
         // same cross-binder-thread-callback reason documented below.
         var clientNonceC: ByteArray? = null
         var clientNonceS: ByteArray? = null
+        // SECURITY (test-code-allmodels round 1, Opus): `handshakeReplyDeferred.isCompleted` only means
+        // SOME bytes arrived claiming to be message 3 - it says nothing about whether they actually
+        // verified, since verification happens asynchronously in a separate coroutine (below) that
+        // awaits this same deferred. Routing onCharacteristicChanged's JSON/photo fallback purely off
+        // `isCompleted` left a real race: a peer that sends garbage as message 3 and then IMMEDIATELY
+        // follows with a fabricated JSON/photo notification could get that notification processed and
+        // MERGED before the verification coroutine has even resumed, let alone rejected it and
+        // disconnected - completely bypassing the mutual proof this whole rewrite exists to enforce, and
+        // requiring no knowledge of the shared secret at all. This flag is the actual gate: only set true
+        // by the verification coroutine itself, only after BOTH the HMAC check and checkPinOrRecordPending
+        // have genuinely succeeded - onCharacteristicChanged's fallback branches must check THIS, not the
+        // deferred's completion state, before ever treating incoming bytes as real payload/photo data.
+        var clientHandshakeVerified = false
 
         // Guards against calling onSyncDone() twice (e.g. once from a failure path and again from the
         // disconnect that follows it) and makes sure a connection that drops before completing - GATT
@@ -1985,6 +2062,11 @@ class GattSyncManager(
                                 try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
                                 return@launch
                             }
+                            // SECURITY (test-code-allmodels round 1, Opus): mutual auth + identity check
+                            // BOTH genuinely passed - only now does onCharacteristicChanged's fallback
+                            // routing start accepting incoming bytes as real payload/photo data. See
+                            // clientHandshakeVerified's own doc for the race this closes.
+                            synchronized(clientLock) { clientHandshakeVerified = true }
                             // Mutual auth + identity check both passed - proceed exactly as the
                             // pre-existing post-handshake flow (stall watchdog + build/send real payload).
                             // BUG fix: see metadataResponseSignal's own doc - without this watchdog, a
@@ -2088,6 +2170,18 @@ class GattSyncManager(
                     }
                     return
                 }
+
+                // SECURITY (test-code-allmodels round 1, Opus): `handshakeReplyDeferred` being completed
+                // (checked above) only means SOME bytes arrived claiming to be message 3 - verification of
+                // those bytes happens asynchronously in a separate coroutine (see clientHandshakeVerified's
+                // own doc). Without this gate, a peer that sends garbage as message 3 and then immediately
+                // follows with a fabricated JSON/photo notification could get it processed before that
+                // coroutine has even resumed, let alone rejected and disconnected it - bypassing the mutual
+                // proof entirely. Anything arriving before verification has genuinely succeeded is dropped
+                // here, silently, on both the photo and JSON paths - there is nothing legitimate this could
+                // ever be, since the server (per this file's own protocol) never sends anything else until
+                // after it has authenticated and accepted this device.
+                if (!synchronized(clientLock) { clientHandshakeVerified }) return
 
                 if (characteristic.uuid == BleConstants.PHOTO_CHARACTERISTIC_UUID) {
                     val flag = value[0]
