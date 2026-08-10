@@ -1177,24 +1177,38 @@ class GattSyncManager(
     // a single connection (the photo phase only ever starts after the JSON round trip is fully done).
     private val serverPhotoIncoming = HashMap<String, ByteArrayOutputStream>()
     private val serverPhotoOutQueue = HashMap<String, MutableList<ByteArray>>()
-    // KNOWN ACCEPTED RESIDUAL (test-code-allmodels round 5, Opus - reviewed and consciously deferred,
-    // not an oversight): this set's ONLY clear path is onConnectionStateChange(STATE_DISCONNECTED) -
-    // the very callback round 5 already treats as unreliable on some Android/OEM stacks for its
-    // STATE_CONNECTED counterpart (see serverAuthenticatedDeviceIds' neighboring doc). If a disconnect
-    // is ever missed here, an attacker who can spoof the exact BLE address of an address whose entry is
-    // still (stale-)present could skip the handshake entirely - onCharacteristicWriteRequest's
-    // `isAuthenticated` check is address-keyed with no further liveness proof. Considered fixing this by
-    // always reissuing a fresh nonce on every CCCD re-subscribe (self-healing a stale entry the same way
-    // the nonce-identity commit check does) - but onDescriptorWriteRequest's own doc explains why that
-    // exact approach was deliberately avoided: it would let a spurious mid-sync re-subscribe (an OEM
-    // quirk, not attacker-controlled) inject a raw notification into an otherwise-authenticated
-    // connection's JSON/photo stream, corrupting an ACTIVE legitimate sync - trading one narrow gap for
-    // a different, more easily triggered one. A structurally sound fix needs a real per-connection
-    // cryptographic binding that survives regardless of which connection-state callbacks fire - which is
-    // exactly what Stage 2's real key exchange (see BleConstants.kt's own doc) is for. Exploiting this
-    // TODAY requires MAC-spoofing the exact partner device AND a missed disconnect callback AND winning
-    // a race before the real partner reconnects - reviewed with the user and explicitly accepted as a
-    // narrow, Stage-2-scope residual rather than blocking Stage 1 on it.
+    // KNOWN ACCEPTED RESIDUAL (test-code-allmodels round 5 Opus, round 6 Sonnet + Opus corrections -
+    // reviewed and consciously deferred, not an oversight): this set's clear paths are
+    // onConnectionStateChange(STATE_DISCONNECTED) and stopServer() (called on the apart transition, BT
+    // adapter off, unpair, and service onDestroy - so the window is bounded to at most one
+    // together-session, not unbounded). STATE_CONNECTED now also removes a stale entry as a one-way,
+    // trust-REMOVING-only signal (see onConnectionStateChange's own doc) - defense in depth, not a full
+    // close, since it depends on the same potentially-unreliable callback. If BOTH a disconnect AND the
+    // next connection's own STATE_CONNECTED are missed on some stack, an attacker who can spoof the exact
+    // BLE address of a still-(stale-)authenticated entry could skip the handshake entirely -
+    // onCharacteristicWriteRequest's `isAuthenticated` check is address-keyed with no further liveness
+    // proof. This is a FULL top-invariant violation if hit, not just "receives without proving the
+    // secret": serverAuthenticatedDeviceIds[addr] is cleared in lockstep with this set (same callback,
+    // same block) and holds the REAL pinned partner's proven id, so applyPayload's pin check (219) passes
+    // for the attacker's forged data too - both a poisoned merge attributed to the trusted partner AND
+    // exfiltration of this device's real payload back to the attacker. That lockstep coupling is
+    // load-bearing: if a future change ever cleared one of these two maps without the other, this residual
+    // would silently become either fully closed or fully open depending on which - keep them clearing
+    // together. Considered always reissuing a fresh nonce on every CCCD re-subscribe as a full fix, but
+    // rejected it for two independent reasons, not just the one originally recorded here: (1)
+    // onDescriptorWriteRequest's own doc explains that a spurious mid-sync re-subscribe (an OEM quirk, not
+    // attacker-controlled) would inject a raw notification into an otherwise-authenticated connection's
+    // JSON/photo stream, corrupting an ACTIVE legitimate sync; (2) even setting that aside, it wouldn't
+    // actually close the gap, because Android's GATT server does not require or enforce a CCCD write
+    // before accepting a characteristic write - an attacker can simply skip onDescriptorWriteRequest
+    // entirely and write straight to the sync characteristic, so any self-healing hung off that callback
+    // never triggers for them. A structurally sound full fix needs a real per-connection cryptographic
+    // binding that survives regardless of which connection-state callbacks fire - exactly what Stage 2's
+    // real key exchange (see BleConstants.kt's own doc) is for. Also note: a legitimately reconnecting
+    // partner does NOT race an attacker for this slot - alreadyAuthenticated blocks a fresh nonce from
+    // ever being issued to it, so it just times out (HANDSHAKE_NONCE_TIMEOUT_MILLIS) and fails closed,
+    // locked out of syncing until the stale entry clears by one of the paths above. Reviewed with the user
+    // and explicitly accepted as a narrow, Stage-2-scope residual rather than blocking Stage 1 on it.
     private val authenticatedDevices = HashSet<String>()
     private val deviceMtus = HashMap<String, Int>()
     // Per-device nonce issued at CCCD-subscribe time (see onDescriptorWriteRequest) and consumed the
@@ -1321,10 +1335,24 @@ class GattSyncManager(
             override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
                 val addr = device.address
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    // No-op: the per-connection identity discriminator is now serverNonces[addr]'s own
-                    // object reference (see serverAuthenticatedDeviceIds' neighboring doc above), issued
-                    // in onDescriptorWriteRequest - deliberately NOT tied to STATE_CONNECTED being
-                    // delivered here, since that isn't guaranteed on every stack (round 4, Opus).
+                    // SECURITY (test-code-allmodels round 6, Opus - defense-in-depth, see
+                    // authenticatedDevices' own doc for the residual this narrows): the per-connection
+                    // identity discriminator used to COMMIT a handshake is serverNonces[addr]'s own object
+                    // reference (see serverAuthenticatedDeviceIds' neighboring doc), deliberately NOT tied
+                    // to STATE_CONNECTED being delivered, since that isn't guaranteed on every stack
+                    // (round 4, Opus). But this event, when it DOES fire, is safe to use as a one-way
+                    // TRUST-REMOVING signal (never trust-granting) for a brand new connection at this
+                    // address: unlike reissuing a nonce here (rejected - see the doc below for why),
+                    // simply clearing any previously-authenticated state does not send anything and
+                    // cannot corrupt an in-flight legitimate JSON/photo stream, so it carries none of that
+                    // rejected fix's risk. Worst case if this ever fires spuriously on an actively-syncing
+                    // connection: that connection's next write is treated as unauthenticated, rejected
+                    // (serverNonces[addr] is already null post-auth), and the peer's own retry/reconnect
+                    // logic recovers it - fail-closed, not silent corruption.
+                    synchronized(serverLock) {
+                        authenticatedDevices.remove(addr)
+                        serverAuthenticatedDeviceIds.remove(addr)
+                    }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     synchronized(serverLock) {
                         authenticatedDevices.remove(addr)
@@ -1869,8 +1897,12 @@ class GattSyncManager(
     private val clientPhotoIncoming = ByteArrayOutputStream()
     private var clientPhotoOutQueue: MutableList<ByteArray> = mutableListOf()
     @Volatile private var clientPhotoChunkPayload = BleConstants.MAX_CHUNK_PAYLOAD_PHOTO
-    private var clientPhotoSendComplete: CompletableDeferred<Unit>? = null
-    private var photoDoneSignal: CompletableDeferred<Unit>? = null
+    // SECURITY (test-code-allmodels round 6, Sonnet): completed from onConnectionStateChange's
+    // STATE_DISCONNECTED branch (a raw GATT binder callback) as well as this manager's own coroutines -
+    // the exact same cross-thread visibility reasoning that already earned metadataResponseSignal its
+    // own @Volatile a few lines below applies equally here; these two just never got it.
+    @Volatile private var clientPhotoSendComplete: CompletableDeferred<Unit>? = null
+    @Volatile private var photoDoneSignal: CompletableDeferred<Unit>? = null
     private var clientPhotoReceivedCount = 0
     private var clientPhotoExpectedCount = 0
     // BUG fix: an independent audit round found the JSON metadata phase had neither of the two
@@ -2073,6 +2105,12 @@ class GattSyncManager(
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                // SECURITY (test-code-allmodels round 6, Fable): this was the one client GATT callback
+                // still missing the entry-level staleness guard every sibling has - see clientGatt's own
+                // doc. A stale callback from a torn-down attempt could otherwise call finish(false) on
+                // behalf of a newer attempt that's already holding the shared clientSyncAttemptInProgress
+                // guard.
+                if (gatt !== clientGatt) return
                 val service = gatt.getService(BleConstants.SYNC_SERVICE_UUID)
                 val characteristic = service?.getCharacteristic(BleConstants.SYNC_CHARACTERISTIC_UUID)
                 if (characteristic == null) {
