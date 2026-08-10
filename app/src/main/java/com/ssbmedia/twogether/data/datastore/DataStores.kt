@@ -526,7 +526,15 @@ class SettingsStore(private val context: Context) {
         var result = ""
         context.settingsDs.edit { p ->
             val existing = p[Keys.LOCAL_DEVICE_ID]
-            result = if (existing != null) existing else UUID.randomUUID().toString().also { p[Keys.LOCAL_DEVICE_ID] = it }
+            // SECURITY (test-code-allmodels round 5, Opus): a present-but-BLANK value (e.g. a
+            // hand-edited or corrupted backup file - BackupManager's own JSON reader can yield "" for a
+            // key that's present but empty, and the restore path only null-checks) used to be accepted
+            // as "already generated" forever, since `existing != null` is true for "". Now that
+            // GattSyncManager's handshake gate rejects a blank deviceId outright (it can never be
+            // pinned, see checkPinOrRecordPending's own doc), that would have permanently locked this
+            // install out of ever pairing again with no in-app recovery. Treat blank the same as
+            // missing - regenerate a real id.
+            result = if (!existing.isNullOrBlank()) existing else UUID.randomUUID().toString().also { p[Keys.LOCAL_DEVICE_ID] = it }
         }
         return result
     }

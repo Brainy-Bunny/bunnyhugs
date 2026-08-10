@@ -1409,7 +1409,11 @@ class GattSyncManager(
                     if (decoded == null || expectedResponse == null || !expectedResponse.contentEquals(decoded.response)) {
                         Log.w(TAG, "Rejecting GATT write from unauthenticated device $addr - missing/invalid handshake")
                         try { gattServer?.cancelConnection(device) } catch (e: SecurityException) { /* ignore */ }
-                        synchronized(serverLock) { serverNonces.remove(addr) }
+                        // SECURITY (test-code-allmodels round 5, Sonnet): guarded to only remove OUR OWN
+                        // nonce (nonceS, captured above before this HMAC check) - see the identical guard
+                        // on the sibling pin-check-false branch below for why an unconditional removal
+                        // here could delete a genuinely different, still-live connection's nonce.
+                        synchronized(serverLock) { if (serverNonces[addr] === nonceS) serverNonces.remove(addr) }
                         return
                     }
                     // SECURITY: the client has now proven it knows the shared secret AND its claimed
@@ -2072,6 +2076,10 @@ class GattSyncManager(
             }
 
             override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+                // SECURITY (test-code-allmodels round 5, Sonnet): this callback was the one client
+                // callback missing the entry-level staleness guard every sibling (onMtuChanged,
+                // onCharacteristicWrite, onCharacteristicChanged) already has - see clientGatt's own doc.
+                if (gatt !== clientGatt) return
                 val service = gatt.getService(BleConstants.SYNC_SERVICE_UUID)
                 if (!syncCccdDone && descriptor.characteristic.uuid == BleConstants.SYNC_CHARACTERISTIC_UUID) {
                     // Feature 2: the sync characteristic's own notification subscription is ready - now
@@ -2130,6 +2138,13 @@ class GattSyncManager(
                         try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
                         return@launch
                     }
+                    // SECURITY (test-code-allmodels round 5, Sonnet): nonceDeferred.await() above is a
+                    // suspension point - a NEWER connectAsClient() attempt could have superseded this one
+                    // while it was suspended. The entry-level guard just added only proves this was the
+                    // current attempt when the callback first fired, not after this suspend. Re-check
+                    // before doing anything with the result, same discipline as the sibling
+                    // handshake-completion coroutine in onCharacteristicWrite.
+                    if (gatt !== clientGatt) return@launch
                     // MINOR fix: crypto/DataStore work moved inside the try - a JCE failure (e.g. an
                     // unsupported algorithm on some OEM's crypto provider) used to be able to escape
                     // uncaught into [scope], since the try below only ever wrapped the actual GATT write.
@@ -2159,6 +2174,10 @@ class GattSyncManager(
                         throw e
                     } catch (e: Exception) {
                         Log.w(TAG, "Failed to compute/send handshake proof", e)
+                        // SECURITY (test-code-allmodels round 5, Sonnet): this catch can be reached after
+                        // the suspend points above (getOrCreateLocalDeviceId/pairingStore.current) - don't
+                        // call finish()/disconnect() on behalf of an attempt that's no longer current.
+                        if (gatt !== clientGatt) return@launch
                         finish(false)
                         try { gatt.disconnect() } catch (e2: SecurityException) { /* ignore */ }
                     }
@@ -2573,6 +2592,11 @@ class GattSyncManager(
         val photoCharacteristic = service.getCharacteristic(BleConstants.PHOTO_CHARACTERISTIC_UUID) ?: return
 
         val localMoments = momentRepository.getAll()
+        // SECURITY (test-code-allmodels round 5, Opus): getAll() above suspends (Room I/O) - a NEWER
+        // connectAsClient() attempt could have superseded this one while it was suspended. Re-check
+        // before touching any shared client photo-phase state below - same discipline as every other
+        // suspension point in the handshake/payload coroutines. See clientGatt's own doc.
+        if (gatt !== clientGatt) return
         val toSend = computeToSend(localMoments, remoteMoments, MAX_PHOTOS_PER_DIRECTION_PER_SESSION)
         val toRequestIds = computeToRequestIds(localMoments, remoteMoments, MAX_PHOTOS_PER_DIRECTION_PER_SESSION)
         if (toSend.isEmpty() && toRequestIds.isEmpty()) return
@@ -2608,6 +2632,13 @@ class GattSyncManager(
                 frames += buildPhotoDataFrame(moment.syncId, bytes)
             }
             if (toRequestIds.isNotEmpty()) frames += buildPhotoRequestFrame(toRequestIds)
+
+            // SECURITY (test-code-allmodels round 5, Opus): the per-file withContext(Dispatchers.IO)
+            // read above suspends once per photo - re-check staleness before overwriting shared
+            // clientPhotoSendComplete/clientPhotoOutQueue that a NEWER attempt may already be using.
+            // The unconditional "clear leftover transferring markers" cleanup below this whole
+            // withTimeoutOrNull block still runs either way, so bailing here can't strand the UI.
+            if (gatt !== clientGatt) return@withTimeoutOrNull
 
             if (frames.isNotEmpty()) {
                 val sendComplete = CompletableDeferred<Unit>()
