@@ -785,6 +785,123 @@ class GattSyncManager(
         return usable.coerceIn(MIN_CHUNK_PAYLOAD, maxPayload)
     }
 
+    // ---- SECURITY: mutual-handshake wire framing (see BleConstants.computeMutualHandshakeResponse's
+    // doc for why this exists). Both message shapes below are chunked exactly like the JSON/photo
+    // payloads (MORE/LAST flag byte + toChunks/effectiveChunkPayload) rather than sent as one raw
+    // write/notify - a JCE-derived nonce+response+deviceId+partnerName blob can run past 20 bytes,
+    // which would silently truncate on a device where MTU negotiation fell back to the 23-byte
+    // default (see effectiveChunkPayload's own doc), corrupting the handshake in a way that's easy to
+    // miss in testing on hardware that always negotiates a large MTU. ----
+
+    /** Message 2 (client -> server) and, structurally identical, what the server parses it back into:
+     * the client's own fresh nonce, its proof-of-key HMAC, and its (length-prefixed) deviceId/
+     * partnerName - see BleConstants.computeMutualHandshakeResponse's doc for why deviceId/partnerName
+     * are bound into the HMAC rather than sent as a separate unauthenticated field. */
+    private data class HandshakeProofMessage(
+        val nonce: ByteArray,
+        val response: ByteArray,
+        val deviceId: ByteArray,
+        val partnerName: ByteArray
+    )
+
+    private fun encodeHandshakeProofMessage(nonce: ByteArray, response: ByteArray, deviceId: ByteArray, partnerName: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream()
+        out.write(nonce)
+        out.write(response)
+        out.write(deviceId.size)
+        out.write(deviceId)
+        out.write(partnerName.size)
+        out.write(partnerName)
+        return out.toByteArray()
+    }
+
+    /** Returns null on any malformed/truncated input (a corrupt reassembly, a stray/adversarial write) -
+     * callers must treat null exactly like a failed HMAC check (reject, don't crash), never throw. */
+    private fun decodeHandshakeProofMessage(bytes: ByteArray): HandshakeProofMessage? {
+        val nonceLen = BleConstants.HANDSHAKE_NONCE_BYTES
+        val respLen = BleConstants.HANDSHAKE_RESPONSE_BYTES
+        if (bytes.size < nonceLen + respLen + 1) return null
+        val nonce = bytes.copyOfRange(0, nonceLen)
+        val response = bytes.copyOfRange(nonceLen, nonceLen + respLen)
+        var offset = nonceLen + respLen
+        val deviceIdLen = bytes[offset].toInt() and 0xFF
+        offset += 1
+        if (offset + deviceIdLen > bytes.size) return null
+        val deviceId = bytes.copyOfRange(offset, offset + deviceIdLen)
+        offset += deviceIdLen
+        if (offset >= bytes.size) return null
+        val partnerNameLen = bytes[offset].toInt() and 0xFF
+        offset += 1
+        if (offset + partnerNameLen > bytes.size) return null
+        val partnerName = bytes.copyOfRange(offset, offset + partnerNameLen)
+        return HandshakeProofMessage(nonce, response, deviceId, partnerName)
+    }
+
+    /** Message 3 (server -> client): the server's own proof-of-key HMAC plus its (length-prefixed)
+     * deviceId/partnerName - no nonce field, since by this point the server has already sent nonceS as
+     * the bare first notification (unchanged, pre-existing behavior) and the client generated its own
+     * nonceC locally, so both nonces are already known to whoever's computing/verifying this message. */
+    private data class HandshakeReplyMessage(val response: ByteArray, val deviceId: ByteArray, val partnerName: ByteArray)
+
+    private fun encodeHandshakeReplyMessage(response: ByteArray, deviceId: ByteArray, partnerName: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream()
+        out.write(response)
+        out.write(deviceId.size)
+        out.write(deviceId)
+        out.write(partnerName.size)
+        out.write(partnerName)
+        return out.toByteArray()
+    }
+
+    private fun decodeHandshakeReplyMessage(bytes: ByteArray): HandshakeReplyMessage? {
+        val respLen = BleConstants.HANDSHAKE_RESPONSE_BYTES
+        if (bytes.size < respLen + 1) return null
+        val response = bytes.copyOfRange(0, respLen)
+        var offset = respLen
+        val deviceIdLen = bytes[offset].toInt() and 0xFF
+        offset += 1
+        if (offset + deviceIdLen > bytes.size) return null
+        val deviceId = bytes.copyOfRange(offset, offset + deviceIdLen)
+        offset += deviceIdLen
+        if (offset >= bytes.size) return null
+        val partnerNameLen = bytes[offset].toInt() and 0xFF
+        offset += 1
+        if (offset + partnerNameLen > bytes.size) return null
+        val partnerName = bytes.copyOfRange(offset, offset + partnerNameLen)
+        return HandshakeReplyMessage(response, deviceId, partnerName)
+    }
+
+    /** Defensively truncates a UTF-8-encoded field to BleConstants.MAX_HANDSHAKE_FIELD_BYTES before it
+     * goes anywhere near the wire or the HMAC - see that constant's own doc. Applied identically on
+     * both the encode and (implicitly, since the check side only ever reads back what was actually
+     * sent) decode side, so this never causes a spurious mismatch on its own. */
+    private fun String.toHandshakeFieldBytes(): ByteArray {
+        val bytes = toByteArray(Charsets.UTF_8)
+        return if (bytes.size > BleConstants.MAX_HANDSHAKE_FIELD_BYTES) bytes.copyOf(BleConstants.MAX_HANDSHAKE_FIELD_BYTES) else bytes
+    }
+
+    /** SECURITY (mutual-handshake follow-up): the identity-and-consent gate now enforced BEFORE either
+     * side of a connection ever transmits a byte of real payload data - see the class doc's "Every
+     * connection must first prove..." section and PairingStore.recordPendingResyncRequest's own doc.
+     * Returns true (proceed) when there's no pin yet, or [remoteDeviceId] matches the existing pin;
+     * false (the caller must refuse to continue - no payload, no pin update, disconnect) otherwise, with
+     * the pending-resync-request + throttled notification already recorded as a side effect of the
+     * false path. Shared by BOTH the server's and the client's handshake completion, which is exactly
+     * the point: neither role gets to skip this check anymore, unlike the old design where only the
+     * side that happened to receive a full JSON payload ever ran it. */
+    private suspend fun checkPinOrRecordPending(remoteDeviceId: String, remoteDevice: BluetoothDevice?, remotePartnerName: String): Boolean {
+        val currentPairing = pairingStore.current()
+        val pinned = currentPairing.pinnedPartnerDeviceId
+        if (pinned.isNullOrBlank() || remoteDeviceId.isBlank() || remoteDeviceId == pinned) return true
+        Log.w(TAG, "Rejecting handshake: connecting device did not match this pairing's pinned partner")
+        val bluetoothName = try { remoteDevice?.name } catch (e: SecurityException) { null }
+        val isNewPendingDevice = pairingStore.recordPendingResyncRequest(remoteDeviceId, bluetoothName, remotePartnerName.ifBlank { null })
+        if (isNewPendingDevice) {
+            Notifications.showResyncRequestNotification(context, currentPairing.partnerName)
+        }
+        return false
+    }
+
     // ---- Feature 2: photo wire-frame helpers (shared by client + server) ----
 
     private fun buildPhotoDataFrame(syncId: String, bytes: ByteArray): ByteArray {
@@ -1003,9 +1120,18 @@ class GattSyncManager(
     // moment that device's handshake response is verified - see the nonce/HMAC handshake doc at the top
     // of this file.
     private val serverNonces = HashMap<String, ByteArray>()
+    // SECURITY (mutual-handshake follow-up): reassembly buffer for message 2 (the client's own
+    // nonce+proof+identity, see HandshakeProofMessage) and the outgoing chunk queue for message 3 (this
+    // server's own proof+identity reply, see HandshakeReplyMessage) - kept SEPARATE from
+    // serverIncoming/serverOutQueue (the post-auth JSON buffers) for the same reason serverPhotoIncoming
+    // is separate from both: a device mid-handshake must never be confused with a device mid-JSON-sync,
+    // even though the two phases never overlap in time for one connection.
+    private val serverHandshakeIncoming = HashMap<String, ByteArrayOutputStream>()
+    private val serverHandshakeOutQueue = HashMap<String, MutableList<ByteArray>>()
     // Guards serverIncoming / serverOutQueue / serverPhotoIncoming / serverPhotoOutQueue /
-    // authenticatedDevices / deviceMtus / serverNonces, which are otherwise mutated both from GATT
-    // binder-thread callbacks and from coroutines launched via [scope].
+    // authenticatedDevices / deviceMtus / serverNonces / serverHandshakeIncoming / serverHandshakeOutQueue,
+    // which are otherwise mutated both from GATT binder-thread callbacks and from coroutines launched via
+    // [scope].
     private val serverLock = Any()
     // MINOR fix: read from GATT binder-thread callbacks (onCharacteristicWriteRequest) but written from
     // startServer() - not covered by serverLock's own guard set (a lock there wouldn't help a caller that
@@ -1091,6 +1217,8 @@ class GattSyncManager(
                         serverPhotoOutQueue.remove(addr)
                         deviceMtus.remove(addr)
                         serverNonces.remove(addr)
+                        serverHandshakeIncoming.remove(addr)
+                        serverHandshakeOutQueue.remove(addr)
                     }
                 }
             }
@@ -1107,32 +1235,89 @@ class GattSyncManager(
                 val isAuthenticated = synchronized(serverLock) { authenticatedDevices.contains(addr) }
 
                 if (!isAuthenticated) {
-                    // The very first write from a not-yet-authenticated device must be the correct
-                    // HMAC(handshakeKey, nonce) response to the nonce THIS device was issued when it
-                    // subscribed (see onDescriptorWriteRequest below and this file's top-of-file doc) -
-                    // proving it knows our pairing code without ever transmitting the key itself - before
-                    // we accept or act on anything else it sends (on EITHER characteristic - the client
-                    // always sends the handshake on the sync characteristic first, see connectAsClient).
-                    val nonce = synchronized(serverLock) { serverNonces[addr] }
-                    val expected = if (nonce != null && expectedHandshakeKey.isNotEmpty()) {
-                        BleConstants.computeHandshakeResponse(expectedHandshakeKey, nonce)
-                    } else null
-                    val ok = expected != null && value.contentEquals(expected)
-                    if (ok) {
-                        synchronized(serverLock) { authenticatedDevices.add(addr); serverNonces.remove(addr) }
-                        if (responseNeeded) {
-                            try {
-                                gattServer?.sendResponse(device, requestId, android.bluetooth.BluetoothGatt.GATT_SUCCESS, offset, null)
-                            } catch (e: SecurityException) { Log.w(TAG, "sendResponse failed", e) }
-                        }
-                    } else {
-                        Log.w(TAG, "Rejecting GATT write from unauthenticated device $addr - missing/invalid handshake")
+                    // SECURITY (mutual-handshake follow-up, per multi-round advisory review): the
+                    // client's own proof (message 2 - HandshakeProofMessage) is chunked like everything
+                    // else past the default MTU (see this file's "mutual-handshake wire framing" doc) -
+                    // reassembled here into a buffer SEPARATE from the post-auth JSON one, so a device
+                    // mid-handshake is never confused with one mid-JSON-sync.
+                    val nonceS = synchronized(serverLock) { serverNonces[addr] }
+                    if (nonceS == null || expectedHandshakeKey.isEmpty() || value.isEmpty()) {
+                        Log.w(TAG, "Rejecting GATT write from unauthenticated device $addr - no nonce on record")
                         if (responseNeeded) {
                             try {
                                 gattServer?.sendResponse(device, requestId, android.bluetooth.BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION, offset, null)
                             } catch (e: SecurityException) { Log.w(TAG, "sendResponse failed", e) }
                         }
                         try { gattServer?.cancelConnection(device) } catch (e: SecurityException) { /* ignore */ }
+                        return
+                    }
+                    // Ack the raw BLE write immediately regardless of chunk position or eventual
+                    // accept/reject outcome - the accept/reject DECISION only happens once the full
+                    // message is reassembled below, matching the post-auth JSON path's own shape.
+                    if (responseNeeded) {
+                        try {
+                            gattServer?.sendResponse(device, requestId, android.bluetooth.BluetoothGatt.GATT_SUCCESS, offset, null)
+                        } catch (e: SecurityException) { Log.w(TAG, "sendResponse failed", e) }
+                    }
+                    val buffer = synchronized(serverLock) { serverHandshakeIncoming.getOrPut(addr) { ByteArrayOutputStream() } }
+                    val flag = value[0]
+                    if (value.size > 1) {
+                        synchronized(serverLock) {
+                            if (buffer.size() + value.size - 1 > MAX_HANDSHAKE_MESSAGE_BYTES) {
+                                Log.w(TAG, "Incoming handshake message from client exceeded sanity cap - dropping")
+                                buffer.reset()
+                            } else {
+                                buffer.write(value, 1, value.size - 1)
+                            }
+                        }
+                    }
+                    if (flag != BleConstants.CHUNK_FLAG_LAST) return
+                    val raw = synchronized(serverLock) { serverHandshakeIncoming.remove(addr); buffer.toByteArray() }
+                    val decoded = decodeHandshakeProofMessage(raw)
+                    val expectedResponse = decoded?.let {
+                        BleConstants.computeMutualHandshakeResponse(
+                            expectedHandshakeKey, BleConstants.HANDSHAKE_ROLE_CLIENT, nonceS, it.nonce, it.deviceId, it.partnerName
+                        )
+                    }
+                    if (decoded == null || expectedResponse == null || !expectedResponse.contentEquals(decoded.response)) {
+                        Log.w(TAG, "Rejecting GATT write from unauthenticated device $addr - missing/invalid handshake")
+                        try { gattServer?.cancelConnection(device) } catch (e: SecurityException) { /* ignore */ }
+                        synchronized(serverLock) { serverNonces.remove(addr) }
+                        return
+                    }
+                    // SECURITY: the client has now proven it knows the shared secret AND its claimed
+                    // identity (deviceId/partnerName are bound into the HMAC it just produced, so neither
+                    // could have been tampered with in transit). Now the identity-and-consent gate, BEFORE
+                    // this device ever sends anything real back - see checkPinOrRecordPending's own doc
+                    // for why this must happen HERE, not after-the-fact inside applyPayload as it used to
+                    // (that check remains too, as defence-in-depth, but this is the one that actually
+                    // stops a rejected device from ever receiving our data in the first place).
+                    val clientDeviceId = String(decoded.deviceId, Charsets.UTF_8)
+                    val clientPartnerName = String(decoded.partnerName, Charsets.UTF_8)
+                    val clientNonce = decoded.nonce
+                    scope.launch {
+                        try {
+                            if (!checkPinOrRecordPending(clientDeviceId, device, clientPartnerName)) {
+                                try { gattServer?.cancelConnection(device) } catch (e: SecurityException) { /* ignore */ }
+                                activeServerOnSyncDone(false)
+                                return@launch
+                            }
+                            // Identity accepted - mark authenticated NOW (before replying) so a stray
+                            // write arriving mid-reply is routed to the post-auth JSON path, never back
+                            // into this handshake branch.
+                            synchronized(serverLock) { authenticatedDevices.add(addr); serverNonces.remove(addr) }
+                            val serverDeviceId = settingsStore.getOrCreateLocalDeviceId().toHandshakeFieldBytes()
+                            val serverPartnerName = pairingStore.current().partnerName.toHandshakeFieldBytes()
+                            val responseS = BleConstants.computeMutualHandshakeResponse(
+                                expectedHandshakeKey, BleConstants.HANDSHAKE_ROLE_SERVER, clientNonce, nonceS, serverDeviceId, serverPartnerName
+                            )
+                            sendHandshakeReplyToClient(device, encodeHandshakeReplyMessage(responseS, serverDeviceId, serverPartnerName))
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to complete mutual handshake as server", e)
+                            activeServerOnSyncDone(false)
+                        }
                     }
                     return
                 }
@@ -1240,6 +1425,20 @@ class GattSyncManager(
 
             override fun onNotificationSent(device: BluetoothDevice, status: Int) {
                 val addr = device.address
+                // SECURITY (mutual-handshake follow-up): message 3's remaining chunks (this server's own
+                // proof+identity reply) take top priority - they can only ever be in flight BEFORE the
+                // device is authenticated, strictly earlier than any photo/JSON queue could have
+                // anything for the same connection, so there's no real ordering conflict with the checks
+                // below - this is just the natural sequencing.
+                val nextHandshake = synchronized(serverLock) {
+                    val q = serverHandshakeOutQueue[addr]
+                    if (!q.isNullOrEmpty()) q.removeAt(0) else null
+                }
+                if (nextHandshake != null) {
+                    sendRawNotification(device, nextHandshake)
+                    return
+                }
+                synchronized(serverLock) { serverHandshakeOutQueue.remove(addr) }
                 // Photo-queue chunks take priority if any are pending - in practice the two queues never
                 // have items at the same time for one connection (see the class doc), but checking photo
                 // first is harmless either way and keeps a photo response from ever waiting behind a
@@ -1285,6 +1484,20 @@ class GattSyncManager(
         if (chunks.isEmpty()) return
         val first = chunks.removeAt(0)
         synchronized(serverLock) { serverOutQueue[device.address] = chunks }
+        sendRawNotification(device, first)
+    }
+
+    /** SECURITY (mutual-handshake follow-up): sends message 3 (this server's own proof+identity reply,
+     * see HandshakeReplyMessage) - chunked exactly like sendToClient's post-auth payload, just queued
+     * separately (serverHandshakeOutQueue, pumped first by onNotificationSent) since this always
+     * happens strictly before the device is marked authenticated. */
+    private fun sendHandshakeReplyToClient(device: BluetoothDevice, message: ByteArray) {
+        val mtu = synchronized(serverLock) { deviceMtus[device.address] } ?: DEFAULT_ATT_MTU
+        val chunkPayload = effectiveChunkPayload(mtu, BluetoothGatt.GATT_SUCCESS)
+        val chunks = toChunks(message, chunkPayload).toMutableList()
+        if (chunks.isEmpty()) return
+        val first = chunks.removeAt(0)
+        synchronized(serverLock) { serverHandshakeOutQueue[device.address] = chunks }
         sendRawNotification(device, first)
     }
 
@@ -1416,6 +1629,11 @@ class GattSyncManager(
     private var clientOutQueue: MutableList<ByteArray> = mutableListOf()
     private val clientLock = Any()
     private var clientChunkPayload = BleConstants.MAX_CHUNK_PAYLOAD
+    // SECURITY (mutual-handshake follow-up): reassembly buffer for message 3 (the server's own
+    // proof+identity reply, see HandshakeReplyMessage) - kept separate from clientIncoming (the
+    // post-auth JSON buffer), same reasoning as clientPhotoIncoming's own separation. Reset at the top
+    // of every connectAsClient() call, same as clientIncoming/clientPhotoIncoming.
+    private val clientHandshakeIncoming = ByteArrayOutputStream()
 
     // Feature 2: client-side photo phase state. All reset fresh at the top of connectAsClient() (a new
     // connection attempt must never see leftovers from a previous one), and cleared again on disconnect.
@@ -1470,6 +1688,7 @@ class GattSyncManager(
         } catch (e: SecurityException) { /* ignore */ }
         clientGatt = null
         clientIncoming.reset()
+        clientHandshakeIncoming.reset()
         clientPhotoIncoming.reset()
         synchronized(clientLock) { clientPhotoOutQueue = mutableListOf() }
         clientPhotoSendComplete = null
@@ -1486,17 +1705,33 @@ class GattSyncManager(
         // double-invoking the sync-completion path; or both pass the handshakeAcked check and each
         // independently kick off sending the local ideas list). Guarded by clientLock, the same lock
         // already used below for clientOutQueue.
-        var handshakeAcked = false
         var completed = false
         // Set once both the sync AND photo characteristics have enabled notifications, so the handshake
         // (the actual start of real data exchange) never races ahead of either subscription being ready.
         var syncCccdDone = false
         // Completed by onCharacteristicChanged the moment the server's handshake nonce notification
         // arrives (always the very first notification on the sync characteristic - see this file's
-        // top-of-file doc) - awaited (with a timeout) right before computing+sending the handshake
-        // response, since the nonce can arrive at any point after this device's CCCD write, independent
-        // of when the photo characteristic's own subscription finishes.
+        // top-of-file doc) - awaited (with a timeout) right before computing+sending this device's own
+        // proof (message 2 - HandshakeProofMessage), since the nonce can arrive at any point after this
+        // device's CCCD write, independent of when the photo characteristic's own subscription finishes.
         val nonceDeferred = CompletableDeferred<ByteArray>()
+        // SECURITY (mutual-handshake follow-up): completed by onCharacteristicChanged once message 3
+        // (the server's own proof+identity reply, HandshakeReplyMessage) is fully reassembled - awaited
+        // right after message 2 finishes sending, and verified BEFORE this device ever builds/sends its
+        // real payload. See BleConstants.computeMutualHandshakeResponse's own doc for why this exists.
+        val handshakeReplyDeferred = CompletableDeferred<ByteArray>()
+        // Chunks of message 2 (this device's own proof+identity) still to send, pumped by
+        // onCharacteristicWrite exactly like clientOutQueue is post-auth - kept SEPARATE (see this
+        // file's "mutual-handshake wire framing" doc) and set back to null the moment it's fully sent,
+        // which onCharacteristicWrite uses as the one-shot latch (replacing the old handshakeAcked
+        // boolean) to know when to stop pumping this queue and start awaiting message 3 instead.
+        var clientHandshakeOutQueue: MutableList<ByteArray>? = null
+        // Stashed the moment each is generated/received - verifying message 3 later (in a SEPARATE
+        // callback invocation from the one that sent message 2) needs both nonces to recompute the
+        // expected server proof. Both guarded by clientLock alongside clientHandshakeOutQueue, for the
+        // same cross-binder-thread-callback reason documented below.
+        var clientNonceC: ByteArray? = null
+        var clientNonceS: ByteArray? = null
 
         // Guards against calling onSyncDone() twice (e.g. once from a failure path and again from the
         // disconnect that follows it) and makes sure a connection that drops before completing - GATT
@@ -1607,8 +1842,8 @@ class GattSyncManager(
                     return
                 }
                 scope.launch {
-                    val nonce = withTimeoutOrNull(HANDSHAKE_NONCE_TIMEOUT_MILLIS) { nonceDeferred.await() }
-                    if (nonce == null) {
+                    val nonceS = withTimeoutOrNull(HANDSHAKE_NONCE_TIMEOUT_MILLIS) { nonceDeferred.await() }
+                    if (nonceS == null) {
                         Log.w(TAG, "Timed out waiting for server's handshake nonce")
                         finish(false)
                         // MEDIUM fix: without this, a connection that times out waiting for the nonce
@@ -1620,20 +1855,35 @@ class GattSyncManager(
                         try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
                         return@launch
                     }
-                    // MINOR fix: computeHandshakeResponse moved inside the try - a JCE failure (e.g. an
+                    // MINOR fix: crypto/DataStore work moved inside the try - a JCE failure (e.g. an
                     // unsupported algorithm on some OEM's crypto provider) used to be able to escape
                     // uncaught into [scope], since the try below only ever wrapped the actual GATT write.
                     try {
-                        val response = BleConstants.computeHandshakeResponse(handshakeKey, nonce)
+                        // SECURITY (mutual-handshake follow-up): builds message 2 - this device's own
+                        // fresh nonce, its proof-of-key HMAC, and its (length-prefixed) deviceId/
+                        // partnerName, all bound into the same MAC - see
+                        // BleConstants.computeMutualHandshakeResponse's own doc. Chunked like everything
+                        // else past the default MTU (see this file's "mutual-handshake wire framing" doc).
+                        val nonceC = ByteArray(BleConstants.HANDSHAKE_NONCE_BYTES).also { SecureRandom().nextBytes(it) }
+                        val myDeviceId = settingsStore.getOrCreateLocalDeviceId().toHandshakeFieldBytes()
+                        val myPartnerName = pairingStore.current().partnerName.toHandshakeFieldBytes()
+                        val responseC = BleConstants.computeMutualHandshakeResponse(
+                            handshakeKey, BleConstants.HANDSHAKE_ROLE_CLIENT, nonceS, nonceC, myDeviceId, myPartnerName
+                        )
+                        val message2 = encodeHandshakeProofMessage(nonceC, responseC, myDeviceId, myPartnerName)
+                        synchronized(clientLock) { clientNonceC = nonceC; clientNonceS = nonceS }
+                        val chunks = toChunks(message2, clientChunkPayload).toMutableList()
+                        val first = chunks.removeAt(0)
+                        synchronized(clientLock) { clientHandshakeOutQueue = chunks }
                         characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
                         @Suppress("DEPRECATION")
-                        characteristic.value = response
+                        characteristic.value = first
                         @Suppress("DEPRECATION")
                         gatt.writeCharacteristic(characteristic)
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
-                        Log.w(TAG, "Failed to compute/send handshake response", e)
+                        Log.w(TAG, "Failed to compute/send handshake proof", e)
                         finish(false)
                         try { gatt.disconnect() } catch (e2: SecurityException) { /* ignore */ }
                     }
@@ -1656,70 +1906,141 @@ class GattSyncManager(
                     finish(false)
                     return
                 }
-                val firstHandshakeAck = synchronized(clientLock) {
-                    if (handshakeAcked) false else { handshakeAcked = true; true }
+                // SECURITY (mutual-handshake follow-up): still pumping message 2 (this device's own
+                // proof+identity, possibly several chunks past the default MTU)? Send the next chunk and
+                // return - nothing else happens until the whole message is out.
+                val nextHandshakeChunk = synchronized(clientLock) {
+                    val q = clientHandshakeOutQueue
+                    if (q != null && q.isNotEmpty()) q.removeAt(0) else null
                 }
-                if (firstHandshakeAck) {
-                    // BUG fix: see metadataResponseSignal's own doc - without this watchdog, a peer that
-                    // authenticated correctly but then never sent back a metadata response (or sent one
-                    // that never completed with a LAST flag) left this device waiting forever, holding
-                    // its single-sync-attempt guard open with no way to recover except killing the app.
-                    // Stall-based, not a fixed deadline - see metadataResponseSignal's own "round 2" doc
-                    // for why. Polls rather than a single withTimeoutOrNull so it can compare against a
-                    // deadline that keeps moving forward as long as genuine progress (metadataLastActivityAtMillis)
-                    // keeps happening.
-                    val signal = CompletableDeferred<Unit>()
-                    metadataResponseSignal = signal
-                    metadataLastActivityAtMillis = System.currentTimeMillis()
-                    val phaseStartedAtMillis = metadataLastActivityAtMillis
-                    scope.launch {
-                        while (!signal.isCompleted) {
-                            delay(METADATA_STALL_CHECK_INTERVAL_MILLIS)
-                            if (signal.isCompleted) break
-                            // BUG fix: a second independent review round pointed out this closure reads
-                            // the SHARED metadataLastActivityAtMillis, not one scoped to its own `signal`
-                            // - so if this exact attempt were ever abandoned without its `signal` being
-                            // completed (disconnectClient() closes the gatt without going through the
-                            // normal onConnectionStateChange DISCONNECTED path, which is what would
-                            // otherwise complete it), this watchdog could linger up to the full ceiling
-                            // and then call finish(false) on behalf of a sync that's no longer this
-                            // device's current attempt - a stale finish() is a harmless no-op by itself,
-                            // but is one guard too many to rely on alone. Bailing out the moment
-                            // metadataResponseSignal has been reassigned to a NEWER attempt's signal means
-                            // this watchdog only ever acts on its own, still-current attempt.
-                            if (metadataResponseSignal !== signal) break
-                            val now = System.currentTimeMillis()
-                            val sinceLastActivity = now - metadataLastActivityAtMillis
-                            val sincePhaseStart = now - phaseStartedAtMillis
-                            val stalled = sinceLastActivity > METADATA_STALL_TIMEOUT_MILLIS
-                            val exceededCeiling = sincePhaseStart > METADATA_PHASE_ABSOLUTE_CEILING_MILLIS
-                            if (!stalled && !exceededCeiling) continue
-                            Log.w(
-                                TAG,
-                                if (stalled) "Metadata phase stalled - no progress for ${sinceLastActivity}ms"
-                                else "Metadata phase exceeded absolute ceiling (${sincePhaseStart}ms) despite ongoing progress"
-                            )
-                            finish(false)
-                            try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
-                            break
-                        }
+                if (nextHandshakeChunk != null) {
+                    try {
+                        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                        @Suppress("DEPRECATION")
+                        characteristic.value = nextHandshakeChunk
+                        @Suppress("DEPRECATION")
+                        gatt.writeCharacteristic(characteristic)
+                    } catch (e: SecurityException) {
+                        Log.w(TAG, "Missing permission to write characteristic", e)
+                        finish(false)
                     }
+                    return
+                }
+                // Message 2 just finished sending (the queue existed and is now empty) - null it out (a
+                // one-shot latch, replacing the old handshakeAcked boolean) and move on to awaiting
+                // message 3. Any FUTURE call here (once real payload chunks start flowing, after the
+                // block below completes) sees clientHandshakeOutQueue already null and falls through to
+                // the ordinary post-auth pump at the bottom of this function.
+                val justFinishedHandshakeSend = synchronized(clientLock) {
+                    if (clientHandshakeOutQueue != null) { clientHandshakeOutQueue = null; true } else false
+                }
+                if (justFinishedHandshakeSend) {
                     // MAJOR fix (test-code-allmodels, Opus - unfixed twin of round 2's serializeTimeCapsules
-                    // crash-loop fix, same as the server-side buildPayload() call site above): this used to
-                    // have no try/catch at all, inside a bare scope.launch on ProximityForegroundService.
-                    // lifecycleScope with no CoroutineExceptionHandler - any uncaught throw (a DataStore
-                    // IOException, a Room read failure) crashed the whole process instead of failing this
-                    // one sync attempt. Same report-and-disconnect shape every other failure branch in this
-                    // handshake/sync flow already uses (finish(false) + best-effort disconnect).
+                    // crash-loop fix, same as the server-side buildPayload() call site above): any uncaught
+                    // throw here (a DataStore IOException, a Room read failure, a JCE failure) must fail
+                    // this one sync attempt cleanly, not crash the whole process - same report-and-
+                    // disconnect shape every other failure branch in this handshake/sync flow already uses.
                     scope.launch {
                         try {
+                            val nonceS = synchronized(clientLock) { clientNonceS }
+                            val nonceC = synchronized(clientLock) { clientNonceC }
+                            val replyRaw = withTimeoutOrNull(HANDSHAKE_NONCE_TIMEOUT_MILLIS) { handshakeReplyDeferred.await() }
+                            if (replyRaw == null || nonceS == null || nonceC == null) {
+                                Log.w(TAG, "Timed out waiting for server's mutual handshake reply")
+                                finish(false)
+                                try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
+                                return@launch
+                            }
+                            // SECURITY (mutual-handshake follow-up): verifies message 3 (the server's own
+                            // proof+identity reply) BEFORE this device ever builds/sends its real payload -
+                            // see BleConstants.computeMutualHandshakeResponse's own doc. A fake "server"
+                            // that doesn't know the shared secret can never produce a valid response here,
+                            // closing the gap where this device used to send its full data payload the
+                            // moment its OWN write locally succeeded, without ever checking the other side
+                            // proved anything back.
+                            val decoded = decodeHandshakeReplyMessage(replyRaw)
+                            val expected = decoded?.let {
+                                BleConstants.computeMutualHandshakeResponse(
+                                    handshakeKey, BleConstants.HANDSHAKE_ROLE_SERVER, nonceC, nonceS, it.deviceId, it.partnerName
+                                )
+                            }
+                            if (decoded == null || expected == null || !expected.contentEquals(decoded.response)) {
+                                Log.w(TAG, "Rejecting server's handshake reply - missing/invalid mutual proof")
+                                finish(false)
+                                try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
+                                return@launch
+                            }
+                            // SECURITY: the server has now proven it knows the shared secret AND its
+                            // claimed identity (deviceId/partnerName are bound into the HMAC it just
+                            // produced, so neither could have been tampered with in transit). Now the
+                            // identity-and-consent gate, BEFORE this device ever sends anything real - see
+                            // checkPinOrRecordPending's own doc for why this must happen here, not
+                            // after-the-fact inside applyPayload as it used to (that check remains too, as
+                            // defence-in-depth, but this is the one that actually stops this device from
+                            // ever handing its own data to a rejected identity in the first place).
+                            val serverDeviceId = String(decoded.deviceId, Charsets.UTF_8)
+                            val serverPartnerName = String(decoded.partnerName, Charsets.UTF_8)
+                            if (!checkPinOrRecordPending(serverDeviceId, device, serverPartnerName)) {
+                                finish(false)
+                                try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
+                                return@launch
+                            }
+                            // Mutual auth + identity check both passed - proceed exactly as the
+                            // pre-existing post-handshake flow (stall watchdog + build/send real payload).
+                            // BUG fix: see metadataResponseSignal's own doc - without this watchdog, a
+                            // peer that authenticated correctly but then never sent back a metadata
+                            // response (or sent one that never completed with a LAST flag) left this
+                            // device waiting forever, holding its single-sync-attempt guard open with no
+                            // way to recover except killing the app. Stall-based, not a fixed deadline -
+                            // see metadataResponseSignal's own "round 2" doc for why. Polls rather than a
+                            // single withTimeoutOrNull so it can compare against a deadline that keeps
+                            // moving forward as long as genuine progress (metadataLastActivityAtMillis)
+                            // keeps happening.
+                            val signal = CompletableDeferred<Unit>()
+                            metadataResponseSignal = signal
+                            metadataLastActivityAtMillis = System.currentTimeMillis()
+                            val phaseStartedAtMillis = metadataLastActivityAtMillis
+                            scope.launch {
+                                while (!signal.isCompleted) {
+                                    delay(METADATA_STALL_CHECK_INTERVAL_MILLIS)
+                                    if (signal.isCompleted) break
+                                    // BUG fix: a second independent review round pointed out this closure
+                                    // reads the SHARED metadataLastActivityAtMillis, not one scoped to its
+                                    // own `signal` - so if this exact attempt were ever abandoned without
+                                    // its `signal` being completed (disconnectClient() closes the gatt
+                                    // without going through the normal onConnectionStateChange
+                                    // DISCONNECTED path, which is what would otherwise complete it), this
+                                    // watchdog could linger up to the full ceiling and then call
+                                    // finish(false) on behalf of a sync that's no longer this device's
+                                    // current attempt - a stale finish() is a harmless no-op by itself, but
+                                    // is one guard too many to rely on alone. Bailing out the moment
+                                    // metadataResponseSignal has been reassigned to a NEWER attempt's
+                                    // signal means this watchdog only ever acts on its own, still-current
+                                    // attempt.
+                                    if (metadataResponseSignal !== signal) break
+                                    val now = System.currentTimeMillis()
+                                    val sinceLastActivity = now - metadataLastActivityAtMillis
+                                    val sincePhaseStart = now - phaseStartedAtMillis
+                                    val stalled = sinceLastActivity > METADATA_STALL_TIMEOUT_MILLIS
+                                    val exceededCeiling = sincePhaseStart > METADATA_PHASE_ABSOLUTE_CEILING_MILLIS
+                                    if (!stalled && !exceededCeiling) continue
+                                    Log.w(
+                                        TAG,
+                                        if (stalled) "Metadata phase stalled - no progress for ${sinceLastActivity}ms"
+                                        else "Metadata phase exceeded absolute ceiling (${sincePhaseStart}ms) despite ongoing progress"
+                                    )
+                                    finish(false)
+                                    try { gatt.disconnect() } catch (e: SecurityException) { /* ignore */ }
+                                    break
+                                }
+                            }
                             val payload = buildPayload()
                             synchronized(clientLock) { clientOutQueue = toChunks(payload, clientChunkPayload).toMutableList() }
                             sendNextClientChunk(gatt, characteristic)
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Exception) {
-                            Log.w(TAG, "Failed to build/send outgoing sync payload - reporting failure instead of crashing", e)
+                            Log.w(TAG, "Failed to complete mutual handshake / build outgoing sync payload as client", e)
                             finish(false)
                             try { gatt.disconnect() } catch (e2: SecurityException) { /* ignore */ }
                         }
@@ -1737,9 +2058,34 @@ class GattSyncManager(
                 if (characteristic.uuid == BleConstants.SYNC_CHARACTERISTIC_UUID && !nonceDeferred.isCompleted) {
                     // The very first notification the server ever sends on the sync characteristic is
                     // always its handshake nonce (see startServer's onDescriptorWriteRequest) - raw bytes,
-                    // no chunk-flag framing, since the server won't send real (flag-framed) JSON data
-                    // until AFTER it has authenticated this device via that nonce's HMAC response.
+                    // no chunk-flag framing, since the server won't send this device anything else until
+                    // AFTER it has both authenticated this device's message 2 AND accepted its identity
+                    // (see checkPinOrRecordPending's own doc).
                     nonceDeferred.complete(value)
+                    return
+                }
+
+                // SECURITY (mutual-handshake follow-up): message 3 (the server's own proof+identity
+                // reply, HandshakeReplyMessage) arrives on this same characteristic next, flag-framed
+                // exactly like everything past the raw nonce - reassembled into a buffer SEPARATE from
+                // the post-auth JSON one (clientIncoming), so a handshake-phase notification can never be
+                // misread as JSON or vice versa. Gated on !handshakeReplyDeferred.isCompleted so this
+                // branch only ever runs once per connection, strictly before real data exchange begins.
+                if (characteristic.uuid == BleConstants.SYNC_CHARACTERISTIC_UUID && !handshakeReplyDeferred.isCompleted) {
+                    val flag = value[0]
+                    if (value.size > 1) {
+                        if (clientHandshakeIncoming.size() + value.size - 1 > MAX_HANDSHAKE_MESSAGE_BYTES) {
+                            Log.w(TAG, "Incoming handshake reply from server exceeded sanity cap - dropping")
+                            clientHandshakeIncoming.reset()
+                        } else {
+                            clientHandshakeIncoming.write(value, 1, value.size - 1)
+                        }
+                    }
+                    if (flag == BleConstants.CHUNK_FLAG_LAST) {
+                        val raw = clientHandshakeIncoming.toByteArray()
+                        clientHandshakeIncoming.reset()
+                        handshakeReplyDeferred.complete(raw)
+                    }
                     return
                 }
 
@@ -1991,6 +2337,14 @@ class GattSyncManager(
          * at real BLE throughput would take a long time to actually reach this, which is exactly why the
          * timeout below is stall-based rather than sized off this constant. */
         private const val MAX_SYNC_JSON_BYTES = 10_000_000
+
+        /** SECURITY (mutual-handshake follow-up): sanity ceiling on the reassembled handshake proof
+         * message (nonce + response + length-prefixed deviceId/partnerName, both directions) - mirrors
+         * MAX_SYNC_JSON_BYTES's own reasoning but sized for what this message actually is: at most
+         * 16 + 16 + 1 + 255 + 1 + 255 = 544 bytes even at the absolute field-length ceiling
+         * (BleConstants.MAX_HANDSHAKE_FIELD_BYTES). Generous headroom over that, purely defensive
+         * against a misbehaving/adversarial peer that never sends a LAST flag. */
+        private const val MAX_HANDSHAKE_MESSAGE_BYTES = 4096
 
         /** BLOCKER fix: an independent testing round found that every LWW merge (dateIdeas,
          * listCategories, milestones, momentNotes) trusted the peer's `updatedAt` absolutely, with no

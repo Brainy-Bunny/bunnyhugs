@@ -105,6 +105,56 @@ object BleConstants {
         return mac.doFinal(nonce).copyOf(HANDSHAKE_RESPONSE_BYTES)
     }
 
+    /** SECURITY (mutual-handshake follow-up, per multi-round advisory review): the ONE-WAY handshake
+     * above only ever proves the CLIENT to the SERVER - a fake "server" that knows nothing can still
+     * receive a real client's full data payload, since the client used to send it the moment its own
+     * write locally succeeded, without ever checking the server proved anything back. This computes
+     * BOTH directions of a mutual proof from the SAME shared handshakeKey, with [role] as a domain
+     * separator (HANDSHAKE_ROLE_CLIENT when the CLIENT is the one proving itself to the server,
+     * HANDSHAKE_ROLE_SERVER for the reverse) so a captured client-proof can never be replayed back as a
+     * valid server-proof even though both are derived from the same key. [nonceFirst]/[nonceSecond] are
+     * always ordered "nonce the verifier issued, nonce the prover issued" for THAT direction - see the
+     * two call sites in GattSyncManager for the exact ordering each side uses; getting this backwards
+     * on either side would make every legitimate handshake fail closed (safe) rather than open
+     * (unsafe), since a mismatched order just fails to match, but it's still tracked precisely to avoid
+     * spurious failures. [deviceId]/[partnerName] are bound INTO the MAC (not just carried alongside
+     * it) with explicit length prefixes before each field, specifically so an attacker who doesn't know
+     * handshakeKey can't tamper with either field in transit without invalidating the proof - without
+     * the length prefixes, two different (deviceId, partnerName) pairs whose concatenation happens to
+     * produce the same byte sequence would be indistinguishable to the MAC. */
+    fun computeMutualHandshakeResponse(
+        handshakeKey: ByteArray,
+        role: Byte,
+        nonceFirst: ByteArray,
+        nonceSecond: ByteArray,
+        deviceId: ByteArray,
+        partnerName: ByteArray
+    ): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(handshakeKey, "HmacSHA256"))
+        mac.update(byteArrayOf(role))
+        mac.update(nonceFirst)
+        mac.update(nonceSecond)
+        mac.update(byteArrayOf(deviceId.size.toByte()))
+        mac.update(deviceId)
+        mac.update(byteArrayOf(partnerName.size.toByte()))
+        mac.update(partnerName)
+        return mac.doFinal().copyOf(HANDSHAKE_RESPONSE_BYTES)
+    }
+
+    /** Domain separator for [computeMutualHandshakeResponse] - see its own doc for why this exists. */
+    const val HANDSHAKE_ROLE_CLIENT: Byte = 0x01
+    const val HANDSHAKE_ROLE_SERVER: Byte = 0x02
+
+    /** Hard cap on the UTF-8 byte length of a single variable-length field
+     * ([computeMutualHandshakeResponse]'s deviceId/partnerName) - both are length-prefixed with one
+     * byte on the wire, so this is the largest value that prefix can represent, not an arbitrary
+     * product limit. deviceId is always a 36-character UUID string (well under this); partnerName is a
+     * short display name that's realistically always far shorter, but is defensively truncated to this
+     * cap (silently, at the point of encoding - see GattSyncManager) rather than trusted to already be
+     * short, since it's ultimately free-form user input. */
+    const val MAX_HANDSHAKE_FIELD_BYTES = 255
+
     /** Chunk protocol: 1 flag byte (0 = more chunks follow, 1 = last chunk) + payload. */
     const val CHUNK_FLAG_MORE: Byte = 0
     const val CHUNK_FLAG_LAST: Byte = 1
