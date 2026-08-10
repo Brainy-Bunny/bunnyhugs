@@ -10,7 +10,7 @@ import java.util.UUID
 
 @Database(
     entities = [TogetherSession::class, DateIdea::class, TimeCapsule::class, Moment::class, MomentNote::class, Milestone::class, ListCategory::class],
-    version = 10,
+    version = 11,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -291,6 +291,27 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         /**
+         * v10 -> v11, MAJOR fix (independent review): adds moments.takenWhileTogether - see
+         * Moment.takenWhileTogether's own doc for the cross-device caption bug this closes. Backfilled
+         * from each existing row's own `sessionId IS NOT NULL`, which is EXACTLY the expression the old
+         * UI evaluated at render time, so every already-correct local caption stays byte-identical after
+         * this migration and only the previously-broken remote-stub case (sessionId always null, hence
+         * always "Taken apart") gains the ability to be right - it stays 0 here (we genuinely don't know
+         * for a row that predates the field) and self-corrects the next time the partner re-sends that
+         * moment, since the wire payload now carries the real value.
+         *
+         * INTEGER NOT NULL DEFAULT 0 matches the Kotlin `Boolean` (non-null) declaration - Room's schema
+         * validation compares the column's type/nullability/default against the @Entity field and throws
+         * on the first open after migration if they disagree.
+         */
+        val MIGRATION_10_11 = object : Migration(10, 11) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE moments ADD COLUMN takenWhileTogether INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("UPDATE moments SET takenWhileTogether = 1 WHERE sessionId IS NOT NULL")
+            }
+        }
+
+        /**
          * Seeds the default "Date Ideas" list (id == DEFAULT_LIST_ID) for a genuinely BRAND-NEW install -
          * i.e. no pre-existing database file at all, so Room creates the schema fresh at the CURRENT
          * version and none of MIGRATION_1_2..MIGRATION_7_8 ever run (migrations only fire when upgrading
@@ -320,7 +341,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "twogether.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11)
                     .addCallback(SEED_DEFAULT_LIST_CALLBACK)
                     // Safety net only for a FUTURE schema version we didn't write a real migration for -
                     // the 1->2 and 2->3 paths above are always handled for real, so existing users'

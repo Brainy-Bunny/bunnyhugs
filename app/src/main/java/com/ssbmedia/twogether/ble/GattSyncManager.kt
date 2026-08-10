@@ -532,6 +532,31 @@ class GattSyncManager(
      * for why an unbounded peer clock offset let an obviously-broken peer clock launder its data into a
      * plausible-looking but wrong moment in the past. Extracted as its own function purely so it's
      * independently testable. */
+    /**
+     * NOTE (independent review of v2.6, round 2 - a deliberately REJECTED fix, recorded so it is not
+     * re-attempted): the raw offset is `peer.deviceTimestamp - our System.currentTimeMillis()`, but
+     * `deviceTimestamp` is stamped when the peer BUILDS the payload (see buildPayload) while our "now" is
+     * read when we APPLY it, so the chunked-BLE transfer time in between is counted as if it were clock
+     * skew and inflates every incoming timestamp by roughly the one-way transfer time (live-measured at
+     * 250..390ms). That inflation is what USED to drive a permanent `updatedAt` ratchet: the echoed copy
+     * of an unchanged row looked newer, was accepted, re-written, and echoed back bigger still, forever.
+     *
+     * The first attempt at fixing that added a 60s floor here - ignore any offset too small to be
+     * distinguishable from transfer latency. Round 2 of the review rejected it, correctly: a floor cannot
+     * tell "transfer latency" from "the partner's clock is genuinely 59s fast", and suppressing the
+     * correction in the latter case makes LWW resolve by WHOSE CLOCK IS AHEAD rather than who edited
+     * last. Concretely, with B's clock 59s fast: B edits at wall time T (stored T+59); A edits the same
+     * row 30s LATER (stored T+30); on the next sync A's own newer edit loses to B's older one and is
+     * silently overwritten on both phones. That is exactly the silent-data-loss class this whole file's
+     * skew correction exists to prevent, so the floor traded a churn bug for a correctness bug.
+     *
+     * The ratchet is instead fixed entirely on the merge side, where it belongs: the LWW merges now skip
+     * writing a row whose meaningful content is unchanged (see DateIdeaRepository.mergeRemote), so an
+     * echo is never written and therefore never re-stamped or re-echoed. A row that genuinely DID change
+     * absorbs the one-way inflation exactly once on the receiving side and then stops - live-verified as
+     * a single frozen ~288ms offset between the two devices' copies rather than a monotonic climb. No
+     * floor is needed, and none should be added back.
+     */
     private fun boundPeerClockOffset(rawOffsetMillis: Long): Long =
         if (kotlin.math.abs(rawOffsetMillis) > MAX_PLAUSIBLE_PEER_CLOCK_OFFSET_MILLIS) 0L else rawOffsetMillis
 
@@ -545,6 +570,12 @@ class GattSyncManager(
                 // Feature 2: lets the receiver know whether WE actually hold the photo bytes, so it can
                 // decide whether to request them from us this session - see this class's top-of-file doc.
                 put("hasPhoto", m.photoDownloaded)
+                // MAJOR fix (independent review): see Moment.takenWhileTogether's doc. `sessionId` is
+                // deliberately NOT on the wire (it's a foreign local auto-increment id and is nulled on
+                // receipt), so before this field existed the receiver had no way to know a photo was taken
+                // during a together-session and captioned every single one of the partner's photos "Taken
+                // apart" - contradicting the sending phone's own caption for the identical photo.
+                put("takenWhileTogether", m.takenWhileTogether)
                 put("updatedAt", m.updatedAt)
                 put("deleted", m.deleted)
             })
@@ -573,6 +604,14 @@ class GattSyncManager(
                 photoUri = o.optString("photoUri", ""),
                 takenAt = o.getLong("takenAt"),
                 syncId = syncId,
+                // MUST be passed explicitly: this constructor leaves `sessionId` at its null default, so
+                // the entity's own `takenWhileTogether = sessionId != null` default would resolve to
+                // false here and silently recreate the exact "every partner photo says Taken apart" bug
+                // this field was added to fix. Defaults to false only for a payload from a partner still
+                // on a build that predates this field - degrading to the old behaviour for that one case
+                // rather than guessing. Display-only and therefore safe to take from the peer verbatim -
+                // see Moment.takenWhileTogether's TRUST NOTE.
+                takenWhileTogether = o.optBoolean("takenWhileTogether", false),
                 isRemote = true,
                 updatedAt = updatedAt,
                 deleted = o.optBoolean("deleted", false)

@@ -160,6 +160,18 @@ interface MomentDao {
     @Query("UPDATE moments SET photoDownloaded = :downloaded WHERE syncId = :syncId")
     suspend fun updatePhotoDownloaded(syncId: String, downloaded: Boolean)
 
+    /** MINOR fix (independent review round 2): MomentRepository.mergeRemoteStubs' takenWhileTogether
+     * self-heal used to be a `dao.update(local.copy(...))` built from a snapshot read at the top of that
+     * function - a stale-read full-row write, the exact anti-pattern [TimeCapsuleDao.tombstone]'s doc
+     * already describes and this app already fixed once elsewhere. A photo transfer completing between
+     * that snapshot and the write (entirely reachable: a device is GATT server and client at the same
+     * time, and nothing serialises the two) would have had its `photoDownloaded = true` silently reverted
+     * by the stale snapshot. This touches the single column it means to change and nothing else, so no
+     * concurrent update can be clobbered regardless of timing. One-way by construction (`SET ... = 1`),
+     * matching the self-heal's own one-way contract. */
+    @Query("UPDATE moments SET takenWhileTogether = 1 WHERE syncId = :syncId")
+    suspend fun markTakenWhileTogether(syncId: String)
+
     /** Wipes every row - used only by Feature 4's backup restore, which always fully repopulates this
      * table immediately afterward inside the same DB transaction. */
     @Query("DELETE FROM moments")
@@ -227,6 +239,26 @@ interface ListCategoryDao {
 
     @Query("SELECT * FROM list_categories")
     suspend fun getAll(): List<ListCategory>
+
+    /** MINOR fix (independent review round 2): the default "Date Ideas" list is seeded INDEPENDENTLY on
+     * each phone (AppDatabase.MIGRATION_7_8 on an upgrade, SEED_DEFAULT_LIST_CALLBACK on a fresh install),
+     * so the two devices' copies hold different `createdAt` values - by weeks, for a couple who installed
+     * at different times. [observeActive] orders this screen by `createdAt ASC`, so that difference is
+     * directly user-visible as the default list sitting in a DIFFERENT position relative to their
+     * user-created lists on each phone. Before the no-op-write guard landed it was masked by the churn
+     * (every sync copied the value across, oscillating); with that guard it would otherwise never
+     * converge at all.
+     *
+     * Deliberately `min`, applied one-way via the `>` guard in the WHERE clause: both devices converge on
+     * the SAME value (the earlier of the two creation times) no matter which one merges first, it can
+     * only ever decrease so it cannot oscillate the way a plain LWW copy would, and it self-extinguishes
+     * once both sides agree. Safe from the transfer-latency inflation that motivated the merge guards in
+     * the first place because `createdAt` is passed over the wire verbatim - unlike `updatedAt`, it is
+     * never offset-adjusted by GattSyncManager.deserializeListCategories - so repeated syncs cannot walk
+     * it downward. A targeted single-column update, not a read-modify-write, for the same reason as
+     * [MomentDao.markTakenWhileTogether]. */
+    @Query("UPDATE list_categories SET createdAt = :createdAt WHERE id = :id AND createdAt > :createdAt")
+    suspend fun lowerCreatedAt(id: String, createdAt: Long)
 
     /** Wipes every row - used only by Feature 4's backup restore, which always fully repopulates this
      * table immediately afterward inside the same DB transaction. */

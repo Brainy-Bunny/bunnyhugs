@@ -51,6 +51,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -268,6 +270,23 @@ private fun MomentFullScreen(moment: Moment, isTransferring: Boolean, onDismiss:
     val hasLocalPhoto = remember(moment.photoUri, moment.photoDownloaded) { moment.photoDownloaded && File(moment.photoUri).isFile }
     var showDeleteConfirm by remember { mutableStateOf(false) }
 
+    // MINOR fix (independent review, live-observed on two devices): making this a sibling of THIS screen's
+    // Scaffold (the previous fix, see the comment at the call site) correctly covered this screen's own top
+    // bar and FABs - but the bottom navigation bar does not belong to this screen at all. It lives in
+    // TwogetherNavHost's Scaffold, one level UP, so no composable rendered inside a nav destination can
+    // ever draw over it: Home/Calendar/Our Lists/Moments/Stats stayed fully visible and tappable beneath
+    // the "full-screen" viewer, and the camera FAB showed faintly through it near the note's Save button.
+    //
+    // A Dialog is the fix rather than plumbing a "hide the bottom bar" flag up into NavGraph: a Dialog is
+    // its own window, composed above the entire Activity, so it covers the bottom bar without this screen
+    // needing to know the bar exists (and without every future full-screen overlay having to re-plumb the
+    // same flag). usePlatformDefaultWidth = false removes the Material dialog width inset so it genuinely
+    // fills the screen. Bonus correctness the old Box could not give: the system Back gesture now closes
+    // the VIEWER first, instead of popping the whole Moments destination out from under an open photo.
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -312,7 +331,12 @@ private fun MomentFullScreen(moment: Moment, isTransferring: Boolean, onDismiss:
                 modifier = Modifier.padding(top = 16.dp)
             )
             Text(
-                text = if (moment.sessionId != null) "Taken while together 💕" else "Taken apart",
+                // MAJOR fix (independent review, live-reproduced across two paired devices): was
+                // `moment.sessionId != null`, which is ALWAYS null for a moment that arrived via sync (see
+                // MomentRepository.mergeRemoteStubs) - so the identical photo read "Taken while together
+                // 💕" on the phone that shot it and "Taken apart" on the partner's. Reads the synced
+                // boolean now, so both phones agree. See Moment.takenWhileTogether's doc.
+                text = if (moment.takenWhileTogether) "Taken while together 💕" else "Taken apart",
                 color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.8f),
                 style = MaterialTheme.typography.bodyMedium
             )
@@ -349,6 +373,7 @@ private fun MomentFullScreen(moment: Moment, isTransferring: Boolean, onDismiss:
             androidx.compose.foundation.layout.Spacer(modifier = Modifier.padding(bottom = 32.dp))
         }
     }
+    }
 
     if (showDeleteConfirm) {
         AlertDialog(
@@ -370,7 +395,11 @@ private fun MomentNotesSection(momentSyncId: String) {
     val coroutineScope = rememberCoroutineScope()
     var myDeviceId by remember { mutableStateOf<String?>(null) }
     var partnerName by remember { mutableStateOf("Your partner") }
-    var notes by remember { mutableStateOf<List<MomentNote>>(emptyList()) }
+    // MAJOR fix (independent review of v2.6, live-reproduced): `notes` used to start as emptyList(), which
+    // is indistinguishable from "this moment genuinely has no notes" - and that ambiguity silently
+    // destroyed real user data (see the seeding effect below). Nullable now: null means "the DB has not
+    // answered yet", emptyList() means "answered: there are none".
+    var notes by remember { mutableStateOf<List<MomentNote>?>(null) }
     var myText by remember { mutableStateOf("") }
     var initializedMyText by remember { mutableStateOf(false) }
     var saved by remember { mutableStateOf(false) }
@@ -382,16 +411,43 @@ private fun MomentNotesSection(momentSyncId: String) {
     LaunchedEffect(momentSyncId) {
         ServiceLocator.momentNoteRepository.observeForMoment(momentSyncId).collect { notes = it }
     }
-    // Seed the editable field from whatever's already stored for "me" exactly once per moment, so
-    // typing doesn't get stomped by the very Flow this same save writes back into.
-    val myExisting = remember(notes, myDeviceId) { notes.firstOrNull { it.authorDeviceId == myDeviceId && !it.deleted } }
-    LaunchedEffect(momentSyncId, myExisting) {
-        if (!initializedMyText) {
+    val myExisting = remember(notes, myDeviceId) {
+        notes?.firstOrNull { it.authorDeviceId == myDeviceId && !it.deleted }
+    }
+    /**
+     * Seed the editable field from whatever's already stored for "me" exactly once per moment, so typing
+     * doesn't get stomped by the very Flow this same save writes back into.
+     *
+     * MAJOR fix (independent review of v2.6, live-reproduced on a real device): this used to latch on the
+     * FIRST composition unconditionally. Both of its inputs arrive asynchronously - `myDeviceId` from a
+     * suspend DataStore read, `notes` from a Room Flow - so on that first pass myDeviceId was still null
+     * and notes still empty, `myExisting` resolved to null, and the effect latched `myText = ""` and set
+     * initializedMyText = true. When the real data landed a moment later the effect re-ran but the latch
+     * had already closed, so an existing note NEVER appeared: reopening a photo you had written a note on
+     * always showed an empty box.
+     *
+     * That was not merely cosmetic. The blank box is a loaded gun: `saveMyNote` treats blank text as a
+     * TOMBSTONE (deleted = true, see MomentNoteRepository.saveMyNote), so a user who reopened a photo,
+     * saw an empty field, and tapped "Save note" - or tapped it after typing and then clearing - silently
+     * destroyed the note they had written AND propagated that deletion to their partner's phone on the
+     * next sync, with no warning and no undo.
+     *
+     * Now the latch only closes once BOTH prerequisites have genuinely resolved, so the value it captures
+     * is the real stored one. `notes != null` (not `isNotEmpty()`) is what makes "no notes yet" still
+     * latch correctly and immediately for a genuinely un-noted photo.
+     */
+    LaunchedEffect(momentSyncId, myDeviceId, notes) {
+        if (!initializedMyText && myDeviceId != null && notes != null) {
             myText = myExisting?.text.orEmpty()
             initializedMyText = true
         }
     }
-    val partnerNote = remember(notes, myDeviceId) { notes.firstOrNull { it.authorDeviceId != myDeviceId && !it.deleted } }
+    val partnerNote = remember(notes, myDeviceId) {
+        // Also guarded on myDeviceId being loaded: while it is still null EVERY note has
+        // `authorDeviceId != null`, so for one frame this used to show the user their OWN note back to
+        // them labelled as their partner's.
+        if (myDeviceId == null) null else notes?.firstOrNull { it.authorDeviceId != myDeviceId && !it.deleted }
+    }
 
     Column(
         modifier = Modifier
@@ -406,6 +462,13 @@ private fun MomentNotesSection(momentSyncId: String) {
             onValueChange = { myText = it; saved = false },
             placeholder = { Text("A little detail about this one…") },
             modifier = Modifier.fillMaxWidth(),
+            // MINOR fix (independent review round 2): the field used to be editable from the very first
+            // frame, while the seeding effect above was still waiting on myDeviceId/notes. Anything typed
+            // in that window was then overwritten the instant the latch fired - the same "an effect
+            // stomped what the user typed" class of bug the seeding fix itself addresses. The window is
+            // milliseconds, and nothing could be SAVED during it (the button below is gated on the same
+            // flag), but leaving the field live invited exactly that race.
+            enabled = initializedMyText,
             minLines = 2,
             colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
                 focusedTextColor = androidx.compose.ui.graphics.Color.White,
@@ -413,7 +476,11 @@ private fun MomentNotesSection(momentSyncId: String) {
             )
         )
         Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
-            TextButton(onClick = {
+            // Defence in depth for the data-loss bug fixed in the seeding effect above: even if some
+            // future change reintroduced a too-early latch, saving is impossible until this field is
+            // known to hold the real stored value, so a blank box can never be committed as a tombstone
+            // over a note the user actually wrote.
+            TextButton(enabled = initializedMyText, onClick = {
                 val deviceId = myDeviceId ?: return@TextButton
                 coroutineScope.launch {
                     ServiceLocator.momentNoteRepository.saveMyNote(momentSyncId, deviceId, myText)

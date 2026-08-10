@@ -28,6 +28,7 @@ import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -178,14 +179,36 @@ class UltimateReviewRound3SpecTest {
 
         val upserted = repo.mergeRemote(listOf(remoteEcho), missingLinkedMomentField = setOf("m1"))
 
-        assertEquals(1, upserted.size)
+        // THE BLOCKER INVARIANT this test exists to guard, unchanged and still asserted:
         assertEquals(
             "the local link must survive an old-build partner's echo, not be silently nulled",
             "moment-123",
-            upserted[0].linkedMomentSyncId
+            dao.getAll().first().linkedMomentSyncId
         )
-        assertEquals("every other field (updatedAt) must still come from the remote as normal", 2_000L, upserted[0].updatedAt)
-        assertEquals("moment-123", dao.getAll().first().linkedMomentSyncId)
+        // Every field must be exactly as it was - the echo carried no real change, so nothing may move.
+        assertEquals("Anniversary", dao.getAll().first().label)
+        assertEquals(6, dao.getAll().first().month)
+        assertEquals(12, dao.getAll().first().day)
+        assertFalse(dao.getAll().first().deleted)
+
+        // BEHAVIOUR CHANGE, deliberate (independent review of v2.6, no-op-write guard): this used to
+        // assert `upserted.size == 1` and `upserted[0].updatedAt == 2_000L` - i.e. that the echo was
+        // re-WRITTEN locally, carrying the remote's newer timestamp, with only the link preserved. That
+        // was the mechanism by which the blocker above was fixed, never the blocker itself. mergeRemote
+        // now skips a row whose meaningful content is identical to the one already stored (see
+        // DateIdeaRepository.mergeRemote's doc for the live-measured write-amplification ratchet that
+        // motivated it), so this echo produces NO write at all - which satisfies the invariant above
+        // strictly more strongly than the old behaviour did: the local link cannot be clobbered by a
+        // write that never happens. The preservation still runs BEFORE the content comparison, which is
+        // exactly what makes this echo compare equal; without that ordering it would look "changed" and
+        // be re-written on every single sync forever.
+        //
+        // Not writing also leaves local `updatedAt` at 1_000L rather than adopting the remote's 2_000L.
+        // That is the safer of the two: adopting a peer's skew-inflated timestamp pushes the LOCAL row's
+        // stamp into the future relative to this device's own clock, so a subsequent genuine local edit
+        // (stamped with real `System.currentTimeMillis()`) would look OLDER than the peer's stale copy and
+        // lose the next merge. Leaving it alone cannot produce that inversion.
+        assertTrue("an echo carrying no real change must not be re-written", upserted.isEmpty())
     }
 
     @Test

@@ -171,15 +171,27 @@ class DateIdeaRepository(private val dao: DateIdeaDao) {
         dao.upsert(idea.copy(deleted = true, updatedAt = System.currentTimeMillis()))
     }
 
-    /** Last-write-wins merge of a remote list of ideas into local storage, by id + updatedAt. */
+    /** Last-write-wins merge of a remote list of ideas into local storage, by id + updatedAt.
+     *
+     * MAJOR fix (independent review), applied identically to all four LWW merges in this file: an
+     * incoming row that is CONTENT-identical to the one we already hold is skipped instead of being
+     * re-written just because its `updatedAt` is a few hundred milliseconds newer. See
+     * GattSyncManager.boundPeerClockOffset's doc for the live-measured ratchet that made every sync
+     * re-write every row of every LWW table forever; that fix removes the cause, and this one removes the
+     * whole failure MODE - no residual clock difference, from any source, can produce a write when
+     * nothing a user would recognise as data has actually changed. Deliberately compares only the
+     * meaningful columns (never `updatedAt` itself, which is exactly the field that drifts). */
     suspend fun mergeRemote(remote: List<DateIdea>) {
         val local = dao.getAll().associateBy { it.id }
         val toUpsert = remote.filter { r ->
-            val l = local[r.id]
-            l == null || r.updatedAt > l.updatedAt
+            val l = local[r.id] ?: return@filter true
+            r.updatedAt > l.updatedAt && !r.sameContentAs(l)
         }
         if (toUpsert.isNotEmpty()) dao.upsertAll(toUpsert)
     }
+
+    private fun DateIdea.sameContentAs(other: DateIdea): Boolean =
+        text == other.text && listId == other.listId && done == other.done && deleted == other.deleted
 
     /**
      * Self-heals orphaned ideas - a real, if narrow, race that isn't specific to any one merge: while two
@@ -516,12 +528,49 @@ class MomentRepository(private val dao: MomentDao, private val context: Context)
                 // path, etc.) can never influence the actual destination directory - see
                 // localPhotoFile()/sanitizeExtension().
                 val safePath = localPhotoFile(context, r.syncId, extensionFromHint(r.photoUri)).absolutePath
-                dao.insert(r.copy(id = 0, sessionId = null, isRemote = true, photoUri = safePath))
+                // takenWhileTogether is deliberately carried through from `r` (the peer's payload) rather
+                // than being re-derived from the sessionId we're about to null out - that re-derivation is
+                // precisely the bug this field exists to fix (see Moment.takenWhileTogether's doc). Note
+                // `copy` does NOT re-evaluate the entity's default expression, so the wire value survives
+                // the `sessionId = null` below; it is set explicitly all the same so a future refactor of
+                // either side can't silently reintroduce the old always-"Taken apart" behaviour.
+                dao.insert(
+                    r.copy(
+                        id = 0,
+                        sessionId = null,
+                        takenWhileTogether = r.takenWhileTogether,
+                        isRemote = true,
+                        photoUri = safePath
+                    )
+                )
             } else if (r.deleted && !local.deleted) {
                 if (local.photoDownloaded) {
                     runCatching { File(local.photoUri).delete() }
                 }
                 dao.update(local.copy(deleted = true, updatedAt = maxOf(local.updatedAt, r.updatedAt)))
+            } else if (local.isRemote && !local.takenWhileTogether && r.takenWhileTogether) {
+                // SELF-HEAL for moments that were already synced BEFORE takenWhileTogether existed (see
+                // that field's doc). Those rows were inserted with no such information and were backfilled
+                // to false by AppDatabase.MIGRATION_10_11 (their sessionId is null, as it is for every
+                // remote stub), so without this branch every photo a couple had already shared would keep
+                // the wrong "Taken apart" caption forever on the receiving phone - the upgrade would only
+                // fix photos taken from now on.
+                //
+                // Deliberately narrow, in three ways, so this cannot become a hole:
+                //  - ONE-WAY (false -> true only), exactly like the tombstone branch above, so it converges
+                //    and cannot flip back and forth between syncs.
+                //  - Gated on `local.isRemote`, so a peer can never rewrite the caption of a photo THIS
+                //    phone took; for our own rows our own capture-time value is authoritative.
+                //  - `updatedAt` is deliberately NOT bumped: this is a one-time backfill of missing
+                //    information, not a user edit, and bumping it would feed the very sync write-
+                //    amplification the sibling LWW guards exist to prevent. The condition is
+                //    self-extinguishing (it is false on every subsequent sync once applied), so this
+                //    writes at most once per affected row, ever.
+                // MINOR fix (independent review round 2): a targeted single-column UPDATE rather than
+                // `dao.update(local.copy(...))`. `local` came from the snapshot read at the top of this
+                // function, so a full-row write could silently revert a `photoDownloaded = true` that a
+                // photo transfer committed in between - see MomentDao.markTakenWhileTogether's own doc.
+                dao.markTakenWhileTogether(local.syncId)
             }
         }
     }
@@ -598,9 +647,11 @@ class MomentNoteRepository(private val dao: MomentNoteDao) {
         val incoming = remote.filter { it.authorDeviceId.isNotBlank() && it.authorDeviceId != myDeviceId }
         if (incoming.isEmpty()) return
         val localByKey = dao.getAll().associateBy { it.momentSyncId to it.authorDeviceId }
+        // Content-identical rows are skipped rather than re-written - see DateIdeaRepository.mergeRemote's
+        // doc for the full reasoning behind this guard on all four LWW merges in this file.
         val toUpsert = incoming.filter { r ->
-            val l = localByKey[r.momentSyncId to r.authorDeviceId]
-            l == null || r.updatedAt > l.updatedAt
+            val l = localByKey[r.momentSyncId to r.authorDeviceId] ?: return@filter true
+            r.updatedAt > l.updatedAt && !(r.text == l.text && r.deleted == l.deleted)
         }
         if (toUpsert.isNotEmpty()) dao.upsertAll(toUpsert)
     }
@@ -639,6 +690,17 @@ class MilestoneRepository(private val dao: MilestoneDao) {
         dao.upsert(milestone.copy(linkedMomentSyncId = linkedMomentSyncId, updatedAt = System.currentTimeMillis()))
     }
 
+    /** The columns that make a milestone meaningfully different, for [mergeRemote]'s no-op-write guard -
+     * deliberately excludes `updatedAt` (the field that drifts) and `createdAt`. `createdAt` is excluded
+     * simply because it is immutable: a milestone is created on ONE device and copied to the other
+     * verbatim on insert (see the `local == null` branch), so both copies always already agree on it and
+     * comparing it would be dead weight. Unlike ListCategory's `createdAt` - which genuinely does differ
+     * between devices, because the default list is seeded independently on each - there is nothing here
+     * to converge. */
+    private fun Milestone.sameContentAs(other: Milestone): Boolean =
+        label == other.label && month == other.month && day == other.day && year == other.year &&
+            deleted == other.deleted && linkedMomentSyncId == other.linkedMomentSyncId
+
     /** Union+tombstone merge by id + updatedAt, same LWW shape as DateIdeaRepository.mergeRemote - these
      * are simple, rarely-edited additions, so plain last-write-wins is appropriate (see task spec).
      * BUG fix: returns what was actually upserted (was Unit) - an independent audit round found that
@@ -664,9 +726,19 @@ class MilestoneRepository(private val dao: MilestoneDao) {
     suspend fun mergeRemote(remote: List<Milestone>, missingLinkedMomentField: Set<String>): List<Milestone> {
         val local = dao.getAll().associateBy { it.id }
         val toUpsert = remote.mapNotNull { r ->
-            val l = local[r.id]
-            if (l != null && r.updatedAt <= l.updatedAt) return@mapNotNull null
-            if (l != null && r.id in missingLinkedMomentField) r.copy(linkedMomentSyncId = l.linkedMomentSyncId) else r
+            val l = local[r.id] ?: return@mapNotNull r
+            if (r.updatedAt <= l.updatedAt) return@mapNotNull null
+            // The linkedMomentSyncId preservation is applied BEFORE the content comparison below, so the
+            // thing we compare is the row we would actually write - otherwise an echoed row from a
+            // pre-linkedMomentSyncId partner build would look "changed" (remote null vs local set) and be
+            // written on every sync, exactly the churn the guard exists to stop.
+            val effective = if (r.id in missingLinkedMomentField) r.copy(linkedMomentSyncId = l.linkedMomentSyncId) else r
+            // Content-identical rows are skipped - see DateIdeaRepository.mergeRemote's doc. Skipping also
+            // correctly avoids re-arming this milestone's yearly alarm at the call site (which schedules
+            // only what this function returns): nothing about the date changed, so the alarm already
+            // armed by the original upsert is still the right one.
+            if (effective.sameContentAs(l)) return@mapNotNull null
+            effective
         }
         if (toUpsert.isNotEmpty()) dao.upsertAll(toUpsert)
         return toUpsert
@@ -740,10 +812,26 @@ class ListCategoryRepository(
      * NON-delete update to it (e.g. a rename) still applies normally. */
     suspend fun mergeRemote(remote: List<ListCategory>) {
         val local = dao.getAll().associateBy { it.id }
-        val toUpsert = remote.filter { r ->
-            if (r.id == DEFAULT_LIST_ID && r.deleted) return@filter false
-            val l = local[r.id]
-            l == null || r.updatedAt > l.updatedAt
+        // Converge createdAt downward for lists we already know - see ListCategoryDao.lowerCreatedAt's
+        // doc. Runs independently of (and before) the LWW decision below, because the whole point is the
+        // case where LWW correctly decides there is nothing to write.
+        remote.forEach { r ->
+            val l = local[r.id] ?: return@forEach
+            if (r.createdAt < l.createdAt) dao.lowerCreatedAt(r.id, r.createdAt)
+        }
+        val toUpsert = remote.mapNotNull { r ->
+            if (r.id == DEFAULT_LIST_ID && r.deleted) return@mapNotNull null
+            val l = local[r.id] ?: return@mapNotNull r
+            // Content-identical rows are skipped - see DateIdeaRepository.mergeRemote's doc. `createdAt`
+            // is excluded from the comparison on purpose: the two devices' copies of the DEFAULT list are
+            // seeded independently and so hold permanently different createdAt values, and treating that
+            // as a content change would defeat the guard entirely for the one row every couple is
+            // guaranteed to have. It is instead converged separately, above and just below.
+            if (r.updatedAt <= l.updatedAt || (r.name == l.name && r.deleted == l.deleted)) return@mapNotNull null
+            // A real change IS being written - carry the converged (minimum) createdAt into it rather
+            // than the remote's raw value, otherwise this write would undo the convergence above and the
+            // default list's position would diverge again on the first rename.
+            r.copy(createdAt = minOf(l.createdAt, r.createdAt))
         }
         if (toUpsert.isNotEmpty()) dao.upsertAll(toUpsert)
     }

@@ -100,6 +100,29 @@ data class Moment(
     val photoUri: String,
     val takenAt: Long,
     val sessionId: Long? = null,
+    /**
+     * MAJOR fix (independent review, live-reproduced on two devices): whether this photo was taken while
+     * the couple were actually together. Previously the Moments viewer derived that caption from
+     * `sessionId != null` directly - but [MomentRepository.mergeRemoteStubs] deliberately (and correctly)
+     * NULLS `sessionId` on every incoming remote row, because it is the OTHER device's local
+     * auto-increment id and is meaningless (and potentially coincidentally-colliding) here. The result was
+     * that the very same photo read "Taken while together 💕" on the phone that shot it and "Taken apart"
+     * on the partner's phone, permanently, for 100% of synced photos - two phones stating contradictory
+     * facts about one shared memory.
+     *
+     * This is the sync-safe replacement: a plain boolean that means the same thing on both devices and
+     * therefore CAN travel over the wire (unlike [sessionId]). Set once at capture time from this
+     * device's own live proximity state (see MomentRepository.add) and never mutated afterward.
+     * AppDatabase.MIGRATION_10_11 backfills it for existing rows from their own `sessionId IS NOT NULL`,
+     * which is exactly what the old UI check computed, so no already-correct local caption ever changes.
+     *
+     * TRUST NOTE: for a remote-stub row this is taken from the peer's payload verbatim. That is a
+     * deliberate, bounded exception to this app's "never trust a peer's claim" rule and is safe
+     * specifically because this field is display-only: it feeds one caption string and nothing else - no
+     * stats, no capsule threshold, no filesystem path, no merge/LWW decision. A lying peer can at worst
+     * mislabel its own photo, which it could equally do by simply taking the photo while together.
+     */
+    val takenWhileTogether: Boolean = sessionId != null,
     /** Feature D: stable cross-device identity, same reasoning as TogetherSession.syncId above - lets
      * MomentNote reference a specific moment by an id that means the same thing on both phones. */
     val syncId: String = UUID.randomUUID().toString(),

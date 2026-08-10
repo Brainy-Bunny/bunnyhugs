@@ -407,6 +407,12 @@ object BackupManager {
                     put("photoUri", m.photoUri)
                     put("takenAt", m.takenAt)
                     put("sessionId", m.sessionId)
+                    // MAJOR fix (independent review) - see Moment.takenWhileTogether's doc. Written even
+                    // though a same-device restore could re-derive it from sessionId, because a backup
+                    // taken on one phone and restored on another (the disaster-recovery case this whole
+                    // feature exists for) carries remote-stub rows whose sessionId is legitimately null
+                    // while takenWhileTogether may well be true.
+                    put("takenWhileTogether", m.takenWhileTogether)
                     put("photoZipEntry", if (File(m.photoUri).isFile) photoZipEntryName(m) else JSONObject.NULL)
                     put("syncId", m.syncId)
                     put("isRemote", m.isRemote)
@@ -1243,11 +1249,18 @@ object BackupManager {
             Log.w(TAG, "Rejecting implausible moment from backup: $syncId updatedAt=$updatedAt")
             return@mapNotNull null
         }
+        val sessionId = if (o.isNull("sessionId")) null else o.getLong("sessionId")
         val moment = Moment(
             id = o.getLong("id"),
             photoUri = MomentRepository.localPhotoFile(context, syncId, MomentRepository.extensionFromHint(rawPhotoUriHint)).absolutePath,
             takenAt = o.getLong("takenAt"),
-            sessionId = if (o.isNull("sessionId")) null else o.getLong("sessionId"),
+            sessionId = sessionId,
+            // MUST be passed explicitly for the same reason GattSyncManager.deserializeMoments does (see
+            // its comment): a missing value must not silently fall through to the entity default. The
+            // fallback for a backup made before this field existed is `sessionId != null`, which is
+            // exactly what the old UI computed at render time and what AppDatabase.MIGRATION_10_11
+            // backfills - so an older backup restores to precisely the captions it had when it was taken.
+            takenWhileTogether = o.optBoolean("takenWhileTogether", sessionId != null),
             syncId = syncId,
             isRemote = isRemote,
             // Feature 2: a v1/v2 backup (made before photoDownloaded existed) defaults exactly like
