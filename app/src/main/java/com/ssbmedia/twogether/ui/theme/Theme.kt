@@ -34,10 +34,29 @@ private val LightColors = lightColorScheme(
     surface = WarmCreamSurface,
     onSurface = WarmTextDark,
     surfaceVariant = WarmCreamSurfaceVariant,
-    onSurfaceVariant = WarmTextDark,
+    // MINOR fix (ultimate-app-review round 1, item 4): was WarmTextDark (identical to onSurface above),
+    // silently rendering every caption/chart-label/secondary-text at full emphasis instead of the
+    // intentional de-emphasis this role exists for - see WarmTextMuted's own doc in Color.kt.
+    onSurfaceVariant = WarmTextMuted,
     outline = WarmOutline,
     error = ErrorRed,
-    errorContainer = ErrorRedContainer
+    errorContainer = ErrorRedContainer,
+    // MINOR fix (ultimate-app-review round 1, item 4): every role below was previously left unset, so
+    // Material3 silently filled it from its own baseline purple default - see Color.kt's matching doc for
+    // where each of these values comes from.
+    onError = OnErrorRed,
+    onErrorContainer = OnErrorRedContainer,
+    outlineVariant = WarmOutlineVariant,
+    inverseSurface = WarmInverseSurfaceLight,
+    inverseOnSurface = WarmInverseOnSurfaceLight,
+    inversePrimary = WarmInversePrimaryLight,
+    surfaceTint = BlushPink,
+    scrim = Color.Black,
+    surfaceContainerLowest = WarmSurfaceContainerLowest,
+    surfaceContainerLow = WarmSurfaceContainerLow,
+    surfaceContainer = WarmSurfaceContainer,
+    surfaceContainerHigh = WarmSurfaceContainerHigh,
+    surfaceContainerHighest = WarmSurfaceContainerHighest
 )
 
 private val DarkColors = darkColorScheme(
@@ -58,10 +77,25 @@ private val DarkColors = darkColorScheme(
     surface = WarmDarkSurface,
     onSurface = WarmTextLight,
     surfaceVariant = WarmDarkSurfaceVariant,
-    onSurfaceVariant = WarmTextLight,
+    // MINOR fix (ultimate-app-review round 1, item 4): see LightColors' matching comment above - was
+    // WarmTextLight (identical to onSurface above) in this scheme too.
+    onSurfaceVariant = WarmTextMutedDark,
     outline = WarmOutlineDark,
     error = ErrorRedDark,
-    errorContainer = ErrorRedContainerDark
+    errorContainer = ErrorRedContainerDark,
+    onError = OnErrorRedDark,
+    onErrorContainer = OnErrorRedContainerDark,
+    outlineVariant = WarmOutlineVariantDark,
+    inverseSurface = WarmInverseSurfaceDark,
+    inverseOnSurface = WarmInverseOnSurfaceDark,
+    inversePrimary = WarmInversePrimaryDark,
+    surfaceTint = BlushPinkDark,
+    scrim = Color.Black,
+    surfaceContainerLowest = WarmSurfaceContainerLowestDark,
+    surfaceContainerLow = WarmSurfaceContainerLowDark,
+    surfaceContainer = WarmSurfaceContainerDark,
+    surfaceContainerHigh = WarmSurfaceContainerHighDark,
+    surfaceContainerHighest = WarmSurfaceContainerHighestDark
 )
 
 private val TwogetherShapes = Shapes(
