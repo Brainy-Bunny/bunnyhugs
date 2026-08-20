@@ -178,6 +178,16 @@ class DateIdeaRepository(private val dao: DateIdeaDao) {
 }
 
 class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
+    companion object {
+        /** UX-FIX-PLAN.md Phase 2 item 11: the SAME effective-threshold formula [unlockEligible] uses to
+         * decide whether a capsule has actually unlocked, extracted here so CapsulesScreen's new
+         * always-visible "unlocks after Xh together" timeline text can never disagree with the real
+         * lock/unlock decision - previously this formula was duplicated inline in CapsulesScreen's own
+         * Locked-branch display code, one copy that was free to drift from this repository's own logic. */
+        fun effectiveThreshold(capsule: TimeCapsule, currentManualHoursCredit: Float): Float =
+            capsule.unlockAtHours + (currentManualHoursCredit - capsule.manualHoursAtCreation)
+    }
+
     fun observeAll(): Flow<List<TimeCapsule>> = dao.observeAll()
 
     /** [manualHoursAtCreation] is the couple's CURRENT manual-hours credit (StatsCalculator.
@@ -217,7 +227,7 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
         val locked = dao.getLocked()
         val now = System.currentTimeMillis()
         locked.forEach { capsule ->
-            val effectiveThreshold = capsule.unlockAtHours + (currentManualHoursCredit - capsule.manualHoursAtCreation)
+            val effectiveThreshold = effectiveThreshold(capsule, currentManualHoursCredit)
             if (effectiveThreshold <= totalHours) {
                 dao.update(capsule.copy(unlockedAt = now))
             }

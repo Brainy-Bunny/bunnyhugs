@@ -29,7 +29,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.exifinterface.media.ExifInterface
 import com.ssbmedia.twogether.ServiceLocator
+import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.events.AppEvents
+import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.util.ImageDownscaler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -38,6 +40,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.time.Instant
 import java.time.LocalDate
+import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -75,6 +78,11 @@ fun GalleryImportHost(
     val scope = rememberCoroutineScope()
     var pendingUri by remember { mutableStateOf<Uri?>(null) }
     var suggestedDate by remember { mutableStateOf<LocalDate?>(null) }
+    // UX-FIX-PLAN.md Phase 2 item 12: the photo's own EXIF time-of-day (if it had one), kept separate
+    // from [suggestedDate] since the date field is user-editable text but the time isn't shown/edited
+    // anywhere in this dialog - this is purely carried through to takenAt at save time. Null means EXIF
+    // had no time component (or no EXIF at all), in which case takenAt falls back to noon, same as before.
+    var exifTime by remember { mutableStateOf<LocalTime?>(null) }
     var isSaving by remember { mutableStateOf(false) }
     // BUG fix: a copy failure (storage full, a revoked/expired content:// grant, etc - see
     // copyPickedImageToMomentsDir's own doc for why it returns null rather than throwing) used to just
@@ -87,7 +95,9 @@ fun GalleryImportHost(
     val pickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null) {
             pendingUri = uri
-            suggestedDate = readExifDate(context, uri)
+            val exifDateTime = readExifDateTime(context, uri)
+            suggestedDate = exifDateTime?.date
+            exifTime = exifDateTime?.time
             saveError = null
         }
     }
@@ -108,9 +118,11 @@ fun GalleryImportHost(
                 scope.launch {
                     val savedFile = withContext(Dispatchers.IO) { copyPickedImageToMomentsDir(context, uri) }
                     if (savedFile != null) {
-                        val takenAt = date.atTime(12, 0).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
-                        // sessionId is deliberately always null here - see this file's top-of-file doc.
-                        ServiceLocator.momentRepository.add(savedFile.absolutePath, null, takenAt)
+                        val zone = ZoneId.systemDefault()
+                        // UX-FIX-PLAN.md Phase 2 item 12 (fix 1 of 2): keep the photo's real EXIF
+                        // time-of-day instead of always hardcoding noon - see resolveTakenAtMillis' doc.
+                        val takenAt = resolveTakenAtMillis(date, exifTime, zone)
+
                         // Optional "we were together" companion entry (owner-requested addition): a
                         // backfilled photo alone was deliberately never enough on its own to create
                         // together-time (a photo isn't proof the whole day was spent together - see
@@ -120,9 +132,32 @@ fun GalleryImportHost(
                         // dialog uses - isManual=true, counts toward stats/streaks like any other
                         // manual entry, excluded from Time Capsule eligibility by the same anti-cheat
                         // rule as every other manual session, syncs to the partner the same way.
-                        if (togetherRange != null) {
-                            ServiceLocator.sessionRepository.addManualSession(togetherRange.first, togetherRange.second)
+                        //
+                        // UX-FIX-PLAN.md Phase 2 item 12 (fix 2 of 2): created BEFORE the sessionContaining
+                        // lookup below (not after, as this used to be ordered) - the just-created session
+                        // must already be visible to that lookup, since a "we were together" range is
+                        // exactly the kind of session a photo taken that same day should match against.
+                        val manualSessionId = togetherRange?.let { range ->
+                            ServiceLocator.sessionRepository.addManualSession(range.first, range.second)
                         }
+
+                        // Auto-detect "taken while together" instead of always defaulting to apart: any
+                        // EXISTING session (BLE-detected or manual, including the one just created above)
+                        // whose window actually contains this photo's real takenAt wins first; if none
+                        // does but the user explicitly ticked "we were together" for this exact photo, that
+                        // explicit answer is trusted as a fallback even if the exact from/to typed times
+                        // don't perfectly bracket the EXIF timestamp (e.g. rounding) - see
+                        // resolveImportedPhotoSessionId's own doc.
+                        val allSessions = ServiceLocator.sessionRepository.getAll()
+                        val lastSeenAt = ServiceLocator.proximityStateStore.current().lastSeenAt
+                        val sessionIdForMoment = resolveImportedPhotoSessionId(
+                            sessions = allSessions,
+                            takenAt = takenAt,
+                            manualSessionId = manualSessionId,
+                            lastSeenAt = lastSeenAt
+                        )
+                        ServiceLocator.momentRepository.add(savedFile.absolutePath, sessionIdForMoment, takenAt)
+
                         // Same reasoning as CameraScreen's onImageSaved and CalendarScreen's
                         // addManualSession - don't make a freshly-backfilled photo (and any companion
                         // together-time entry) wait for the next reconnect/15-minute catch-all if we're
@@ -146,11 +181,51 @@ fun GalleryImportHost(
     }
 }
 
+/** UX-FIX-PLAN.md Phase 2 item 12: builds the real takenAt instant for a backfilled photo from the
+ * user-confirmed date plus the photo's own EXIF time-of-day, falling back to noon only when EXIF had no
+ * time component at all (no EXIF, or a tag that failed to parse) - previously this always hardcoded noon
+ * regardless of what the photo's own metadata said. A plain top-level function (not inlined into the
+ * Composable) so it's unit-testable without any Compose/Android test dependency. */
+internal fun resolveTakenAtMillis(date: LocalDate, exifTime: LocalTime?, zone: ZoneId): Long =
+    date.atTime(exifTime ?: LocalTime.NOON).atZone(zone).toInstant().toEpochMilli()
+
+/** UX-FIX-PLAN.md Phase 2 item 12: resolves which [TogetherSession] (if any) a gallery-imported photo
+ * should be tagged with, so MomentsScreen's `moment.sessionId != null` check (see this file's top-of-file
+ * doc) reports "taken while together" correctly instead of always defaulting to apart. Two ways to win,
+ * either is sufficient:
+ *  1. [takenAt] falls inside ANY existing session's window - [StatsCalculator.sessionContaining] already
+ *     applies the same open-session clamp every other read in this app uses, so this can't be tricked by
+ *     a stale/orphaned open session either.
+ *  2. Falling back to [manualSessionId] - the session (if any) JUST created by this exact import's own
+ *     "we were together" checkbox. This is the direct fix for the contradiction bug the plan calls out:
+ *     the user explicitly said "we were together that day" and a real session now exists for that
+ *     window, so the photo must not still read "Taken apart" even if its EXIF timestamp sits a few
+ *     minutes outside the typed from/to range (rounding, a slightly-off phone clock, etc.) - the user's
+ *     explicit answer for this exact photo is trusted over a strict boundary check.
+ * A plain top-level function (not inlined) so both branches are independently unit-testable. */
+internal fun resolveImportedPhotoSessionId(
+    sessions: List<TogetherSession>,
+    takenAt: Long,
+    manualSessionId: Long?,
+    now: Long = System.currentTimeMillis(),
+    lastSeenAt: Long = 0L
+): Long? {
+    val matching = StatsCalculator.sessionContaining(sessions, takenAt, now, lastSeenAt)
+    return matching?.id ?: manualSessionId
+}
+
+/** UX-FIX-PLAN.md Phase 2 item 12: the photo's own EXIF date, plus its time-of-day when the tag actually
+ * carried one. [time] used to be discarded entirely (readExifDate/parseExifDateTime only ever returned a
+ * bare LocalDate) - see resolveTakenAtMillis for where this now feeds into the real takenAt instead of a
+ * hardcoded noon. */
+private data class ExifDateTime(val date: LocalDate, val time: LocalTime)
+
 /** Reads EXIF DateTimeOriginal (falling back to DateTime) off the picked image via a file descriptor
  * (rather than a raw ContentResolver InputStream) so seeking works reliably for formats that need it.
  * Returns null on any failure (missing tag, unreadable/corrupt EXIF, permission hiccup) - callers treat
- * that identically to "no EXIF date", defaulting the date field to today for the user to edit instead. */
-private fun readExifDate(context: Context, uri: Uri): LocalDate? = try {
+ * that identically to "no EXIF date", defaulting the date field to today for the user to edit instead
+ * (and, per resolveTakenAtMillis, the time to noon). */
+private fun readExifDateTime(context: Context, uri: Uri): ExifDateTime? = try {
     context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
         val exif = ExifInterface(pfd.fileDescriptor)
         val raw = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL) ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
@@ -160,10 +235,15 @@ private fun readExifDate(context: Context, uri: Uri): LocalDate? = try {
     null
 }
 
-private fun parseExifDateTime(raw: String): LocalDate? = try {
-    // EXIF's DateTime tags are "yyyy:MM:dd HH:mm:ss", not ISO - see the TIFF/EXIF spec.
+private fun parseExifDateTime(raw: String): ExifDateTime? = try {
+    // EXIF's DateTime tags are "yyyy:MM:dd HH:mm:ss", not ISO - see the TIFF/EXIF spec. The tag always
+    // carries both a date AND a time component in this format (there's no EXIF variant with a date only),
+    // so a successful parse always yields a real time-of-day, not just a date.
     val parsed = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).parse(raw)
-    parsed?.let { Instant.ofEpochMilli(it.time).atZone(ZoneId.systemDefault()).toLocalDate() }
+    parsed?.let {
+        val localDateTime = LocalDateTime.ofInstant(Instant.ofEpochMilli(it.time), ZoneId.systemDefault())
+        ExifDateTime(localDateTime.toLocalDate(), localDateTime.toLocalTime())
+    }
 } catch (e: Exception) {
     null
 }

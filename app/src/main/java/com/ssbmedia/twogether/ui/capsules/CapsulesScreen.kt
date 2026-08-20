@@ -39,13 +39,18 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.data.datastore.ProximityPersistedState
+import com.ssbmedia.twogether.data.db.TimeCapsule
+import com.ssbmedia.twogether.data.repo.TimeCapsuleRepository
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.EmptyState
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import com.ssbmedia.twogether.util.DateFormats
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import java.time.Instant
+import java.time.ZoneId
 
 class CapsulesViewModel : ViewModel() {
     val capsules = ServiceLocator.timeCapsuleRepository.observeAll()
@@ -135,6 +140,10 @@ fun CapsulesScreen(onBack: () -> Unit) {
             ) {
                 items(capsules, key = { it.id }) { capsule ->
                     val unlocked = capsule.unlockedAt != null
+                    // UX-FIX-PLAN.md Phase 2 item 11 (user's literal ask: "time capsule should not be
+                    // delete-able" - full stop, no exception): deliberately no delete affordance on this
+                    // card, and CapsulesViewModel has no delete() function - there is nothing here to wire
+                    // one up to. Do not add one back.
                     Card(
                         shape = MaterialTheme.shapes.large,
                         colors = CardDefaults.cardColors(
@@ -142,15 +151,18 @@ fun CapsulesScreen(onBack: () -> Unit) {
                         )
                     ) {
                         Column(modifier = Modifier.padding(16.dp)) {
+                            // Auto-adjusted threshold - see TimeCapsuleRepository.unlockEligible's doc.
+                            // Grows/shrinks by exactly however much manual-hours credit has changed since
+                            // this capsule was created, so it always takes the same amount of genuine
+                            // together-time to unlock regardless of backfill activity. Computed once here
+                            // (not duplicated per-branch) via the same shared TimeCapsuleRepository function
+                            // the actual unlock decision itself uses, so this display can never disagree
+                            // with reality, and so item 11's persistent timeline text below can reuse it too.
+                            val effectiveThreshold = TimeCapsuleRepository.effectiveThreshold(capsule, manualCredit)
                             if (unlocked) {
                                 Text("💌 Unlocked", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
                                 Text(capsule.text, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.padding(top = 4.dp))
                             } else {
-                                // Auto-adjusted threshold - see TimeCapsuleRepository.unlockEligible's doc.
-                                // Grows/shrinks by exactly however much manual-hours credit has changed
-                                // since this capsule was created, so it always takes the same amount of
-                                // genuine together-time to unlock regardless of backfill activity.
-                                val effectiveThreshold = capsule.unlockAtHours + (manualCredit - capsule.manualHoursAtCreation)
                                 val remaining = (effectiveThreshold - stats.totalHoursAllTime.toFloat()).coerceAtLeast(0f)
                                 val delta = effectiveThreshold - capsule.unlockAtHours
                                 Text("🔒 Locked", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
@@ -174,6 +186,28 @@ fun CapsulesScreen(onBack: () -> Unit) {
                                         modifier = Modifier.padding(top = 2.dp)
                                     )
                                 }
+                            }
+
+                            // UX-FIX-PLAN.md Phase 2 item 11: a persistent creation/unlock timeline, shown
+                            // in BOTH card states - this is the fix for the reported bug that a capsule's
+                            // creation/unlock info used to blank out the moment it unlocked (the Unlocked
+                            // branch above never rendered anything but the note text). Text itself comes
+                            // from a plain top-level function (not inlined here) so it's unit-testable
+                            // without any Compose test infra - see CapsulesScreenTest.
+                            val timeline = buildCapsuleTimelineText(capsule, effectiveThreshold)
+                            Text(
+                                timeline.sealedLine,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 10.dp)
+                            )
+                            timeline.openedLine?.let {
+                                Text(
+                                    it,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(top = 2.dp)
+                                )
                             }
                         }
                     }
@@ -238,4 +272,25 @@ private fun AddCapsuleDialog(onDismiss: () -> Unit, onAdd: (String, Float) -> Un
 
 private fun Float.trimZeros(): String {
     return if (this == this.toInt().toFloat()) this.toInt().toString() else "%.1f".format(this)
+}
+
+/** UX-FIX-PLAN.md Phase 2 item 11: the two lines of persistent timeline text a capsule card shows -
+ * [sealedLine] always, [openedLine] only once [TimeCapsule.unlockedAt] is set (and, unlike the old
+ * Unlocked-branch UI, this keeps showing forever after - it never blanks back out). Extracted as a plain
+ * function (not inlined into the Composable) purely so it's unit-testable without any Compose test
+ * dependency - see CapsulesScreenTest. */
+internal data class CapsuleTimelineText(val sealedLine: String, val openedLine: String?)
+
+internal fun buildCapsuleTimelineText(
+    capsule: TimeCapsule,
+    effectiveThreshold: Float,
+    zone: ZoneId = ZoneId.systemDefault()
+): CapsuleTimelineText {
+    val createdDate = Instant.ofEpochMilli(capsule.createdAt).atZone(zone).toLocalDate()
+    val sealedLine = "Sealed on ${DateFormats.formatDate(createdDate)} · unlocks after ${effectiveThreshold.trimZeros()}h together"
+    val openedLine = capsule.unlockedAt?.let { unlockedAt ->
+        val unlockedDate = Instant.ofEpochMilli(unlockedAt).atZone(zone).toLocalDate()
+        "Opened on ${DateFormats.formatDate(unlockedDate)}"
+    }
+    return CapsuleTimelineText(sealedLine, openedLine)
 }
