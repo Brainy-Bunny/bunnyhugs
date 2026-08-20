@@ -43,7 +43,20 @@ data class DateIdea(
     val listId: String = DEFAULT_LIST_ID,
     val done: Boolean = false,
     val updatedAt: Long,
-    val deleted: Boolean = false
+    val deleted: Boolean = false,
+    /** Item 24 (UX-FIX-PLAN.md): per-item "remind me X minutes after we're together" reminder, in
+     * addition to (and independent from) [ListCategory.defaultRemindAfterTogetherMinutes]'s per-LIST
+     * default - see ProximityForegroundService.checkListReminders' doc for how the two combine. Null
+     * means "no reminder set on this specific idea"; a per-item value here takes precedence over the
+     * owning list's default when both happen to be set. Deliberately LOCAL-ONLY for now: it does not
+     * currently travel over the GATT wire protocol (GattSyncManager.serializeDateIdeas/
+     * deserializeDateIdeas were not touched - see this feature's own implementation notes) - a reminder
+     * set on one phone stays on that phone until wire-protocol support is added. It DOES round-trip
+     * through BackupManager's JSON backup/restore (see buildManifest/parseDateIdeas), and
+     * DateIdeaRepository.mergeRemote is careful to preserve this device's own local value across an
+     * otherwise-legitimate sync merge of some OTHER field, rather than let the wire's always-null value
+     * silently clobber it. */
+    val remindAfterTogetherMinutes: Int? = null
 )
 
 /**
@@ -61,7 +74,14 @@ data class ListCategory(
     val name: String,
     val createdAt: Long,
     val updatedAt: Long,
-    val deleted: Boolean = false
+    val deleted: Boolean = false,
+    /** Item 24 (UX-FIX-PLAN.md): per-LIST default "remind me X minutes after we're together" reminder -
+     * e.g. "remind me about our bucket list every time we've been together 2+ hours". Fires ONE
+     * notification about the list as a whole (see Notifications.showListReminder), independent of any
+     * per-item [DateIdea.remindAfterTogetherMinutes] reminders also firing for ideas inside it. Null
+     * means "no default reminder for this list". Same local-only-for-now caveat as
+     * DateIdea.remindAfterTogetherMinutes - see its own doc. */
+    val defaultRemindAfterTogetherMinutes: Int? = null
 )
 
 @Entity(tableName = "time_capsules")

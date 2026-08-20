@@ -10,7 +10,7 @@ import java.util.UUID
 
 @Database(
     entities = [TogetherSession::class, DateIdea::class, TimeCapsule::class, Moment::class, MomentNote::class, Milestone::class, ListCategory::class],
-    version = 8,
+    version = 9,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -246,6 +246,20 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /** v8 -> v9, item 24 (UX-FIX-PLAN.md): adds date_ideas.remindAfterTogetherMinutes and
+         * list_categories.defaultRemindAfterTogetherMinutes - both nullable Ints ("no reminder set" for
+         * every pre-existing row, which is correct: nothing had a reminder before this feature existed).
+         * Plain ADD COLUMN with no NOT NULL/DEFAULT, same as MIGRATION_9_10's linkedMomentSyncId pattern
+         * in later app history - correct here specifically because both Kotlin fields are nullable
+         * (`Int? = null`), and Room's schema validation checks the column's nullability against the
+         * entity's own declared nullability, not against any other migration's shape. */
+        val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE date_ideas ADD COLUMN remindAfterTogetherMinutes INTEGER")
+                db.execSQL("ALTER TABLE list_categories ADD COLUMN defaultRemindAfterTogetherMinutes INTEGER")
+            }
+        }
+
         /**
          * Seeds the default "Date Ideas" list (id == DEFAULT_LIST_ID) for a genuinely BRAND-NEW install -
          * i.e. no pre-existing database file at all, so Room creates the schema fresh at the CURRENT
@@ -276,7 +290,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "twogether.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9)
                     .addCallback(SEED_DEFAULT_LIST_CALLBACK)
                     // Safety net only for a FUTURE schema version we didn't write a real migration for -
                     // the 1->2 and 2->3 paths above are always handled for real, so existing users'

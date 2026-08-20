@@ -16,6 +16,7 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -139,6 +140,20 @@ class OurListsViewModel : ViewModel() {
         scheduleAutoSyncIfTogether()
     }
 
+    /** Item 24 (UX-FIX-PLAN.md): sets (or clears, via null) this idea's own "remind me X minutes after
+     * we're together" reminder. Deliberately does NOT call scheduleAutoSyncIfTogether() like the other
+     * mutators above - this field is currently local-only (see DateIdea.remindAfterTogetherMinutes' own
+     * doc), so requesting a sync here wouldn't actually carry the change to the partner's phone. */
+    fun setIdeaReminder(idea: DateIdea, minutes: Int?) {
+        viewModelScope.launch { ServiceLocator.dateIdeaRepository.setReminder(idea, minutes) }
+    }
+
+    /** Item 24 (UX-FIX-PLAN.md): sets (or clears) a list's own default reminder - same local-only
+     * reasoning as setIdeaReminder above. */
+    fun setListDefaultReminder(list: ListCategory, minutes: Int?) {
+        viewModelScope.launch { ServiceLocator.listCategoryRepository.setDefaultReminder(list, minutes) }
+    }
+
     /** Asks the proximity service (which owns the live BLE/GATT connection) to sync right now. */
     fun syncNow() {
         AppEvents.requestManualSync()
@@ -150,7 +165,14 @@ class OurListsViewModel : ViewModel() {
 }
 
 @Composable
-fun OurListsScreen(onBack: () -> Unit) {
+fun OurListsScreen(
+    onBack: () -> Unit,
+    // Item 24 (UX-FIX-PLAN.md): non-null exactly once, right after the user taps a list/list-item
+    // reminder notification - see NavGraph's own doc for the latch-then-consume pattern that feeds this
+    // (mirrors MilestonesScreen's initialMilestoneId param). Auto-expands that list so the reminder's
+    // tap-through actually lands somewhere useful instead of just the flat list-of-lists.
+    initialExpandListId: String? = null
+) {
     val vm: OurListsViewModel = viewModel(factory = SimpleViewModelFactory { OurListsViewModel() })
     val lists by vm.lists.collectAsState()
     val ideas by vm.ideas.collectAsState()
@@ -164,12 +186,20 @@ fun OurListsScreen(onBack: () -> Unit) {
     var pendingDelete by remember { mutableStateOf<DateIdea?>(null) }
     var pendingDeleteList by remember { mutableStateOf<ListCategory?>(null) }
     var showAddListDialog by remember { mutableStateOf(false) }
+    // Item 24 (UX-FIX-PLAN.md): which idea/list a reminder-setting dialog is currently open for - only
+    // one of these two is ever non-null at a time, mirroring pendingDelete/pendingDeleteList's shape.
+    var pendingReminderIdea by remember { mutableStateOf<DateIdea?>(null) }
+    var pendingReminderList by remember { mutableStateOf<ListCategory?>(null) }
     // Per-list UI state, keyed by ListCategory.id - each card's own expansion and its own independent
     // "show completed" toggle, exactly mirroring the single global `showCompleted` the old flat screen
     // had, just one map entry per list instead of one screen-wide bool.
     val expandedListIds = remember { mutableStateOf(setOf<String>()) }
     val showCompletedListIds = remember { mutableStateOf(setOf<String>()) }
     val coroutineScope = rememberCoroutineScope()
+
+    androidx.compose.runtime.LaunchedEffect(initialExpandListId) {
+        initialExpandListId?.let { id -> expandedListIds.value = expandedListIds.value + id }
+    }
 
     androidx.compose.runtime.LaunchedEffect(Unit) {
         lastSyncAt = ServiceLocator.settingsStore.current().lastSyncAt
@@ -282,6 +312,7 @@ fun OurListsScreen(onBack: () -> Unit) {
                                 }
                             },
                             onDeleteClick = { pendingDeleteList = list },
+                            onReminderClick = { pendingReminderList = list },
                             onAddIdea = { text -> vm.add(text, list.id) },
                             activeIdeas = activeIdeas,
                             completedIdeas = completedIdeas,
@@ -294,7 +325,8 @@ fun OurListsScreen(onBack: () -> Unit) {
                                 }
                             },
                             onToggleIdea = { idea -> vm.toggleDone(idea) },
-                            onDeleteIdea = { idea -> pendingDelete = idea }
+                            onDeleteIdea = { idea -> pendingDelete = idea },
+                            onReminderIdeaClick = { idea -> pendingReminderIdea = idea }
                         )
                     }
                 }
@@ -332,6 +364,24 @@ fun OurListsScreen(onBack: () -> Unit) {
             onAdd = { name -> vm.addList(name); showAddListDialog = false }
         )
     }
+
+    pendingReminderIdea?.let { idea ->
+        ReminderMinutesDialog(
+            title = "Remind me about this idea",
+            current = idea.remindAfterTogetherMinutes,
+            onDismiss = { pendingReminderIdea = null },
+            onSave = { minutes -> vm.setIdeaReminder(idea, minutes); pendingReminderIdea = null }
+        )
+    }
+
+    pendingReminderList?.let { list ->
+        ReminderMinutesDialog(
+            title = "Remind me about \"${list.name}\"",
+            current = list.defaultRemindAfterTogetherMinutes,
+            onDismiss = { pendingReminderList = null },
+            onSave = { minutes -> vm.setListDefaultReminder(list, minutes); pendingReminderList = null }
+        )
+    }
 }
 
 /**
@@ -346,13 +396,15 @@ private fun ListCategoryCard(
     expanded: Boolean,
     onToggleExpanded: () -> Unit,
     onDeleteClick: () -> Unit,
+    onReminderClick: () -> Unit,
     onAddIdea: (String) -> Unit,
     activeIdeas: List<DateIdea>,
     completedIdeas: List<DateIdea>,
     showCompleted: Boolean,
     onToggleShowCompleted: () -> Unit,
     onToggleIdea: (DateIdea) -> Unit,
-    onDeleteIdea: (DateIdea) -> Unit
+    onDeleteIdea: (DateIdea) -> Unit,
+    onReminderIdeaClick: (DateIdea) -> Unit
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -381,6 +433,16 @@ private fun ListCategoryCard(
                 // reassigned into a list that itself doesn't resolve, reproducing the exact "invisible
                 // forever" bug that mechanism exists to prevent. No delete affordance for it at all, rather
                 // than a tap that would silently no-op against ListCategoryRepository.delete's own guard.
+                // Item 24 (UX-FIX-PLAN.md): "remind me about this list every time we've been together
+                // X+ minutes" - tinted primary when a default reminder is already set, so the state is
+                // visible at a glance without opening the dialog.
+                IconButton(onClick = onReminderClick) {
+                    Icon(
+                        Icons.Filled.Notifications,
+                        contentDescription = if (list.defaultRemindAfterTogetherMinutes != null) "Reminder set - tap to change" else "Set a reminder for this list",
+                        tint = if (list.defaultRemindAfterTogetherMinutes != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
                 if (list.id != DEFAULT_LIST_ID) {
                     IconButton(onClick = onDeleteClick) {
                         Icon(Icons.Filled.Delete, contentDescription = "Delete list")
@@ -424,6 +486,7 @@ private fun ListCategoryCard(
                                 idea = idea,
                                 onToggle = { onToggleIdea(idea) },
                                 onDelete = { onDeleteIdea(idea) },
+                                onReminderClick = { onReminderIdeaClick(idea) },
                                 modifier = Modifier.padding(vertical = 4.dp)
                             )
                         }
@@ -458,6 +521,7 @@ private fun ListCategoryCard(
                                     idea = idea,
                                     onToggle = { onToggleIdea(idea) },
                                     onDelete = { onDeleteIdea(idea) },
+                                    onReminderClick = { onReminderIdeaClick(idea) },
                                     modifier = Modifier.padding(vertical = 4.dp)
                                 )
                             }
@@ -470,7 +534,13 @@ private fun ListCategoryCard(
 }
 
 @Composable
-private fun DateIdeaRow(idea: DateIdea, onToggle: () -> Unit, onDelete: () -> Unit, modifier: Modifier = Modifier) {
+private fun DateIdeaRow(
+    idea: DateIdea,
+    onToggle: () -> Unit,
+    onDelete: () -> Unit,
+    onReminderClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
     Card(
         modifier = modifier,
         shape = MaterialTheme.shapes.large,
@@ -491,11 +561,67 @@ private fun DateIdeaRow(idea: DateIdea, onToggle: () -> Unit, onDelete: () -> Un
                     style = MaterialTheme.typography.bodyLarge
                 )
             }
+            // Item 24 (UX-FIX-PLAN.md): "remind me about this specific idea X minutes after we're
+            // together" - tinted primary when set, same visual convention as the list-level reminder
+            // icon in ListCategoryCard's header.
+            IconButton(onClick = onReminderClick) {
+                Icon(
+                    Icons.Filled.Notifications,
+                    contentDescription = if (idea.remindAfterTogetherMinutes != null) "Reminder set - tap to change" else "Set a reminder for this idea",
+                    tint = if (idea.remindAfterTogetherMinutes != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
             IconButton(onClick = onDelete) {
                 Icon(Icons.Filled.Delete, contentDescription = "Delete")
             }
         }
     }
+}
+
+/** Item 24 (UX-FIX-PLAN.md): shared "set/clear a reminder" dialog for both a single idea
+ * (OurListsScreen's pendingReminderIdea) and a whole list's default (pendingReminderList) - same simple
+ * numeric-input style as CapsulesScreen's AddCapsuleDialog "hours" field. Blank input clears the
+ * reminder (saves null); [current] pre-fills the field with whatever's already set, if anything. */
+@Composable
+private fun ReminderMinutesDialog(title: String, current: Int?, onDismiss: () -> Unit, onSave: (Int?) -> Unit) {
+    var text by remember { mutableStateOf(current?.toString() ?: "") }
+    val parsed = text.toIntOrNull()
+    val maxMinutes = com.ssbmedia.twogether.data.repo.DateIdeaRepository.MAX_REMIND_AFTER_TOGETHER_MINUTES
+    val error: String? = when {
+        text.isBlank() -> null // blank = clear the reminder, always valid
+        parsed == null -> "Enter a valid number of minutes"
+        parsed <= 0 -> "Must be greater than zero"
+        parsed > maxMinutes -> "Keep it under $maxMinutes minutes"
+        else -> null
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column {
+                Text(
+                    "Remind me this many minutes after we're together (leave blank to turn off).",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it.filter { c -> c.isDigit() }.take(5) },
+                    placeholder = { Text("e.g. 120") },
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                )
+                error?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(enabled = error == null, onClick = { onSave(text.toIntOrNull()) }) { Text("Save") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }
 
 @Composable
