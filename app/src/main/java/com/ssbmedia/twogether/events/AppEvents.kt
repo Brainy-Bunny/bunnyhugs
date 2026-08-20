@@ -125,4 +125,18 @@ object AppEvents {
     fun setMomentsTransferring(syncIds: Set<String>) {
         _momentsTransferring.value = syncIds
     }
+
+    /** MainActivity (dispatchKeyEvent) -> CameraScreen: a volume button was pressed while the Camera
+     * screen is the active destination (see [com.ssbmedia.twogether.util.VolumeShutterKeyHandler] for
+     * the pure key-event decision logic that decides when this fires). MainActivity is a plain Activity
+     * method, not a composable, so it has no direct reference to CameraScreen's own capture function -
+     * this event bus is the existing established pattern in this file for exactly that kind of
+     * Activity/service -> UI nudge (see [reunionEvents], [unpaired], etc above), reused here rather than
+     * inventing a second mechanism. */
+    private val _cameraShutterRequests = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val cameraShutterRequests = _cameraShutterRequests.asSharedFlow()
+
+    fun requestCameraShutter() {
+        _cameraShutterRequests.tryEmit(Unit)
+    }
 }
