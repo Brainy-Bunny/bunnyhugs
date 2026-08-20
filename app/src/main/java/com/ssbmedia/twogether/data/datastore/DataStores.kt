@@ -9,6 +9,8 @@ import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -469,7 +471,13 @@ data class AppSettings(
      * since. Reset to 0 whenever a NEW restore starts (restoreBackupDurable); once it exceeds
      * BackupManager's retry cap, the attempt is treated as permanent and the pending state is given up
      * on, same as a validation failure. */
-    val pendingRestoreAttempts: Int = 0
+    val pendingRestoreAttempts: Int = 0,
+    /** Item 24 (UX-FIX-PLAN.md): how many minutes of continuous together-time trigger the "snap a
+     * photo?" nudge - was previously hardcoded (ProximityForegroundService.FIFTEEN_MINUTES_MILLIS,
+     * Notifications.showPhotoReminder's title text). Settings' "Photo reminder interval" row lets the
+     * user change this; the notification's own title text is now built from this value too, rather than
+     * a hardcoded "15". */
+    val photoReminderMinutes: Int = 15
 )
 
 class SettingsStore(private val context: Context) {
@@ -492,10 +500,20 @@ class SettingsStore(private val context: Context) {
         val PENDING_UPDATE_VERSION_CODE = intPreferencesKey("pending_update_version_code")
         val PENDING_UPDATE_VERSION_NAME = stringPreferencesKey("pending_update_version_name")
         val PENDING_UPDATE_APK_PATH = stringPreferencesKey("pending_update_apk_path")
+        val PHOTO_REMINDER_MINUTES = intPreferencesKey("photo_reminder_minutes")
     }
 
-    val settings: Flow<AppSettings> = context.settingsDs.data.map { p ->
-        AppSettings(
+    val settings: Flow<AppSettings> = context.settingsDs.data.map { p -> fromPreferences(p) }
+
+    companion object {
+        /** Pure mapping from a raw DataStore [Preferences] snapshot to [AppSettings] - extracted out of
+         * the [settings] Flow's map{} lambda so it's unit-testable directly against a plain in-memory
+         * Preferences instance (androidx.datastore.preferences.core.Preferences/MutablePreferences are
+         * ordinary JVM classes with no Android Context dependency, unlike the DataStore file itself),
+         * without needing Robolectric or an instrumented test. Item 24 (UX-FIX-PLAN.md) added
+         * photoReminderMinutes; see PhotoReminderSettingsAuditTest for the round-trip coverage this
+         * enables. */
+        internal fun fromPreferences(p: Preferences): AppSettings = AppSettings(
             defaultSnoozeMinutes = p[Keys.SNOOZE_MIN] ?: 15,
             notificationsEnabled = p[Keys.NOTIFS] ?: true,
             pinHash = p[Keys.PIN_HASH],
@@ -515,7 +533,8 @@ class SettingsStore(private val context: Context) {
             pendingRestoreAttempts = p[Keys.PENDING_RESTORE_ATTEMPTS] ?: 0,
             pendingUpdateVersionCode = p[Keys.PENDING_UPDATE_VERSION_CODE] ?: 0,
             pendingUpdateVersionName = p[Keys.PENDING_UPDATE_VERSION_NAME],
-            pendingUpdateApkPath = p[Keys.PENDING_UPDATE_APK_PATH]
+            pendingUpdateApkPath = p[Keys.PENDING_UPDATE_APK_PATH],
+            photoReminderMinutes = p[Keys.PHOTO_REMINDER_MINUTES] ?: 15
         )
     }
 
@@ -573,6 +592,14 @@ class SettingsStore(private val context: Context) {
 
     suspend fun setDefaultSnoozeMinutes(min: Int) {
         context.settingsDs.edit { it[Keys.SNOOZE_MIN] = min }
+    }
+
+    /** Item 24 (UX-FIX-PLAN.md): persists the user's chosen photo-reminder interval - see
+     * AppSettings.photoReminderMinutes' own doc. Same "trust the caller's own bound-checked input"
+     * pattern as setDefaultSnoozeMinutes above (the Settings dialog itself does the coerceIn), rather
+     * than duplicating validation here too. */
+    suspend fun setPhotoReminderMinutes(minutes: Int) {
+        context.settingsDs.edit { it[Keys.PHOTO_REMINDER_MINUTES] = minutes }
     }
 
     suspend fun setNotificationsEnabled(enabled: Boolean) {
@@ -725,7 +752,15 @@ data class ProximityPersistedState(
      * other). Deliberately a SEPARATE field from [lastApartSince] (which anchors the reunion-gap check
      * and must keep reflecting the CLAMPED estimated-real-apart instant, not this raw transition
      * timestamp) - see ProximityForegroundService.handleBecameApart's doc for why both exist. */
-    val pendingApartSince: Long = 0L
+    val pendingApartSince: Long = 0L,
+    /** Item 24 (UX-FIX-PLAN.md): "fired once per together-session" tracking for the list/list-item
+     * reminder feature - mirrors [reminderFiredForSession]'s pattern for the photo reminder, just keyed
+     * (rather than a single bool) since many distinct ideas/lists can each have their own reminder.
+     * Entries look like "idea:<DateIdea.id>" or "list:<ListCategory.id>" - see
+     * ProximityForegroundService.checkListReminders' doc. Reset to empty at exactly the same two points
+     * reminderFiredForSession resets to false (a fresh together-transition, and an apart transition), so
+     * a new continuous-together session always gets a clean slate of reminders to re-fire. */
+    val remindersFiredForSession: Set<String> = emptySet()
 )
 
 class ProximityStateStore(private val context: Context) {
@@ -740,6 +775,7 @@ class ProximityStateStore(private val context: Context) {
         val PENDING_CELEBRATION = booleanPreferencesKey("pending_reunion_celebration")
         val LAST_SEEN_ELAPSED_REALTIME = longPreferencesKey("last_seen_elapsed_realtime")
         val PENDING_APART_SINCE = longPreferencesKey("pending_apart_since")
+        val LIST_REMINDERS_FIRED = stringSetPreferencesKey("list_reminders_fired_for_session")
     }
 
     val state: Flow<ProximityPersistedState> = context.proximityDs.data.map { p ->
@@ -753,7 +789,8 @@ class ProximityStateStore(private val context: Context) {
             currentSessionId = p[Keys.SESSION_ID] ?: -1L,
             pendingReunionCelebration = p[Keys.PENDING_CELEBRATION] ?: false,
             lastSeenElapsedRealtime = p[Keys.LAST_SEEN_ELAPSED_REALTIME] ?: 0L,
-            pendingApartSince = p[Keys.PENDING_APART_SINCE] ?: 0L
+            pendingApartSince = p[Keys.PENDING_APART_SINCE] ?: 0L,
+            remindersFiredForSession = p[Keys.LIST_REMINDERS_FIRED] ?: emptySet()
         )
     }
 
@@ -782,7 +819,8 @@ class ProximityStateStore(private val context: Context) {
                 currentSessionId = p[Keys.SESSION_ID] ?: -1L,
                 pendingReunionCelebration = p[Keys.PENDING_CELEBRATION] ?: false,
                 lastSeenElapsedRealtime = p[Keys.LAST_SEEN_ELAPSED_REALTIME] ?: 0L,
-                pendingApartSince = p[Keys.PENDING_APART_SINCE] ?: 0L
+                pendingApartSince = p[Keys.PENDING_APART_SINCE] ?: 0L,
+                remindersFiredForSession = p[Keys.LIST_REMINDERS_FIRED] ?: emptySet()
             )
             val updated = transform(currentState)
             p[Keys.IS_TOGETHER] = updated.isTogether
@@ -795,6 +833,7 @@ class ProximityStateStore(private val context: Context) {
             p[Keys.PENDING_CELEBRATION] = updated.pendingReunionCelebration
             p[Keys.LAST_SEEN_ELAPSED_REALTIME] = updated.lastSeenElapsedRealtime
             p[Keys.PENDING_APART_SINCE] = updated.pendingApartSince
+            p[Keys.LIST_REMINDERS_FIRED] = updated.remindersFiredForSession
         }
     }
 }

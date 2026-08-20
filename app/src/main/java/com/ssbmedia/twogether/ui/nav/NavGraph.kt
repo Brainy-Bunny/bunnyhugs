@@ -52,6 +52,10 @@ fun TwogetherNavHost(
     cameraTrigger: Int,
     onUnpaired: () -> Unit,
     openMilestoneId: String? = null,
+    // Item 24 (UX-FIX-PLAN.md): tap-through target for a list/list-item reminder notification - see
+    // Notifications.EXTRA_OPEN_LIST_ID's own doc. Mirrors openMilestoneId exactly, including the
+    // latch-then-navigate-then-consume shape below.
+    openListId: String? = null,
     onCameraTriggerConsumed: () -> Unit = {},
     onMilestoneIdConsumed: () -> Unit = {},
     // Item 16 (camera overhaul), point 5: MainActivity's dispatchKeyEvent is a plain Activity method, not
@@ -59,7 +63,8 @@ fun TwogetherNavHost(
     // it whether volume-key presses should be routed to the camera shutter (see AppEvents.
     // cameraShutterRequests) right now, versus behaving as completely normal volume keys everywhere else
     // in the app. This callback is how that flag gets kept in sync with the actual current destination.
-    onCameraScreenActiveChanged: (Boolean) -> Unit = {}
+    onCameraScreenActiveChanged: (Boolean) -> Unit = {},
+    onListIdConsumed: () -> Unit = {}
 ) {
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
@@ -126,6 +131,20 @@ fun TwogetherNavHost(
             latchedMilestoneId = openMilestoneId
             navController.navigate(Screen.Milestones.route) { launchSingleTop = true }
             onMilestoneIdConsumed()
+        }
+    }
+
+    // Item 24 (UX-FIX-PLAN.md): tapping a list/list-item reminder notification opens "Our Lists" with
+    // that list auto-expanded (see OurListsScreen's initialExpandListId param) - exact same
+    // latch-then-navigate-then-consume shape as the milestone trigger just above, for the exact same
+    // reason (navigate() only schedules the destination to compose later, so the source must stay
+    // readable until OurListsScreen actually composes and reads it).
+    var latchedListId by rememberSaveable { mutableStateOf<String?>(null) }
+    LaunchedEffect(openListId) {
+        if (openListId != null) {
+            latchedListId = openListId
+            navController.navigate(Screen.DateIdeas.route) { launchSingleTop = true }
+            onListIdConsumed()
         }
     }
 
@@ -215,7 +234,9 @@ fun TwogetherNavHost(
                     onOpenMoments = { day -> navController.navigate(Screen.Moments.withArgs(jumpToEpochDay = day)) }
                 )
             }
-            composable(Screen.DateIdeas.route) { OurListsScreen(onBack = { navController.popBackStack() }) }
+            composable(Screen.DateIdeas.route) {
+                OurListsScreen(onBack = { navController.popBackStack() }, initialExpandListId = latchedListId)
+            }
             composable(
                 route = Screen.Moments.routePattern,
                 arguments = listOf(navArgument("jumpToEpochDay") { type = NavType.LongType; defaultValue = -1L })

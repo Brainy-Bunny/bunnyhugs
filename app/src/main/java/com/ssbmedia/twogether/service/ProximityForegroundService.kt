@@ -39,8 +39,9 @@ import kotlinx.coroutines.launch
 
 /**
  * Long-running foreground service: advertises + scans BLE to detect the paired partner nearby,
- * debounces that into a together/apart state with hysteresis, logs sessions, fires the 15-minute
- * photo nudge, drives reunion celebrations, and opportunistically syncs the date-ideas list.
+ * debounces that into a together/apart state with hysteresis, logs sessions, fires the
+ * (user-configurable, see AppSettings.photoReminderMinutes) photo nudge and any list/list-item
+ * reminders, drives reunion celebrations, and opportunistically syncs the date-ideas list.
  */
 class ProximityForegroundService : LifecycleService() {
 
@@ -372,6 +373,9 @@ class ProximityForegroundService : LifecycleService() {
 
         if (stateMachine.isTogether) {
             checkPhotoReminder(now)
+            // Item 24 (UX-FIX-PLAN.md): same "only while genuinely together" gate as the photo reminder
+            // just above - see checkListReminders' own doc.
+            checkListReminders(now)
         }
 
         if (secondsElapsed % 60 == 0L) {
@@ -591,7 +595,11 @@ class ProximityForegroundService : LifecycleService() {
                 reminderFiredForSession = false,
                 snoozeUntil = 0L,
                 pendingApartSince = 0L,
-                pendingReunionCelebration = it.pendingReunionCelebration || isReunion
+                pendingReunionCelebration = it.pendingReunionCelebration || isReunion,
+                // Item 24 (UX-FIX-PLAN.md): a fresh continuous-together session gets a clean slate of
+                // list/list-item reminders to re-fire, same reasoning as reminderFiredForSession's reset
+                // just above.
+                remindersFiredForSession = emptySet()
             )
         }
 
@@ -646,7 +654,10 @@ class ProximityForegroundService : LifecycleService() {
                 reminderFiredForSession = false,
                 snoozeUntil = 0L,
                 lastApartSince = apartSince,
-                pendingApartSince = if (openSession != null) now else 0L
+                pendingApartSince = if (openSession != null) now else 0L,
+                // Item 24 (UX-FIX-PLAN.md): same reset as reminderFiredForSession above - the
+                // together-session that just ended is over, so its fired-reminders record is done too.
+                remindersFiredForSession = emptySet()
             )
         }
         Notifications.cancelPhotoReminder(this)
@@ -696,20 +707,78 @@ class ProximityForegroundService : LifecycleService() {
         val persisted = ServiceLocator.proximityStateStore.current()
         if (!persisted.isTogether || persisted.continuousTogetherSince <= 0L) return
 
+        // Item 24 (UX-FIX-PLAN.md): was a hardcoded FIFTEEN_MINUTES_MILLIS constant - now reads the
+        // user-configured AppSettings.photoReminderMinutes (Settings' own "Photo reminder interval" row).
+        // coerceAtLeast(1) is defensive against a stray 0/negative value (shouldn't normally happen, the
+        // Settings dialog itself validates) ever making this fire immediately/every tick.
+        val reminderThresholdMillis = settings.photoReminderMinutes.coerceAtLeast(1) * 60_000L
         if (!persisted.reminderFiredForSession) {
-            if (now - persisted.continuousTogetherSince >= FIFTEEN_MINUTES_MILLIS) {
+            if (now - persisted.continuousTogetherSince >= reminderThresholdMillis) {
                 // Only consume the one-per-session reminder if it actually posted (e.g. not silently
                 // skipped for lack of POST_NOTIFICATIONS) - otherwise a denied permission would burn
                 // this session's only reminder for nothing, and the ticker naturally retries every 5s
                 // until permission is granted or the session ends.
-                if (Notifications.showPhotoReminder(this)) {
+                if (Notifications.showPhotoReminder(this, settings.photoReminderMinutes)) {
                     ServiceLocator.proximityStateStore.update { it.copy(reminderFiredForSession = true) }
                 }
             }
         } else if (persisted.snoozeUntil > 0L && now >= persisted.snoozeUntil) {
-            if (Notifications.showPhotoReminder(this)) {
+            if (Notifications.showPhotoReminder(this, settings.photoReminderMinutes)) {
                 ServiceLocator.proximityStateStore.update { it.copy(snoozeUntil = 0L) }
             }
+        }
+    }
+
+    /**
+     * Item 24 (UX-FIX-PLAN.md): evaluates every active DateIdea's own
+     * [com.ssbmedia.twogether.data.db.DateIdea.remindAfterTogetherMinutes] and every active
+     * ListCategory's own [com.ssbmedia.twogether.data.db.ListCategory.defaultRemindAfterTogetherMinutes]
+     * against how long the couple has been CONTINUOUSLY together this session (persisted.
+     * continuousTogetherSince - the exact same clock checkPhotoReminder above uses), firing at most one
+     * notification per idea/list per together-session (persisted.remindersFiredForSession - see its own
+     * doc for the "idea:<id>"/"list:<id>" key shape), mirroring checkPhotoReminder's own
+     * fired-once-per-session pattern. A per-item reminder and its owning list's default reminder are
+     * fully independent of each other - both can fire (or neither, or just one) in the same session.
+     */
+    private suspend fun checkListReminders(now: Long) {
+        val settings = ServiceLocator.settingsStore.current()
+        if (!settings.notificationsEnabled) return
+        val persisted = ServiceLocator.proximityStateStore.current()
+        if (!persisted.isTogether || persisted.continuousTogetherSince <= 0L) return
+        val elapsedMillis = now - persisted.continuousTogetherSince
+        if (elapsedMillis < 0L) return
+
+        val alreadyFired = persisted.remindersFiredForSession
+        val newlyFired = mutableSetOf<String>()
+
+        val lists = ServiceLocator.listCategoryRepository.getAll().filter { !it.deleted }
+        val listsById = lists.associateBy { it.id }
+
+        val ideas = ServiceLocator.dateIdeaRepository.getAll()
+        for (idea in ideas) {
+            if (idea.deleted) continue
+            val minutes = idea.remindAfterTogetherMinutes ?: continue
+            val key = "idea:${idea.id}"
+            if (key in alreadyFired) continue
+            if (!listReminderThresholdCrossed(minutes, elapsedMillis)) continue
+            val list = listsById[idea.listId]
+            if (Notifications.showListItemReminder(this, idea.id, idea.listId, list?.name ?: "Our Lists", idea.text)) {
+                newlyFired += key
+            }
+        }
+
+        for (list in lists) {
+            val minutes = list.defaultRemindAfterTogetherMinutes ?: continue
+            val key = "list:${list.id}"
+            if (key in alreadyFired) continue
+            if (!listReminderThresholdCrossed(minutes, elapsedMillis)) continue
+            if (Notifications.showListReminder(this, list.id, list.name)) {
+                newlyFired += key
+            }
+        }
+
+        if (newlyFired.isNotEmpty()) {
+            ServiceLocator.proximityStateStore.update { it.copy(remindersFiredForSession = it.remindersFiredForSession + newlyFired) }
         }
     }
 
@@ -949,5 +1018,17 @@ class ProximityForegroundService : LifecycleService() {
          * at [pendingApartSince] has now elapsed and a still-open session should actually be closed. */
         private fun graceWindowExpired(pendingApartSince: Long, now: Long): Boolean =
             pendingApartSince > 0L && now - pendingApartSince >= SESSION_GRACE_MILLIS
+
+        /** Item 24 (UX-FIX-PLAN.md): pure decision helper for the list/list-item reminder feature -
+         * unit-tested directly (via reflection, mirroring GraceWindowAuditTest's pattern for testing a
+         * private companion function without standing up the full Android Service). True iff
+         * [elapsedTogetherMillis] (time since the current continuous together-session began - see
+         * checkListReminders) has crossed [thresholdMinutes] (the user-set "remind me X minutes after
+         * we're together" value on a DateIdea or ListCategory). A non-positive threshold never fires -
+         * defensive: the Settings/Our Lists UI dialogs already validate their own input to be positive,
+         * but this is a second, structural gate against a corrupted/hand-crafted-backup value (e.g. 0,
+         * which would otherwise fire on literally the first tick of every together-session). */
+        private fun listReminderThresholdCrossed(thresholdMinutes: Int, elapsedTogetherMillis: Long): Boolean =
+            thresholdMinutes > 0 && elapsedTogetherMillis >= thresholdMinutes * 60_000L
     }
 }

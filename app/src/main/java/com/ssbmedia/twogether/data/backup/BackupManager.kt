@@ -22,6 +22,7 @@ import com.ssbmedia.twogether.data.db.Moment
 import com.ssbmedia.twogether.data.db.MomentNote
 import com.ssbmedia.twogether.data.db.TimeCapsule
 import com.ssbmedia.twogether.data.db.TogetherSession
+import com.ssbmedia.twogether.data.repo.DateIdeaRepository
 import com.ssbmedia.twogether.data.repo.MomentRepository
 import com.ssbmedia.twogether.data.repo.TimeCapsuleRepository
 import com.ssbmedia.twogether.notif.MilestoneAlarmScheduler
@@ -366,6 +367,11 @@ object BackupManager {
                     put("done", d.done)
                     put("updatedAt", d.updatedAt)
                     put("deleted", d.deleted)
+                    // Item 24 (UX-FIX-PLAN.md): local-only field (see DateIdea.remindAfterTogetherMinutes'
+                    // own doc for why it doesn't travel over the GATT wire protocol) - included in the
+                    // backup/restore round-trip so it doesn't silently vanish across a restore, even
+                    // though it currently CAN vanish across a live partner sync.
+                    put("remindAfterTogetherMinutes", d.remindAfterTogetherMinutes ?: JSONObject.NULL)
                 })
             }
         })
@@ -459,6 +465,9 @@ object BackupManager {
                     put("createdAt", c.createdAt)
                     put("updatedAt", c.updatedAt)
                     put("deleted", c.deleted)
+                    // Item 24 (UX-FIX-PLAN.md): same local-only-for-now field as dateIdeas' matching
+                    // addition just above - see ListCategory.defaultRemindAfterTogetherMinutes' own doc.
+                    put("defaultRemindAfterTogetherMinutes", c.defaultRemindAfterTogetherMinutes ?: JSONObject.NULL)
                 })
             }
         })
@@ -1027,6 +1036,20 @@ object BackupManager {
             Log.w(TAG, "Rejecting implausible date idea from backup: $id updatedAt=$updatedAt")
             return@mapNotNull null
         }
+        // Item 24 (UX-FIX-PLAN.md): a pre-item-24 backup has no remindAfterTogetherMinutes key at all -
+        // optIntOrNull's has()-check defaults that to null the same defensive-fallback way listId does
+        // just below. isPlausibleReminderMinutes rejects an out-of-range value (typo, or a hand-crafted/
+        // corrupted backup) back to null rather than trusting it verbatim - same "reject, don't clamp"
+        // shape TimeCapsuleRepository's own bounds already use.
+        //
+        // NOTE(merge): the source branch originally routed this row's updatedAt through a
+        // `clampBackupUpdatedAt` helper that no longer exists on this branch - HEAD's history already
+        // replaced that whole "clamp and accept" design with the reject-outright
+        // isPlausibleBackupUpdatedAt gate above (see its own doc for why clamping was the bug). Kept the
+        // gate, not the clamp, and validated updatedAt the same way every sibling parser in this file
+        // already does.
+        val remindMinutes = o.optIntOrNull("remindAfterTogetherMinutes")
+            .takeIf { DateIdeaRepository.isPlausibleReminderMinutes(it) }
         DateIdea(
             id = id,
             text = o.getString("text"),
@@ -1036,7 +1059,8 @@ object BackupManager {
             listId = o.optStringOrNull("listId") ?: DEFAULT_LIST_ID,
             done = o.optBoolean("done", false),
             updatedAt = updatedAt,
-            deleted = o.optBoolean("deleted", false)
+            deleted = o.optBoolean("deleted", false),
+            remindAfterTogetherMinutes = remindMinutes
         )
     }
 
@@ -1342,18 +1366,32 @@ object BackupManager {
                 Log.w(TAG, "Rejecting implausible list category from backup: $id updatedAt=$updatedAt")
                 return@mapNotNull null
             }
+            // Item 24 (UX-FIX-PLAN.md): same has()-check-defaults-to-null / reject-out-of-range shape as
+            // parseDateIdeas' matching field above - see its NOTE(merge) for why this uses the
+            // isPlausibleBackupUpdatedAt reject-gate rather than the source branch's now-removed
+            // clampBackupUpdatedAt helper.
+            val defaultRemindMinutes = o.optIntOrNull("defaultRemindAfterTogetherMinutes")
+                .takeIf { DateIdeaRepository.isPlausibleReminderMinutes(it) }
             ListCategory(
                 id = id,
                 name = o.getString("name"),
                 createdAt = o.getLong("createdAt"),
                 updatedAt = updatedAt,
-                deleted = o.optBoolean("deleted", false)
+                deleted = o.optBoolean("deleted", false),
+                defaultRemindAfterTogetherMinutes = defaultRemindMinutes
             )
         }
     }
 
     private fun JSONObject.optStringOrNull(key: String): String? =
         if (has(key) && !isNull(key)) getString(key) else null
+
+    /** Item 24 (UX-FIX-PLAN.md): same has()/isNull() pattern as [optStringOrNull] above, for a nullable
+     * Int field - org.json's own optInt() has no way to distinguish "key absent/null" from "key present
+     * with value 0", which matters here since 0 would otherwise be indistinguishable from a genuinely
+     * corrupt/rejected reminder value. */
+    private fun JSONObject.optIntOrNull(key: String): Int? =
+        if (has(key) && !isNull(key)) getInt(key) else null
 
     /**
      * Restarts the app process from scratch after a successful restore. A restore rewrites the pairing

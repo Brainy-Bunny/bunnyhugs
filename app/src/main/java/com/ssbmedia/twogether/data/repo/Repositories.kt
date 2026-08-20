@@ -177,6 +177,20 @@ class SessionRepository(private val dao: TogetherSessionDao) {
 }
 
 class DateIdeaRepository(private val dao: DateIdeaDao) {
+    companion object {
+        /** Item 24 (UX-FIX-PLAN.md): guardrail against a typo or a corrupted/hand-edited backup value
+         * producing a reminder that fires immediately (0 or negative) or effectively never (an absurdly
+         * large number of minutes) - mirrors TimeCapsuleRepository's MAX_UNLOCK_AT_HOURS/
+         * isPlausibleUnlockAtHours pattern. Shared by the Settings/Our Lists UI dialogs AND
+         * BackupManager's untrusted-ingestion parser so both enforce the exact same bound and can't drift
+         * apart. 1440 minutes = 24 hours - generously above any reasonable "remind me X minutes after
+         * we're together" use case, while still bounded. */
+        const val MAX_REMIND_AFTER_TOGETHER_MINUTES = 1440
+
+        fun isPlausibleReminderMinutes(minutes: Int?): Boolean =
+            minutes == null || minutes in 1..MAX_REMIND_AFTER_TOGETHER_MINUTES
+    }
+
     fun observeActive(): Flow<List<DateIdea>> = dao.observeActive()
     suspend fun getAll(): List<DateIdea> = dao.getAll()
 
@@ -212,6 +226,13 @@ class DateIdeaRepository(private val dao: DateIdeaDao) {
         dao.upsert(idea.copy(deleted = true, updatedAt = System.currentTimeMillis()))
     }
 
+    /** Item 24 (UX-FIX-PLAN.md): sets (or clears, via null) this idea's own "remind me X minutes after
+     * we're together" reminder - see DateIdea.remindAfterTogetherMinutes' own doc for why this is
+     * currently local-only (not yet wired through GattSyncManager's wire protocol). */
+    suspend fun setReminder(idea: DateIdea, minutes: Int?) {
+        dao.upsert(idea.copy(remindAfterTogetherMinutes = minutes, updatedAt = System.currentTimeMillis()))
+    }
+
     /** Last-write-wins merge of a remote list of ideas into local storage, by id + updatedAt.
      *
      * MAJOR fix (independent review), applied identically to all four LWW merges in this file: an
@@ -221,12 +242,25 @@ class DateIdeaRepository(private val dao: DateIdeaDao) {
      * re-write every row of every LWW table forever; that fix removes the cause, and this one removes the
      * whole failure MODE - no residual clock difference, from any source, can produce a write when
      * nothing a user would recognise as data has actually changed. Deliberately compares only the
-     * meaningful columns (never `updatedAt` itself, which is exactly the field that drifts). */
+     * meaningful columns (never `updatedAt` itself, which is exactly the field that drifts, and never
+     * remindAfterTogetherMinutes - see the merge note right below for why that field is excluded from
+     * both the wire protocol and this comparison).
+     *
+     * Item 24 (UX-FIX-PLAN.md): [DateIdea.remindAfterTogetherMinutes] is deliberately NOT part of the
+     * wire protocol yet (GattSyncManager.deserializeDateIdeas never sets it, so every incoming remote
+     * row's value is always the Kotlin default of null) - upserting an already-known row's remote copy
+     * verbatim would silently wipe out this device's own locally-set reminder the next time the
+     * partner's copy of this SAME idea legitimately wins the LWW comparison on some other field (text/
+     * listId/done/deleted). Carrying the local value forward on every already-known row closes that,
+     * without needing the reminder field itself to be part of the sync payload at all. A genuinely new
+     * remote row (not known locally yet) has no local value to preserve, so it inserts with null - the
+     * same "no reminder set" state a locally-created idea starts with anyway. */
     suspend fun mergeRemote(remote: List<DateIdea>) {
         val local = dao.getAll().associateBy { it.id }
-        val toUpsert = remote.filter { r ->
-            val l = local[r.id] ?: return@filter true
-            r.updatedAt > l.updatedAt && !r.sameContentAs(l)
+        val toUpsert = remote.mapNotNull { r ->
+            val l = local[r.id] ?: return@mapNotNull r
+            if (r.updatedAt <= l.updatedAt || r.sameContentAs(l)) return@mapNotNull null
+            r.copy(remindAfterTogetherMinutes = l.remindAfterTogetherMinutes)
         }
         if (toUpsert.isNotEmpty()) dao.upsertAll(toUpsert)
     }
@@ -887,13 +921,26 @@ class ListCategoryRepository(
         }
     }
 
+    /** Item 24 (UX-FIX-PLAN.md): sets (or clears, via null) this list's own default "remind me X minutes
+     * after we're together" reminder - see ListCategory.defaultRemindAfterTogetherMinutes' own doc for
+     * why this is currently local-only (not yet wired through GattSyncManager's wire protocol). */
+    suspend fun setDefaultReminder(category: ListCategory, minutes: Int?) {
+        dao.upsert(category.copy(defaultRemindAfterTogetherMinutes = minutes, updatedAt = System.currentTimeMillis()))
+    }
+
     /** Union+tombstone merge by id + updatedAt, same LWW shape as MilestoneRepository.mergeRemote - these
      * are simple, rarely-edited rows, so plain last-write-wins is appropriate.
      *
      * BLOCKER fix: a delete-tombstone for DEFAULT_LIST_ID is never applied, regardless of updatedAt - a
      * partner device (an older/buggy build, or any other way its own copy got soft-deleted) must never be
      * able to remove the one list this device's own reassignOrphans() permanently depends on existing. Any
-     * NON-delete update to it (e.g. a rename) still applies normally. */
+     * NON-delete update to it (e.g. a rename) still applies normally.
+     *
+     * Item 24 (UX-FIX-PLAN.md): [ListCategory.defaultRemindAfterTogetherMinutes] is, like DateIdea's
+     * equivalent field, deliberately NOT part of the wire protocol yet - see
+     * DateIdeaRepository.mergeRemote's matching doc for the full reasoning. Same fix here: an
+     * already-known row's local value is carried forward into the upserted copy instead of being
+     * silently overwritten by the wire's always-null value. */
     suspend fun mergeRemote(remote: List<ListCategory>) {
         val local = dao.getAll().associateBy { it.id }
         // Converge createdAt downward for lists we already know - see ListCategoryDao.lowerCreatedAt's
@@ -914,8 +961,13 @@ class ListCategoryRepository(
             if (r.updatedAt <= l.updatedAt || (r.name == l.name && r.deleted == l.deleted)) return@mapNotNull null
             // A real change IS being written - carry the converged (minimum) createdAt into it rather
             // than the remote's raw value, otherwise this write would undo the convergence above and the
-            // default list's position would diverge again on the first rename.
-            r.copy(createdAt = minOf(l.createdAt, r.createdAt))
+            // default list's position would diverge again on the first rename. Also carry forward the
+            // locally-set defaultRemindAfterTogetherMinutes - see DateIdeaRepository.mergeRemote's
+            // matching doc for why (not part of the wire protocol yet).
+            r.copy(
+                createdAt = minOf(l.createdAt, r.createdAt),
+                defaultRemindAfterTogetherMinutes = l.defaultRemindAfterTogetherMinutes
+            )
         }
         if (toUpsert.isNotEmpty()) dao.upsertAll(toUpsert)
     }

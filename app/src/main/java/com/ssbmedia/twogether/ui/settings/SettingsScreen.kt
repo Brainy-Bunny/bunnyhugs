@@ -84,6 +84,12 @@ class SettingsViewModel : ViewModel() {
         viewModelScope.launch { ServiceLocator.settingsStore.setDefaultSnoozeMinutes(min) }
     }
 
+    /** Item 24 (UX-FIX-PLAN.md): the "Photo reminder interval" row's Change dialog calls this - mirrors
+     * setSnoozeMinutes' own pattern exactly. */
+    fun setPhotoReminderMinutes(minutes: Int) {
+        viewModelScope.launch { ServiceLocator.settingsStore.setPhotoReminderMinutes(minutes) }
+    }
+
     fun setNotificationsEnabled(enabled: Boolean) {
         viewModelScope.launch { ServiceLocator.settingsStore.setNotificationsEnabled(enabled) }
     }
@@ -246,6 +252,7 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
     var pinVerifyPurpose by remember { mutableStateOf<PinVerifyPurpose?>(null) }
     var showUnpairConfirm by remember { mutableStateOf(false) }
     var showSnoozeDialog by remember { mutableStateOf(false) }
+    var showPhotoReminderDialog by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
     var isBackingUp by remember { mutableStateOf(false) }
@@ -346,8 +353,13 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                 // never actually gated the app-update notification, milestone notifications, or anything
                 // else. Fixed the copy to describe what this switch actually controls rather than change
                 // its scope to match the old (aspirational, never-implemented) copy.
-                SettingsRow(label = "Notifications enabled", subtitle = "15-minute photo nudges") {
+                SettingsRow(label = "Notifications enabled", subtitle = "${settings.photoReminderMinutes}-minute photo nudges") {
                     Switch(checked = settings.notificationsEnabled, onCheckedChange = { vm.setNotificationsEnabled(it) })
+                }
+                // Item 24 (UX-FIX-PLAN.md): was hardcoded at 15 minutes - now configurable, same UI
+                // pattern as "Default snooze length" right below it.
+                SettingsRow(label = "Photo reminder interval", subtitle = "${settings.photoReminderMinutes} minutes") {
+                    TextButton(onClick = { showPhotoReminderDialog = true }) { Text("Change") }
                 }
                 SettingsRow(label = "Default snooze length", subtitle = "${settings.defaultSnoozeMinutes} minutes") {
                     TextButton(onClick = { showSnoozeDialog = true }) { Text("Change") }
@@ -558,6 +570,14 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
         )
     }
 
+    if (showPhotoReminderDialog) {
+        PhotoReminderDialog(
+            current = settings.photoReminderMinutes,
+            onDismiss = { showPhotoReminderDialog = false },
+            onSave = { vm.setPhotoReminderMinutes(it); showPhotoReminderDialog = false }
+        )
+    }
+
     if (showPinDialog) {
         SetPinDialog(onDismiss = { showPinDialog = false }, onSave = { pin, onResult -> vm.setPin(pin, onResult) })
     }
@@ -662,6 +682,33 @@ private fun SnoozeDefaultDialog(current: Int, onDismiss: () -> Unit, onSave: (In
                 keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.Number),
                 modifier = Modifier.fillMaxWidth()
             )
+        },
+        confirmButton = { TextButton(onClick = { onSave((text.toIntOrNull() ?: current).coerceIn(1, 720)) }) { Text("Save") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
+/** Item 24 (UX-FIX-PLAN.md): "Photo reminder interval" - the configurable replacement for the old
+ * hardcoded 15-minute photo nudge. Same input pattern as [SnoozeDefaultDialog] right above it. */
+@Composable
+private fun PhotoReminderDialog(current: Int, onDismiss: () -> Unit, onSave: (Int) -> Unit) {
+    var text by remember { mutableStateOf(current.toString()) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Photo reminder interval") },
+        text = {
+            Column {
+                Text(
+                    "How long you've been together before Twogether nudges you to snap a photo.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it.filter { c -> c.isDigit() }.take(4) },
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                )
+            }
         },
         confirmButton = { TextButton(onClick = { onSave((text.toIntOrNull() ?: current).coerceIn(1, 720)) }) { Text("Save") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }

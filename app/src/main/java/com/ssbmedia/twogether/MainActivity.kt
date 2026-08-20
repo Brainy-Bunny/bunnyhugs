@@ -47,6 +47,9 @@ class MainActivity : ComponentActivity() {
 
     private val cameraTrigger = mutableIntStateOf(0)
     private val milestoneTrigger = mutableStateOf<String?>(null)
+    // Item 24 (UX-FIX-PLAN.md): mirrors milestoneTrigger's own pattern exactly - see NavGraph's
+    // openListId doc for the full latch-then-consume story.
+    private val listIdTrigger = mutableStateOf<String?>(null)
 
     // Item 16 (camera overhaul), point 5: kept as a plain (non-Compose-state) field, not a State<Boolean>
     // - it's only ever read from dispatchKeyEvent below, a regular Activity method that runs completely
@@ -71,6 +74,7 @@ class MainActivity : ComponentActivity() {
             cameraTrigger.intValue = 1
         }
         intent?.getStringExtra(Notifications.EXTRA_OPEN_MILESTONE_ID)?.let { milestoneTrigger.value = it }
+        intent?.getStringExtra(Notifications.EXTRA_OPEN_LIST_ID)?.let { listIdTrigger.value = it }
 
         setContent {
             // Hoisted ABOVE TwogetherTheme (rather than loaded inside its content, like pairingInfo
@@ -104,6 +108,7 @@ class MainActivity : ComponentActivity() {
                     var pairingInfo by remember { mutableStateOf<PairingInfo?>(null) }
                     val trigger by cameraTrigger
                     val milestoneId by milestoneTrigger
+                    val listId by listIdTrigger
 
                     LaunchedEffect(Unit) {
                         ServiceLocator.pairingStore.info.collect { pairingInfo = it }
@@ -156,6 +161,7 @@ class MainActivity : ComponentActivity() {
                             cameraTrigger = trigger,
                             onUnpaired = { stopProximityService() },
                             openMilestoneId = milestoneId,
+                            openListId = listId,
                             // BUG fix: an independent review round found this fix (clearing the
                             // in-memory trigger state) was incomplete - onCreate re-reads these same
                             // extras from `intent` on EVERY Activity recreation, including a plain
@@ -173,7 +179,13 @@ class MainActivity : ComponentActivity() {
                                 milestoneTrigger.value = null
                                 intent?.removeExtra(Notifications.EXTRA_OPEN_MILESTONE_ID)
                             },
-                            onCameraScreenActiveChanged = { isCameraScreenActive = it }
+                            onCameraScreenActiveChanged = { isCameraScreenActive = it },
+                            // Item 24 (UX-FIX-PLAN.md): same removeExtra()-on-consume reasoning as
+                            // onMilestoneIdConsumed above.
+                            onListIdConsumed = {
+                                listIdTrigger.value = null
+                                intent?.removeExtra(Notifications.EXTRA_OPEN_LIST_ID)
+                            }
                         )
                     }
                 }
@@ -210,6 +222,7 @@ class MainActivity : ComponentActivity() {
             cameraTrigger.intValue += 1
         }
         intent.getStringExtra(Notifications.EXTRA_OPEN_MILESTONE_ID)?.let { milestoneTrigger.value = it }
+        intent.getStringExtra(Notifications.EXTRA_OPEN_LIST_ID)?.let { listIdTrigger.value = it }
     }
 
     private fun startProximityService() {

@@ -10,7 +10,14 @@ import java.util.UUID
 
 @Database(
     entities = [TogetherSession::class, DateIdea::class, TimeCapsule::class, Moment::class, MomentNote::class, Milestone::class, ListCategory::class],
-    version = 11,
+    // NOTE(merge): incoming branch (Cluster I, item 24) originally shipped this feature as its own
+    // v8 -> v9 migration on top of a database that, on THIS branch, was already at v11 by the time of
+    // merge (Group J's independent work). Both branches also independently named their v8->v9
+    // migration MIGRATION_8_9 for genuinely different schema changes (time-capsule sync columns here
+    // vs. reminder columns there) - a real collision, not just a duplicate. Renumbered Cluster I's
+    // migration to MIGRATION_11_12 (see below) and bumped this version to 12 accordingly, rather than
+    // picking one side.
+    version = 12,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -311,6 +318,25 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /** v11 -> v12, item 24 (UX-FIX-PLAN.md): adds date_ideas.remindAfterTogetherMinutes and
+         * list_categories.defaultRemindAfterTogetherMinutes - both nullable Ints ("no reminder set" for
+         * every pre-existing row, which is correct: nothing had a reminder before this feature existed).
+         * Plain ADD COLUMN with no NOT NULL/DEFAULT, same as MIGRATION_9_10's linkedMomentSyncId pattern -
+         * correct here specifically because both Kotlin fields are nullable (`Int? = null`), and Room's
+         * schema validation checks the column's nullability against the entity's own declared
+         * nullability, not against any other migration's shape.
+         *
+         * NOTE(merge): originally authored on the source branch as MIGRATION_8_9 against a database that
+         * topped out at v9 there; renumbered to 11->12 to land after this branch's MIGRATION_10_11 (see
+         * the @Database version doc above for why).
+         */
+        val MIGRATION_11_12 = object : Migration(11, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE date_ideas ADD COLUMN remindAfterTogetherMinutes INTEGER")
+                db.execSQL("ALTER TABLE list_categories ADD COLUMN defaultRemindAfterTogetherMinutes INTEGER")
+            }
+        }
+
         /**
          * Seeds the default "Date Ideas" list (id == DEFAULT_LIST_ID) for a genuinely BRAND-NEW install -
          * i.e. no pre-existing database file at all, so Room creates the schema fresh at the CURRENT
@@ -341,7 +367,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "twogether.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12)
                     .addCallback(SEED_DEFAULT_LIST_CALLBACK)
                     // Safety net only for a FUTURE schema version we didn't write a real migration for -
                     // the 1->2 and 2->3 paths above are always handled for real, so existing users'

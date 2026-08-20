@@ -73,10 +73,26 @@ object Notifications {
      * else may ever be assigned an ID in that range. */
     const val MILESTONE_NOTIFICATION_ID_BASE = 2000
 
+    /** Item 24 (UX-FIX-PLAN.md): base id for a list/list-item reminder notification, offset by a stable
+     * per-key hash (see showListItemReminder/showListReminder) - mirrors MILESTONE_NOTIFICATION_ID_BASE's
+     * own pattern one level up, deliberately in its OWN separate part of the id space rather than
+     * reusing 2000: MILESTONE_NOTIFICATION_ID_BASE's own hash mask (0x0FFFFFFF, ~268 million) already
+     * spans most of the usable positive-Int range starting at 2000, so a second hash-based range sharing
+     * that same base would meaningfully raise the chance of a real collision with an unrelated
+     * milestone's id. Starting this range at 300,000,000 instead (with the same 0x0FFFFFFF mask, so it
+     * spans up to ~568 million) keeps it clear of both the fixed IDs above (1001-1006) and the entire
+     * milestone range, while staying safely inside Int's positive range (~2.1 billion). */
+    const val LIST_REMINDER_NOTIFICATION_ID_BASE = 300_000_000
+
     const val EXTRA_OPEN_CAMERA = "open_camera"
     /** Feature F: carries which milestone to open the "throughout the years" retrospective for, when the
      * user taps a milestone's yearly notification - mirrors EXTRA_OPEN_CAMERA's pattern. */
     const val EXTRA_OPEN_MILESTONE_ID = "open_milestone_id"
+    /** Item 24 (UX-FIX-PLAN.md): carries which ListCategory to open (and auto-expand) in "Our Lists" when
+     * the user taps a list/list-item reminder notification - mirrors EXTRA_OPEN_MILESTONE_ID's pattern.
+     * Used for BOTH showListItemReminder (opens the ITEM's owning list) and showListReminder (opens the
+     * list itself), since "Our Lists" has no separate per-item destination to deep-link to. */
+    const val EXTRA_OPEN_LIST_ID = "open_list_id"
 
     fun ensureChannels(context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -154,9 +170,12 @@ object Notifications {
             .build()
     }
 
-    /** Returns true iff the reminder was actually posted, so callers don't mark a one-per-session
-     * reminder as "fired" when nothing was shown (e.g. notification permission denied on API 33+). */
-    fun showPhotoReminder(context: Context): Boolean {
+    /** Item 24 (UX-FIX-PLAN.md): [minutes] is the user-configured interval (AppSettings.
+     * photoReminderMinutes, default 15) - the title text is now built from the actual value rather than
+     * a hardcoded "15 minutes". Returns true iff the reminder was actually posted, so callers don't mark
+     * a one-per-session reminder as "fired" when nothing was shown (e.g. notification permission denied
+     * on API 33+). */
+    fun showPhotoReminder(context: Context, minutes: Int): Boolean {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return false
 
         val cameraIntent = Intent(context, MainActivity::class.java).apply {
@@ -176,9 +195,10 @@ object Notifications {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val minutesLabel = if (minutes == 1) "1 minute" else "$minutes minutes"
         val notification = NotificationCompat.Builder(context, CHANNEL_REMINDERS)
             .setSmallIcon(R.drawable.ic_notification_heart)
-            .setContentTitle("You've been together for 15 minutes 💛")
+            .setContentTitle("You've been together for $minutesLabel 💛")
             .setContentText("Snap a photo?")
             .setAutoCancel(true)
             .setContentIntent(cameraPendingIntent)
@@ -189,7 +209,7 @@ object Notifications {
         // On API 33+, notify() without POST_NOTIFICATIONS granted just silently never shows anything -
         // matching the check ProximityForegroundService.updateNotification already does before its own
         // notify() call. Returns whether it actually posted so the caller can avoid marking this
-        // session's one-shot 15-minute reminder as "fired" when nothing was actually shown.
+        // session's one-shot reminder as "fired" when nothing was actually shown.
         if (!BlePermissions.hasNotificationPermission(context)) return false
         manager.notify(REMINDER_NOTIFICATION_ID, notification)
         return true
@@ -198,6 +218,74 @@ object Notifications {
     fun cancelPhotoReminder(context: Context) {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
         manager.cancel(REMINDER_NOTIFICATION_ID)
+    }
+
+    /** Item 24 (UX-FIX-PLAN.md): fired once per together-session for a single DateIdea whose own
+     * [com.ssbmedia.twogether.data.db.DateIdea.remindAfterTogetherMinutes] threshold has been crossed -
+     * see ProximityForegroundService.checkListReminders. Reuses CHANNEL_REMINDERS (same channel as the
+     * photo reminder). Tapping it opens "Our Lists" with the idea's OWNING list expanded (the idea's own
+     * text is in the notification body so it's clear what the reminder is about, even without a
+     * per-item destination to deep-link to). [listId] is the idea's [ListCategory][
+     * com.ssbmedia.twogether.data.db.ListCategory].id, used both for the deep-link and for the stable
+     * per-idea notification id below. */
+    fun showListItemReminder(context: Context, ideaId: String, listId: String, listName: String, ideaText: String): Boolean {
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return false
+        if (!BlePermissions.hasNotificationPermission(context)) return false
+
+        val openIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(EXTRA_OPEN_LIST_ID, listId)
+        }
+        val notificationId = LIST_REMINDER_NOTIFICATION_ID_BASE + ("idea:$ideaId".hashCode() and 0x0FFFFFFF)
+        val pendingIntent = PendingIntent.getActivity(
+            context, notificationId, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_REMINDERS)
+            .setSmallIcon(R.drawable.ic_notification_heart)
+            .setContentTitle("Idea time! 💡")
+            .setContentText("\"$ideaText\" — from your $listName list")
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+
+        manager.notify(notificationId, notification)
+        return true
+    }
+
+    /** Item 24 (UX-FIX-PLAN.md): fired once per together-session for a whole ListCategory whose
+     * [com.ssbmedia.twogether.data.db.ListCategory.defaultRemindAfterTogetherMinutes] threshold has been
+     * crossed (e.g. "remind me about our bucket list every time we've been together 2+ hours") - see
+     * ProximityForegroundService.checkListReminders. One notification about the LIST as a whole,
+     * independent of any per-item reminders also firing for ideas inside it (showListItemReminder
+     * above). Reuses CHANNEL_REMINDERS. Tapping it opens "Our Lists" with this list expanded. */
+    fun showListReminder(context: Context, listId: String, listName: String): Boolean {
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return false
+        if (!BlePermissions.hasNotificationPermission(context)) return false
+
+        val openIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(EXTRA_OPEN_LIST_ID, listId)
+        }
+        val notificationId = LIST_REMINDER_NOTIFICATION_ID_BASE + ("list:$listId".hashCode() and 0x0FFFFFFF)
+        val pendingIntent = PendingIntent.getActivity(
+            context, notificationId, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_REMINDERS)
+            .setSmallIcon(R.drawable.ic_notification_heart)
+            .setContentTitle("Check your $listName list 💌")
+            .setContentText("You've been together a while — take a look?")
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+
+        manager.notify(notificationId, notification)
+        return true
     }
 
     /** Feature F: the yearly "it's [label] today!" notification. Tapping it opens the app straight into
