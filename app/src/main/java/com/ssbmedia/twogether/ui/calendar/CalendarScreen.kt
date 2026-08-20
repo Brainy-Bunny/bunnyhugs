@@ -201,8 +201,8 @@ fun CalendarScreen(
     // Reuses StatsCalculator's qualifying-day count (same buildDailyMinuteMap() call above feeds it)
     // rather than re-deriving "day with any together-time" locally, so this can never drift from the
     // "days together" stat shown on the Stats/Home screens.
-    val totalDaysTogether = remember(sessions, proximityState.lastSeenAt) {
-        StatsCalculator.compute(sessions, zone = zone, lastSeenAt = proximityState.lastSeenAt).totalDaysTogether
+    val totalDaysTogether = remember(sessions, proximityState.lastSeenAt, proximityState.reunionCount) {
+        StatsCalculator.compute(sessions, zone = zone, lastSeenAt = proximityState.lastSeenAt, reunionCount = proximityState.reunionCount).totalDaysTogether
     }
     // Membership in minutesPerDay (not minutes >= 1) is what "qualifies" a day - see StatsCalculator's
     // buildDailyMinuteMap: every key it inserts already had a real positive-duration segment

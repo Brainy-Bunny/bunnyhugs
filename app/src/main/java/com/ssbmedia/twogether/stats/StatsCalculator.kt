@@ -105,11 +105,17 @@ private val FIXED_WEEK_ANCHOR: LocalDate = LocalDate.of(2000, 1, 3)
 
 object StatsCalculator {
 
-    /** The apart-gap threshold a reunion must clear - see [countReunions]. Public (not the old
-     * file-private constant) so ProximityForegroundService's live celebration check can read the SAME
-     * value instead of keeping its own independent copy in sync by hand on every future threshold
-     * change - the two already had to be edited together once (30min -> 1hr) with no compiler help
-     * catching a mismatch if one were missed.
+    /** LEGACY-ONLY as of the user-configurable reunion threshold feature (see
+     * [com.ssbmedia.twogether.data.datastore.AppSettings.reunionThresholdMinutes]'s own doc). This used to
+     * be the single live threshold ProximityForegroundService's celebration check AND [countReunions]'s
+     * full-history rescan both read - now it is ONLY ever used by [legacyReunionCountForBackfill], the
+     * one-time migration that seeds an existing install's persisted reunionCount (see
+     * ProximityPersistedState.reunionCount/reunionCountBackfilled's docs). It must stay a fixed constant,
+     * never itself become user-editable - it exists specifically to represent "the one threshold that
+     * genuinely applied to 100% of this app's history before the live threshold became configurable",
+     * which is what makes that one-time rescan unambiguous. All LIVE (post-migration) reunion detection
+     * now reads AppSettings.reunionThresholdMinutes instead - see
+     * ProximityForegroundService.handleBecameTogether.
      *
      * Item 10 (UX-FIX-PLAN.md): this used to ALSO require the apart-start and the reunion itself to fall
      * on the same calendar day (see the now-removed isSameCalendarDay check in [countReunions]), which
@@ -162,7 +168,18 @@ object StatsCalculator {
          * information genuinely isn't available yet; that case is still bounded by the session's own
          * startedAt rather than running unclamped to [now]. */
         lastSeenAt: Long = 0L,
-        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS,
+        /** Reunion-count non-retroactivity feature: the couple's lifetime reunion count, taken VERBATIM
+         * from the caller's own ProximityPersistedState.reunionCount (a persisted, live-incrementing
+         * counter - see its own doc) rather than computed here. This used to be `countReunions(merged)`,
+         * rescanning the ENTIRE session history on every single call with whatever the single global
+         * threshold constant happened to be - fundamentally incompatible with a user-editable threshold,
+         * since a later threshold change would silently reinterpret (and change the count of) reunions
+         * that already happened and were already celebrated under a DIFFERENT threshold. Defaults to 0
+         * only for callers that don't care about this field (e.g. [manualHoursCredit]'s two internal
+         * `compute()` calls, which only ever read totalHoursAllTime) - every real UI call site must pass
+         * its own ProximityPersistedState's reunionCount explicitly. */
+        reunionCount: Int = 0
     ): TogetherStats {
 
         // Computed from raw session start times (not the merged/clamped timeline below) so it reflects
@@ -180,7 +197,10 @@ object StatsCalculator {
             return TogetherStats(
                 totalHoursAllTime = 0.0, totalHoursThisWeek = 0.0, totalHoursThisMonth = 0.0,
                 currentDailyStreak = 0, longestDailyStreak = 0, currentWeeklyStreak = 0, longestWeeklyStreak = 0,
-                longestSessionMinutes = 0, reunionCount = 0, perfectWeekCount = 0, favoriteDayOfWeek = null, totalDaysTogether = 0,
+                // reunionCount is still the passed-in persisted counter here, not 0 - see the parameter's
+                // own doc: it's never derived from `merged`, so an empty session list (nothing left after
+                // filtering/clamping) must not force it to 0 either.
+                longestSessionMinutes = 0, reunionCount = reunionCount, perfectWeekCount = 0, favoriteDayOfWeek = null, totalDaysTogether = 0,
                 mostMetMonth = null, mostHoursMonth = null, longestSingleDay = null, togetherSince = togetherSince,
                 monthTrend = Trend.FLAT, monthTrendDeltaDays = 0, avgDaysBetweenMeetups = null, longestApart = null
             )
@@ -234,7 +254,10 @@ object StatsCalculator {
 
         val longestSessionMinutes = merged.maxOf { it.end - it.start } / 60_000L
 
-        val reunionCount = countReunions(merged)
+        // reunionCount is NOT computed here (was `countReunions(merged)` - a full-history rescan run on
+        // EVERY call) - it's the `reunionCount` parameter, passed straight through from the caller's own
+        // ProximityPersistedState.reunionCount. See that parameter's own doc for why this function must
+        // never derive it from `merged` any more.
 
         val favoriteDayOfWeek = minutesPerDay.entries
             .groupBy { it.key.dayOfWeek }
@@ -556,7 +579,14 @@ object StatsCalculator {
      * day, which meant an overnight gap (goodnight -> next morning) or a multi-day apart stretch never
      * counted as a reunion no matter how long the real gap was - clearly wrong, since the whole point of
      * the gap threshold is to detect a genuine apart-then-back-together event. The same-day check (and
-     * the [zone] it needed) is removed entirely; only the gap threshold remains. */
+     * the [zone] it needed) is removed entirely; only the gap threshold remains.
+     *
+     * LEGACY-ONLY as of the user-configurable reunion threshold feature: [compute] no longer calls this on
+     * its normal path (it now takes reunionCount as a plain parameter - see its own doc) - this full-
+     * history rescan survives ONLY as [legacyReunionCountForBackfill]'s implementation, for the one-time
+     * migration that seeds an existing install's persisted counter. Never call this directly from any new
+     * code path; a rescan against the CURRENT live threshold is exactly the retroactive recomputation this
+     * whole feature exists to prevent. */
     private fun countReunions(mergedSorted: List<Interval>): Int {
         var count = 0
         for (i in 1 until mergedSorted.size) {
@@ -565,6 +595,23 @@ object StatsCalculator {
         }
         return count
     }
+
+    /** One-time backfill helper for an EXISTING install adopting the user-configurable reunion threshold
+     * feature - see [ProximityPersistedState][com.ssbmedia.twogether.data.datastore.ProximityPersistedState]
+     * .reunionCount/.reunionCountBackfilled's own docs, and
+     * ProximityForegroundService.backfillReunionCountIfNeeded (the sole caller). Rescans the couple's ENTIRE
+     * session history exactly once, against the fixed legacy [REUNION_GAP_MILLIS] (60 min) - the only
+     * threshold that has EVER applied to any of this app's history before this feature shipped, so this one
+     * rescan is genuinely unambiguous, unlike a rescan against whatever the live, user-editable threshold
+     * happens to be today. Must never be called again after the caller's backfill flag is set - repurposes
+     * the same [mergedIntervals]/[countReunions] machinery [compute] used to call on every single
+     * invocation, rather than reimplementing equivalent gap-counting logic a second time. */
+    fun legacyReunionCountForBackfill(
+        sessions: List<TogetherSession>,
+        now: Long = System.currentTimeMillis(),
+        lastSeenAt: Long = 0L,
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+    ): Int = countReunions(mergedIntervals(sessions, now, lastSeenAt, absenceTimeoutMillis))
 
     /** Turns a sorted list of distinct together-days (the same qualifying-day concept used for
      * [totalDaysTogether]/streaks - see [buildDailyMinuteMap]) into the gap list between each

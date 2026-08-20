@@ -212,12 +212,18 @@ class ProximityForegroundService : LifecycleService() {
         val effectiveTogether = persisted.isTogether && !isStale
         stateMachine.restoreState(effectiveTogether, persisted.lastSeenAt)
 
-        // Item 9 (UX-FIX-PLAN.md): a persisted pendingApartSince that's still within SESSION_GRACE_MILLIS
+        // Reunion-count non-retroactivity feature: sessionGraceMinutes is now a live, user-configurable
+        // setting (AppSettings.sessionGraceMinutes) instead of the old hardcoded SESSION_GRACE_MILLIS
+        // constant - see withinGraceWindow/graceWindowExpired's own docs. Read once here so this whole
+        // restoreState() call is internally consistent about which grace window it's applying.
+        val graceMillis = ServiceLocator.settingsStore.current().sessionGraceMinutes.coerceAtLeast(1) * 60_000L
+
+        // Item 9 (UX-FIX-PLAN.md): a persisted pendingApartSince that's still within the grace window
         // means the process died/restarted mid-grace-window - the fast isTogether flip already correctly
         // happened (persisted.isTogether is false), but the underlying TogetherSession row and the
         // continuous-together timer are still "live" pending a possible resume, not something to reset.
         // See selfHealOrphanedSession's own doc for how this interacts with the stale-session self-heal.
-        val stillWithinGrace = !effectiveTogether && withinGraceWindow(persisted.pendingApartSince, now)
+        val stillWithinGrace = !effectiveTogether && withinGraceWindow(persisted.pendingApartSince, now, graceMillis)
         continuousTogetherSinceMillis = if (effectiveTogether || stillWithinGrace) persisted.continuousTogetherSince else 0L
 
         selfHealOrphanedSession(persisted, isStale, stillWithinGrace, now)
@@ -238,6 +244,44 @@ class ProximityForegroundService : LifecycleService() {
             ServiceLocator.proximityStateStore.update {
                 it.copy(isTogether = false, continuousTogetherSince = 0L, currentSessionId = -1L, lastApartSince = estimatedApartSince)
             }
+        }
+
+        backfillReunionCountIfNeeded(persisted, now)
+    }
+
+    /**
+     * Reunion-count non-retroactivity feature: one-time migration for an install that already has real
+     * session history from before this feature shipped - see
+     * [com.ssbmedia.twogether.data.datastore.ProximityPersistedState.reunionCount]/[reunionCountBackfilled]'s
+     * own docs for the full design rationale. Every distinct real-world reunion this couple has ever had
+     * was, until this feature existed, ALWAYS evaluated under the single hardcoded
+     * [StatsCalculator.REUNION_GAP_MILLIS] (60 min) - the only threshold that has ever applied to any of
+     * this app's history - so rescanning once with that fixed legacy value
+     * ([StatsCalculator.legacyReunionCountForBackfill]) is genuinely unambiguous, not a "best guess."
+     *
+     * Called from every [restoreState] (i.e. every service start), but [ProximityPersistedState.
+     * reunionCountBackfilled] makes every call after the very first a cheap no-op - this must never run
+     * twice, or a live [com.ssbmedia.twogether.data.datastore.AppSettings.reunionThresholdMinutes] change
+     * could get silently re-applied to the couple's ENTIRE history the next time the service happens to
+     * restart, which is exactly the retroactive-recomputation bug this whole feature exists to prevent.
+     */
+    private suspend fun backfillReunionCountIfNeeded(persisted: ProximityPersistedState, now: Long) {
+        if (persisted.reunionCountBackfilled) return
+        val sessions = ServiceLocator.sessionRepository.getAll()
+        val legacyCount = StatsCalculator.legacyReunionCountForBackfill(
+            sessions,
+            now = now,
+            lastSeenAt = persisted.lastSeenAt,
+            absenceTimeoutMillis = stateMachine.absenceTimeoutMillis
+        )
+        ServiceLocator.proximityStateStore.update {
+            // Re-check inside the transaction (same defensive read-fresh-inside-edit{} pattern
+            // ProximityStateStore.update's own doc requires of every caller) - if some other path already
+            // completed the backfill by the time this write lands, never clobber a reunionCount that may
+            // have since moved on from live handleBecameTogether() increments. Extracted to a pure
+            // companion helper (backfilledReunionState) - unit-tested directly via reflection, same
+            // reasoning as isReunion/nextReunionCount above.
+            backfilledReunionState(it, legacyCount)
         }
     }
 
@@ -392,11 +436,15 @@ class ProximityForegroundService : LifecycleService() {
             // never accelerate an unlock - see TimeCapsuleRepository.unlockEligible's doc for the full
             // anti-cheat reasoning (manual hours cancel out of the actual unlock condition entirely).
             val sessions = ServiceLocator.sessionRepository.getAll()
+            // reunionCount is the persisted, live-incrementing counter (see ProximityPersistedState.
+            // reunionCount's own doc) - passed straight through, never recomputed here.
+            val proximityStateForStats = ServiceLocator.proximityStateStore.current()
             val stats = StatsCalculator.compute(
                 sessions,
                 now = now,
                 lastSeenAt = stateMachine.lastSeenAt,
-                absenceTimeoutMillis = stateMachine.absenceTimeoutMillis
+                absenceTimeoutMillis = stateMachine.absenceTimeoutMillis,
+                reunionCount = proximityStateForStats.reunionCount
             )
             val manualCredit = StatsCalculator.manualHoursCredit(
                 sessions,
@@ -553,15 +601,36 @@ class ProximityForegroundService : LifecycleService() {
 
     private suspend fun handleBecameTogether(now: Long, device: BluetoothDevice, tieBreak: Byte) {
         val persisted = ServiceLocator.proximityStateStore.current()
-        val gapMillis = if (persisted.lastApartSince > 0) now - persisted.lastApartSince else Long.MAX_VALUE
+        val settings = ServiceLocator.settingsStore.current()
+        // Reunion-count non-retroactivity feature: reads the LIVE, user-configurable
+        // AppSettings.reunionThresholdMinutes at this exact instant - not the old hardcoded
+        // StatsCalculator.REUNION_GAP_MILLIS constant. This is what makes each reunion's evaluation a
+        // genuine one-time, point-in-time decision: whatever threshold is in effect RIGHT NOW is applied
+        // once, here, and never revisited - a later change to reunionThresholdMinutes can only ever affect
+        // the NEXT transition this function evaluates, never this one after the fact (see
+        // reunionCount below, and AppSettings.reunionThresholdMinutes' own doc for the full guarantee).
+        //
         // Item 10 (UX-FIX-PLAN.md): dropped the same-calendar-day requirement this used to also check
         // (via StatsCalculator.isSameCalendarDay) - an overnight or multi-day reunion was silently never
         // celebrated before, however long the real gap was. Only the gap threshold matters now, mirroring
-        // StatsCalculator.countReunions' own fix. Interaction with item 9: SESSION_GRACE_MILLIS (10 min)
-        // is far shorter than REUNION_GAP_MILLIS (60 min, enforced below), so a grace-window "resume" -
-        // which never touches persisted.lastApartSince in the first place, see the resume branch below -
-        // can never itself be misread as a reunion.
-        val isReunion = persisted.lastApartSince > 0 && gapMillis >= StatsCalculator.REUNION_GAP_MILLIS
+        // StatsCalculator.countReunions' own (now legacy-only) fix.
+        val reunionThresholdMillis = settings.reunionThresholdMinutes.coerceAtLeast(1) * 60_000L
+        // Extracted to a pure companion helper (see its own doc) - unit-tested directly via reflection,
+        // mirroring withinGraceWindow/graceWindowExpired's established pattern, rather than only
+        // indirectly through the full Service (which this project's plain-JVM unit tests can't
+        // instantiate - no Robolectric/Context available).
+        val isReunion = isReunion(persisted.lastApartSince, now, reunionThresholdMillis)
+
+        // Reunion-count non-retroactivity feature: sessionGraceMinutes is now live/user-configurable too
+        // (AppSettings.sessionGraceMinutes) - see withinGraceWindow's own doc. NOTE: unlike the old
+        // hardcoded pair (SESSION_GRACE_MILLIS 10min « REUNION_GAP_MILLIS 60min), these two settings are
+        // now independently user-editable, so that structural "grace is always far shorter than reunion"
+        // invariant is no longer guaranteed - a user who sets reunionThresholdMinutes below
+        // sessionGraceMinutes can see a grace-window "resume" ALSO flagged as a reunion (the session/timer
+        // still resumes rather than restarting, since isReunion above is independent of resumableSession
+        // below). That's an accepted edge case of making both settings independent, not a bug: a
+        // sufficiently low reunion threshold is a deliberate "count almost every gap" choice.
+        val graceMillis = settings.sessionGraceMinutes.coerceAtLeast(1) * 60_000L
 
         // Item 9 (UX-FIX-PLAN.md): if the apart transition that just ended is still within its grace
         // window and left a TogetherSession row open, this is a RESUME - reconnecting the SAME session
@@ -571,7 +640,7 @@ class ProximityForegroundService : LifecycleService() {
         // normal "new session" path if the grace window already expired (checkGraceExpiry may have beaten
         // this beacon sighting to it and already closed the session) or there was never a pending apart to
         // begin with.
-        val resumableSession = if (withinGraceWindow(persisted.pendingApartSince, now)) {
+        val resumableSession = if (withinGraceWindow(persisted.pendingApartSince, now, graceMillis)) {
             ServiceLocator.sessionRepository.getOpenSession()
         } else {
             null
@@ -600,7 +669,17 @@ class ProximityForegroundService : LifecycleService() {
                 // Item 24 (UX-FIX-PLAN.md): a fresh continuous-together session gets a clean slate of
                 // list/list-item reminders to re-fire, same reasoning as reminderFiredForSession's reset
                 // just above.
-                remindersFiredForSession = emptySet()
+                remindersFiredForSession = emptySet(),
+                // Reunion-count non-retroactivity feature: incremented by exactly 1, in this SAME
+                // transactional update{} call (not a second separate write) - see ProximityPersistedState.
+                // reunionCount's own doc for why this is a live counter and not something ever recomputed
+                // from history. `it.reunionCount` (the fresh in-transaction value, per ProximityStateStore.
+                // update's own doc) rather than `persisted.reunionCount` read before this transaction
+                // started, so a concurrent increment (shouldn't happen for this specific field today, but
+                // matches this store's own established safety pattern) can never be lost. Extracted to a
+                // pure companion helper (nextReunionCount) for the same reflection-testability reason as
+                // isReunion above.
+                reunionCount = nextReunionCount(it.reunionCount, isReunion)
             )
         }
 
@@ -678,7 +757,9 @@ class ProximityForegroundService : LifecycleService() {
      * other, or never together to begin with). */
     private suspend fun checkGraceExpiry(now: Long) {
         val persisted = ServiceLocator.proximityStateStore.current()
-        if (!graceWindowExpired(persisted.pendingApartSince, now)) return
+        // Reunion-count non-retroactivity feature: live setting, not the old hardcoded SESSION_GRACE_MILLIS.
+        val graceMillis = ServiceLocator.settingsStore.current().sessionGraceMinutes.coerceAtLeast(1) * 60_000L
+        if (!graceWindowExpired(persisted.pendingApartSince, now, graceMillis)) return
 
         val openSession = ServiceLocator.sessionRepository.getOpenSession()
         if (openSession != null) {
@@ -999,26 +1080,65 @@ class ProximityForegroundService : LifecycleService() {
         private const val TAG = "ProximityService"
         private const val FIFTEEN_MINUTES_MILLIS = 15 * 60 * 1000L
 
-        /** Item 9 (UX-FIX-PLAN.md): how long a TogetherSession row (and the continuous-together timer) is
-         * given after the fast ~100s isTogether apart-flip before it's actually torn down for real - see
-         * handleBecameApart/checkGraceExpiry/handleBecameTogether's resume path. Deliberately much shorter
-         * than StatsCalculator.REUNION_GAP_MILLIS (60 min) so a grace-window resume can never itself look
-         * like a reunion - see handleBecameTogether's isReunion doc (item 10's interaction note). */
-        const val SESSION_GRACE_MILLIS = 10 * 60 * 1000L
+        /** Item 9 (UX-FIX-PLAN.md) / reunion-count non-retroactivity feature: how long a TogetherSession
+         * row (and the continuous-together timer) is given after the fast ~100s isTogether apart-flip
+         * before it's actually torn down for real - see handleBecameApart/checkGraceExpiry/
+         * handleBecameTogether's resume path. Used to be a hardcoded constant here
+         * (SESSION_GRACE_MILLIS, 10 min) - now a live, user-configurable setting
+         * (AppSettings.sessionGraceMinutes, same 10-minute default), read fresh at each call site
+         * (restoreState/handleBecameTogether/checkGraceExpiry) and passed into [withinGraceWindow]/
+         * [graceWindowExpired] as [graceMillis] rather than baked into these functions. See
+         * handleBecameTogether's own doc for why this is no longer structurally guaranteed to stay shorter
+         * than the (also now-configurable) reunion threshold, unlike the old fixed pair. */
 
         /** Pure decision helper - unit-tested directly (via reflection, since it's private - see
          * GraceWindowAuditTest) rather than only indirectly through the full Service. True iff a reconnect
          * at [now] should resume the session left open at [pendingApartSince] (a
-         * ProximityPersistedState.pendingApartSince value) rather than starting a brand new one. Also true
-         * for [checkGraceExpiry]'s own "should I close it yet" question via [graceWindowExpired] below -
-         * the two are complements of each other for any pendingApartSince > 0. */
-        private fun withinGraceWindow(pendingApartSince: Long, now: Long): Boolean =
-            pendingApartSince > 0L && now - pendingApartSince < SESSION_GRACE_MILLIS
+         * ProximityPersistedState.pendingApartSince value) rather than starting a brand new one, given a
+         * grace window of [graceMillis] (the live AppSettings.sessionGraceMinutes value, converted to
+         * millis by the caller). Also true for [checkGraceExpiry]'s own "should I close it yet" question
+         * via [graceWindowExpired] below - the two are complements of each other for any
+         * pendingApartSince > 0. */
+        private fun withinGraceWindow(pendingApartSince: Long, now: Long, graceMillis: Long): Boolean =
+            pendingApartSince > 0L && now - pendingApartSince < graceMillis
 
-        /** Pure decision helper (private, unit-tested via reflection) - true iff the grace window opened
-         * at [pendingApartSince] has now elapsed and a still-open session should actually be closed. */
-        private fun graceWindowExpired(pendingApartSince: Long, now: Long): Boolean =
-            pendingApartSince > 0L && now - pendingApartSince >= SESSION_GRACE_MILLIS
+        /** Pure decision helper (private, unit-tested via reflection) - true iff the grace window of
+         * [graceMillis] opened at [pendingApartSince] has now elapsed and a still-open session should
+         * actually be closed. */
+        private fun graceWindowExpired(pendingApartSince: Long, now: Long, graceMillis: Long): Boolean =
+            pendingApartSince > 0L && now - pendingApartSince >= graceMillis
+
+        /** Reunion-count non-retroactivity feature: pure decision helper - unit-tested directly via
+         * reflection (see ReunionNonRetroactivityAuditTest), mirroring [withinGraceWindow]/
+         * [graceWindowExpired]'s established pattern. True iff the apart-gap ending at [now] (measured
+         * from [lastApartSince], a ProximityPersistedState.lastApartSince value) clears
+         * [reunionThresholdMillis] - the LIVE, user-configurable AppSettings.reunionThresholdMinutes value
+         * at the moment [handleBecameTogether] calls this, converted to millis by the caller. This is the
+         * ENTIRE one-time, point-in-time reunion decision: called exactly once per apart->together
+         * transition, its result is used immediately (to fire the celebration and increment
+         * [nextReunionCount] below) and never revisited - a later change to reunionThresholdMinutes cannot
+         * affect a decision this function already made, only a future call to it. */
+        private fun isReunion(lastApartSince: Long, now: Long, reunionThresholdMillis: Long): Boolean =
+            lastApartSince > 0L && now - lastApartSince >= reunionThresholdMillis
+
+        /** Reunion-count non-retroactivity feature: pure decision helper - the ENTIRE "increment the
+         * persisted counter by exactly 1" logic, unit-tested directly via reflection. [currentCount] is
+         * the fresh in-transaction ProximityPersistedState.reunionCount value (see
+         * ProximityStateStore.update's own doc for why it must be the in-transaction value, not one read
+         * before the transaction started) - this function itself has no notion of "before/after", it's a
+         * pure function of (current count, did a reunion just happen). */
+        private fun nextReunionCount(currentCount: Int, isReunion: Boolean): Int =
+            if (isReunion) currentCount + 1 else currentCount
+
+        /** Reunion-count non-retroactivity feature: pure decision helper for
+         * [backfillReunionCountIfNeeded]'s one-time migration - unit-tested directly via reflection. If
+         * [current] (the fresh in-transaction ProximityPersistedState) has already been backfilled, returns
+         * it UNCHANGED (never re-applies [legacyCount], even if called again) - otherwise seeds
+         * reunionCount with [legacyCount] and sets the flag. This is what makes the backfill idempotent:
+         * calling this function 100 times with the same [current]-already-backfilled input always produces
+         * the same unchanged result, never a re-application. */
+        private fun backfilledReunionState(current: ProximityPersistedState, legacyCount: Int): ProximityPersistedState =
+            if (current.reunionCountBackfilled) current else current.copy(reunionCount = legacyCount, reunionCountBackfilled = true)
 
         /** Item 24 (UX-FIX-PLAN.md): pure decision helper for the list/list-item reminder feature -
          * unit-tested directly (via reflection, mirroring GraceWindowAuditTest's pattern for testing a

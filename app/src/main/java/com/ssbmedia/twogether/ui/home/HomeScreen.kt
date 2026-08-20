@@ -485,8 +485,8 @@ fun HomeScreen(
     // timeout, matching Home's own effectivelyTogether staleness check below - see
     // StatsCalculator.effectiveOpenSessionEnd's doc for why (a stale/orphaned open session must
     // never silently "grow" forever just because something read it).
-    val stats = remember(sessions, now, proximityState.lastSeenAt) {
-        StatsCalculator.compute(sessions, now, lastSeenAt = proximityState.lastSeenAt)
+    val stats = remember(sessions, now, proximityState.lastSeenAt, proximityState.reunionCount) {
+        StatsCalculator.compute(sessions, now, lastSeenAt = proximityState.lastSeenAt, reunionCount = proximityState.reunionCount)
     }
 
     // Same "on this exact calendar date, in a past year" lookup used by the Calendar screen's per-day

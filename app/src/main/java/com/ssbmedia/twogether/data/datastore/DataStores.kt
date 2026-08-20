@@ -499,7 +499,30 @@ data class AppSettings(
      * an explicit opt-in, never silently on. Never a REPLACEMENT for the PIN - PIN entry stays available
      * unconditionally regardless of this setting, since biometric auth can always fail (wet fingers, no
      * enrollment, hardware removed) and there must always be a way in. */
-    val biometricUnlockEnabled: Boolean = false
+    val biometricUnlockEnabled: Boolean = false,
+    /** Reunion-count non-retroactivity feature: replaces the old hardcoded
+     * ProximityForegroundService.SESSION_GRACE_MILLIS (10 min) constant. How long a brief BLE gap can
+     * last without resetting the continuous "together" timer/session - see
+     * ProximityForegroundService.withinGraceWindow/graceWindowExpired, both of which now read this live
+     * setting instead of a compile-time constant. Purely a real-time session-continuation knob - nothing
+     * displayed anywhere is ever DERIVED from this setting's history, so (unlike
+     * [reunionThresholdMinutes] below) changing it has no retroactive-recomputation concern at all: it
+     * only ever affects the CURRENT apart/together decision, never a past one. */
+    val sessionGraceMinutes: Int = 10,
+    /** Reunion-count non-retroactivity feature: the CURRENT threshold used to detect a NEW reunion going
+     * forward - replaces the old hardcoded StatsCalculator.REUNION_GAP_MILLIS (60 min) constant for all
+     * LIVE (post-migration) reunion detection. Read live, at the exact moment of each apart->together
+     * transition, by ProximityForegroundService.handleBecameTogether - see its own doc and
+     * [com.ssbmedia.twogether.data.datastore.ProximityPersistedState.reunionCount]'s doc for why this is
+     * a genuinely one-time, point-in-time decision per reunion rather than a value that could later be
+     * recomputed differently. CRITICAL: changing this must NEVER retroactively reinterpret history -
+     * already-recorded reunions stay counted forever exactly as they happened, under whatever threshold
+     * was in effect the moment each one occurred. That guarantee is what makes reunionCount a persisted,
+     * live-incrementing counter instead of a value derived by rescanning session history (the old
+     * StatsCalculator.countReunions design, which is fundamentally incompatible with a user-editable
+     * threshold - the moment the constant becomes editable, "rescan everything with today's value" starts
+     * silently reinterpreting history the user already celebrated under a different rule). */
+    val reunionThresholdMinutes: Int = 60
 )
 
 class SettingsStore(private val context: Context) {
@@ -524,6 +547,8 @@ class SettingsStore(private val context: Context) {
         val PENDING_UPDATE_APK_PATH = stringPreferencesKey("pending_update_apk_path")
         val PHOTO_REMINDER_MINUTES = intPreferencesKey("photo_reminder_minutes")
         val BIOMETRIC_UNLOCK_ENABLED = booleanPreferencesKey("biometric_unlock_enabled")
+        val SESSION_GRACE_MINUTES = intPreferencesKey("session_grace_minutes")
+        val REUNION_THRESHOLD_MINUTES = intPreferencesKey("reunion_threshold_minutes")
     }
 
     val settings: Flow<AppSettings> = context.settingsDs.data.map { p -> fromPreferences(p) }
@@ -558,7 +583,9 @@ class SettingsStore(private val context: Context) {
             pendingUpdateVersionName = p[Keys.PENDING_UPDATE_VERSION_NAME],
             pendingUpdateApkPath = p[Keys.PENDING_UPDATE_APK_PATH],
             photoReminderMinutes = p[Keys.PHOTO_REMINDER_MINUTES] ?: 15,
-            biometricUnlockEnabled = p[Keys.BIOMETRIC_UNLOCK_ENABLED] ?: false
+            biometricUnlockEnabled = p[Keys.BIOMETRIC_UNLOCK_ENABLED] ?: false,
+            sessionGraceMinutes = p[Keys.SESSION_GRACE_MINUTES] ?: 10,
+            reunionThresholdMinutes = p[Keys.REUNION_THRESHOLD_MINUTES] ?: 60
         )
     }
 
@@ -624,6 +651,26 @@ class SettingsStore(private val context: Context) {
      * than duplicating validation here too. */
     suspend fun setPhotoReminderMinutes(minutes: Int) {
         context.settingsDs.edit { it[Keys.PHOTO_REMINDER_MINUTES] = minutes }
+    }
+
+    /** Reunion-count non-retroactivity feature: persists the user's chosen together-timer grace window -
+     * see [AppSettings.sessionGraceMinutes]'s own doc. Same "trust the caller's own bound-checked input"
+     * pattern as setPhotoReminderMinutes/setDefaultSnoozeMinutes above. Purely a live setting - no
+     * historical data is ever derived from it, so unlike [setReunionThresholdMinutes] there is no
+     * retroactive-recomputation concern to document here. */
+    suspend fun setSessionGraceMinutes(minutes: Int) {
+        context.settingsDs.edit { it[Keys.SESSION_GRACE_MINUTES] = minutes }
+    }
+
+    /** Reunion-count non-retroactivity feature: persists the user's chosen reunion threshold - see
+     * [AppSettings.reunionThresholdMinutes]'s own doc for the full non-retroactivity guarantee. This
+     * setter does nothing beyond writing the new live value: it deliberately does NOT touch
+     * [ProximityPersistedState.reunionCount] or trigger any rescan of history. Changing this value only
+     * ever changes which threshold ProximityForegroundService.handleBecameTogether applies to the VERY
+     * NEXT apart->together transition it evaluates - every reunion already counted before this call stays
+     * counted exactly as it was, forever. */
+    suspend fun setReunionThresholdMinutes(minutes: Int) {
+        context.settingsDs.edit { it[Keys.REUNION_THRESHOLD_MINUTES] = minutes }
     }
 
     suspend fun setNotificationsEnabled(enabled: Boolean) {
@@ -798,7 +845,29 @@ data class ProximityPersistedState(
      * ProximityForegroundService.checkListReminders' doc. Reset to empty at exactly the same two points
      * reminderFiredForSession resets to false (a fresh together-transition, and an apart transition), so
      * a new continuous-together session always gets a clean slate of reminders to re-fire. */
-    val remindersFiredForSession: Set<String> = emptySet()
+    val remindersFiredForSession: Set<String> = emptySet(),
+    /** Reunion-count non-retroactivity feature (see [AppSettings.reunionThresholdMinutes]'s own doc for
+     * the full design rationale). This is NOT derived/recomputable - it is a persisted counter that
+     * ProximityForegroundService.handleBecameTogether increments by exactly 1, live, at the moment it
+     * determines a reunion just happened (evaluated against whatever [AppSettings.reunionThresholdMinutes]
+     * was in effect at that exact instant). StatsCalculator.compute() now takes this as a plain parameter
+     * instead of recomputing it by rescanning session history - see StatsCalculator.compute's own doc and
+     * the now-legacy-only StatsCalculator.countReunions/legacyReunionCountForBackfill. Starts at 0 for a
+     * brand new install; see [reunionCountBackfilled] for how an EXISTING install's already-accumulated
+     * history gets seeded into this exactly once, without ever being rescanned again after that. */
+    val reunionCount: Int = 0,
+    /** Reunion-count non-retroactivity feature: true once the one-time legacy backfill (see
+     * ProximityForegroundService.backfillReunionCountIfNeeded) has run for this install. Existing installs
+     * from before this feature shipped have real history that was ALWAYS evaluated under the single
+     * hardcoded StatsCalculator.REUNION_GAP_MILLIS (60 min) - genuinely unambiguous, since that's the only
+     * threshold that has ever applied to any of this app's history - so it's seeded into [reunionCount]
+     * exactly once by rescanning with that fixed legacy value. This flag is what makes that a ONE-TIME
+     * event: once true, it must never flip back or be re-evaluated, so a later live change to
+     * [AppSettings.reunionThresholdMinutes] can never re-trigger a rescan of history under the new value -
+     * that is exactly the retroactive-recomputation bug this whole feature exists to prevent. False on a
+     * brand new install too, but harmlessly so: a fresh install has no pre-existing history to backfill,
+     * the rescan finds 0 reunions, and the flag flips true on the very first restoreState() either way. */
+    val reunionCountBackfilled: Boolean = false
 )
 
 class ProximityStateStore(private val context: Context) {
@@ -814,6 +883,8 @@ class ProximityStateStore(private val context: Context) {
         val LAST_SEEN_ELAPSED_REALTIME = longPreferencesKey("last_seen_elapsed_realtime")
         val PENDING_APART_SINCE = longPreferencesKey("pending_apart_since")
         val LIST_REMINDERS_FIRED = stringSetPreferencesKey("list_reminders_fired_for_session")
+        val REUNION_COUNT = intPreferencesKey("reunion_count")
+        val REUNION_COUNT_BACKFILLED = booleanPreferencesKey("reunion_count_backfilled")
     }
 
     val state: Flow<ProximityPersistedState> = context.proximityDs.data.map { p ->
@@ -828,7 +899,9 @@ class ProximityStateStore(private val context: Context) {
             pendingReunionCelebration = p[Keys.PENDING_CELEBRATION] ?: false,
             lastSeenElapsedRealtime = p[Keys.LAST_SEEN_ELAPSED_REALTIME] ?: 0L,
             pendingApartSince = p[Keys.PENDING_APART_SINCE] ?: 0L,
-            remindersFiredForSession = p[Keys.LIST_REMINDERS_FIRED] ?: emptySet()
+            remindersFiredForSession = p[Keys.LIST_REMINDERS_FIRED] ?: emptySet(),
+            reunionCount = p[Keys.REUNION_COUNT] ?: 0,
+            reunionCountBackfilled = p[Keys.REUNION_COUNT_BACKFILLED] ?: false
         )
     }
 
@@ -858,7 +931,9 @@ class ProximityStateStore(private val context: Context) {
                 pendingReunionCelebration = p[Keys.PENDING_CELEBRATION] ?: false,
                 lastSeenElapsedRealtime = p[Keys.LAST_SEEN_ELAPSED_REALTIME] ?: 0L,
                 pendingApartSince = p[Keys.PENDING_APART_SINCE] ?: 0L,
-                remindersFiredForSession = p[Keys.LIST_REMINDERS_FIRED] ?: emptySet()
+                remindersFiredForSession = p[Keys.LIST_REMINDERS_FIRED] ?: emptySet(),
+                reunionCount = p[Keys.REUNION_COUNT] ?: 0,
+                reunionCountBackfilled = p[Keys.REUNION_COUNT_BACKFILLED] ?: false
             )
             val updated = transform(currentState)
             p[Keys.IS_TOGETHER] = updated.isTogether
@@ -872,6 +947,8 @@ class ProximityStateStore(private val context: Context) {
             p[Keys.LAST_SEEN_ELAPSED_REALTIME] = updated.lastSeenElapsedRealtime
             p[Keys.PENDING_APART_SINCE] = updated.pendingApartSince
             p[Keys.LIST_REMINDERS_FIRED] = updated.remindersFiredForSession
+            p[Keys.REUNION_COUNT] = updated.reunionCount
+            p[Keys.REUNION_COUNT_BACKFILLED] = updated.reunionCountBackfilled
         }
     }
 }

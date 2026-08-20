@@ -83,7 +83,7 @@ class CapsulesViewModel : ViewModel() {
                 // since this collector performs an irreversible unlockedAt write. Skip until a genuine
                 // persisted value has loaded rather than unlock off a possibly-inflated open session.
                 if (list.isEmpty() || state.lastSeenAt <= 0L) return@collect
-                val hours = StatsCalculator.compute(list, lastSeenAt = state.lastSeenAt).totalHoursAllTime.toFloat()
+                val hours = StatsCalculator.compute(list, lastSeenAt = state.lastSeenAt, reunionCount = state.reunionCount).totalHoursAllTime.toFloat()
                 val manualCredit = StatsCalculator.manualHoursCredit(list, lastSeenAt = state.lastSeenAt)
                 ServiceLocator.timeCapsuleRepository.unlockEligible(hours, manualCredit)
             }
@@ -124,8 +124,8 @@ fun CapsulesScreen(onBack: () -> Unit, onOpenCalendar: (jumpToEpochDay: Long) ->
     // TRUE total hours (manual backfill included, same number every other screen shows) - see
     // TimeCapsuleRepository.unlockEligible's doc for how each capsule's own effective threshold (below)
     // is what keeps this un-gameable, not filtering what counts toward the total.
-    val stats = remember(sessions, proximityState.lastSeenAt) {
-        StatsCalculator.compute(sessions, lastSeenAt = proximityState.lastSeenAt)
+    val stats = remember(sessions, proximityState.lastSeenAt, proximityState.reunionCount) {
+        StatsCalculator.compute(sessions, lastSeenAt = proximityState.lastSeenAt, reunionCount = proximityState.reunionCount)
     }
     val manualCredit = remember(sessions, proximityState.lastSeenAt) {
         StatsCalculator.manualHoursCredit(sessions, lastSeenAt = proximityState.lastSeenAt)

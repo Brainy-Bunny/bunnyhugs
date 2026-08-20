@@ -91,8 +91,8 @@ fun BadgesScreen(
     val unlockDates by vm.unlockDates.collectAsState()
     // lastSeenAt clamps an open session's live duration so badge progress can't be inflated by a
     // stale/orphaned open session - see StatsCalculator.effectiveOpenSessionEnd's doc.
-    val stats = remember(sessions, proximityState.lastSeenAt) {
-        StatsCalculator.compute(sessions, lastSeenAt = proximityState.lastSeenAt)
+    val stats = remember(sessions, proximityState.lastSeenAt, proximityState.reunionCount) {
+        StatsCalculator.compute(sessions, lastSeenAt = proximityState.lastSeenAt, reunionCount = proximityState.reunionCount)
     }
     val statuses = remember(stats) { BadgeCatalog.statuses(stats) }
     // Same DateRange lookups StatsScreen's own "Longest streak" cards already drive - see their doc there

@@ -100,6 +100,23 @@ class SettingsViewModel : ViewModel() {
         viewModelScope.launch { ServiceLocator.settingsStore.setPhotoReminderMinutes(minutes) }
     }
 
+    /** Reunion-count non-retroactivity feature: the "Together-timer grace window" row's Change dialog
+     * calls this - mirrors setPhotoReminderMinutes' own pattern exactly. See
+     * AppSettings.sessionGraceMinutes' own doc: purely a live setting, no retroactive-recomputation
+     * concern. */
+    fun setSessionGraceMinutes(minutes: Int) {
+        viewModelScope.launch { ServiceLocator.settingsStore.setSessionGraceMinutes(minutes) }
+    }
+
+    /** Reunion-count non-retroactivity feature: the "Reunion threshold" row's Change dialog calls this -
+     * mirrors setPhotoReminderMinutes' own pattern exactly. See AppSettings.reunionThresholdMinutes' own
+     * doc for the full non-retroactivity guarantee this deliberately does NOT (and must never) touch:
+     * this setter only ever changes the live value future transitions get evaluated against - it never
+     * rescans or rewrites ProximityPersistedState.reunionCount. */
+    fun setReunionThresholdMinutes(minutes: Int) {
+        viewModelScope.launch { ServiceLocator.settingsStore.setReunionThresholdMinutes(minutes) }
+    }
+
     fun setNotificationsEnabled(enabled: Boolean) {
         viewModelScope.launch { ServiceLocator.settingsStore.setNotificationsEnabled(enabled) }
     }
@@ -289,6 +306,8 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
     var showUnpairConfirm by remember { mutableStateOf(false) }
     var showSnoozeDialog by remember { mutableStateOf(false) }
     var showPhotoReminderDialog by remember { mutableStateOf(false) }
+    var showSessionGraceDialog by remember { mutableStateOf(false) }
+    var showReunionThresholdDialog by remember { mutableStateOf(false) }
     // Item 1 (deferred UX fix, 4-model advisory audit): "Paired with" row's edit dialog toggle.
     var showEditPartnerDialog by remember { mutableStateOf(false) }
 
@@ -400,6 +419,25 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                 }
                 SettingsRow(label = "Default snooze length", subtitle = "${settings.defaultSnoozeMinutes} minutes") {
                     TextButton(onClick = { showSnoozeDialog = true }) { Text("Change") }
+                }
+            }
+
+            // Reunion-count non-retroactivity feature: both rows below were previously hardcoded
+            // constants (ProximityForegroundService.SESSION_GRACE_MILLIS / StatsCalculator.
+            // REUNION_GAP_MILLIS) - now user-configurable, same "Change" dialog pattern as the
+            // Notifications section above.
+            SettingsSection(title = "Together timer & Reunions") {
+                SettingsRow(
+                    label = "Together-timer grace window",
+                    subtitle = "A brief BLE gap under ${settings.sessionGraceMinutes} min won't reset your together timer"
+                ) {
+                    TextButton(onClick = { showSessionGraceDialog = true }) { Text("Change") }
+                }
+                SettingsRow(
+                    label = "Reunion threshold",
+                    subtitle = "Apart ${settings.reunionThresholdMinutes}+ min counts as a real reunion. Changing this only affects future reunions, never past ones."
+                ) {
+                    TextButton(onClick = { showReunionThresholdDialog = true }) { Text("Change") }
                 }
             }
 
@@ -680,6 +718,22 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
         )
     }
 
+    if (showSessionGraceDialog) {
+        SessionGraceDialog(
+            current = settings.sessionGraceMinutes,
+            onDismiss = { showSessionGraceDialog = false },
+            onSave = { vm.setSessionGraceMinutes(it); showSessionGraceDialog = false }
+        )
+    }
+
+    if (showReunionThresholdDialog) {
+        ReunionThresholdDialog(
+            current = settings.reunionThresholdMinutes,
+            onDismiss = { showReunionThresholdDialog = false },
+            onSave = { vm.setReunionThresholdMinutes(it); showReunionThresholdDialog = false }
+        )
+    }
+
     if (showPinDialog) {
         SetPinDialog(onDismiss = { showPinDialog = false }, onSave = { pin, onResult -> vm.setPin(pin, onResult) })
     }
@@ -872,6 +926,72 @@ private fun PhotoReminderDialog(current: Int, onDismiss: () -> Unit, onSave: (In
                 Text(
                     "How long you've been together before Twogether nudges you to snap a photo.",
                     style = MaterialTheme.typography.bodySmall
+                )
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it.filter { c -> c.isDigit() }.take(4) },
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = { onSave((text.toIntOrNull() ?: current).coerceIn(1, 720)) }) { Text("Save") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
+/** Reunion-count non-retroactivity feature: "Together-timer grace window" - the configurable replacement
+ * for the old hardcoded ProximityForegroundService.SESSION_GRACE_MILLIS (10 min). Same input pattern as
+ * [PhotoReminderDialog]/[SnoozeDefaultDialog] above it. Purely a live setting (see
+ * AppSettings.sessionGraceMinutes' own doc) - no non-retroactivity copy needed here, unlike
+ * [ReunionThresholdDialog] below. */
+@Composable
+private fun SessionGraceDialog(current: Int, onDismiss: () -> Unit, onSave: (Int) -> Unit) {
+    var text by remember { mutableStateOf(current.toString()) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Together-timer grace window") },
+        text = {
+            Column {
+                Text(
+                    "If your phones briefly lose Bluetooth contact for less than this, your \"together\" timer keeps running instead of resetting.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it.filter { c -> c.isDigit() }.take(4) },
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = { onSave((text.toIntOrNull() ?: current).coerceIn(1, 720)) }) { Text("Save") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
+/** Reunion-count non-retroactivity feature: "Reunion threshold" - the configurable replacement for the
+ * old hardcoded StatsCalculator.REUNION_GAP_MILLIS (60 min). Same input pattern as [PhotoReminderDialog]/
+ * [SnoozeDefaultDialog] above it, but with an explicit non-retroactivity disclosure in the body copy -
+ * this is the one setting in the app where a user could reasonably (and wrongly) expect their whole
+ * history to be reinterpreted under the new value, so the UI says outright that it won't be. See
+ * AppSettings.reunionThresholdMinutes' own doc for the full guarantee this copy is describing. */
+@Composable
+private fun ReunionThresholdDialog(current: Int, onDismiss: () -> Unit, onSave: (Int) -> Unit) {
+    var text by remember { mutableStateOf(current.toString()) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Reunion threshold") },
+        text = {
+            Column {
+                Text(
+                    "How long you need to be apart before getting back together counts as a real reunion (and adds to your lifetime Reunions count).",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text(
+                    "This only changes future reunions — it never rewrites reunions you've already had, no matter how you change it.",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(top = 8.dp)
                 )
                 OutlinedTextField(
                     value = text,

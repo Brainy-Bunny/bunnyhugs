@@ -70,8 +70,8 @@ fun StatsScreen(
     val proximityState by vm.proximityState.collectAsState()
     // lastSeenAt clamps an open session's live duration to the last confirmed sighting + absence
     // timeout - see StatsCalculator.effectiveOpenSessionEnd's doc.
-    val stats = remember(sessions, proximityState.lastSeenAt) {
-        StatsCalculator.compute(sessions, lastSeenAt = proximityState.lastSeenAt)
+    val stats = remember(sessions, proximityState.lastSeenAt, proximityState.reunionCount) {
+        StatsCalculator.compute(sessions, lastSeenAt = proximityState.lastSeenAt, reunionCount = proximityState.reunionCount)
     }
     // Feature 1: the actual calendar-date span of the longest daily/weekly streak, so "Longest streak"
     // cards can jump Calendar there and highlight it - see StatsCalculator's doc for why this is a
