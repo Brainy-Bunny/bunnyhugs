@@ -509,6 +509,13 @@ data class AppSettings(
      * [reunionThresholdMinutes] below) changing it has no retroactive-recomputation concern at all: it
      * only ever affects the CURRENT apart/together decision, never a past one. */
     val sessionGraceMinutes: Int = 10,
+    /** Couple-level settings sync: wall-clock time [sessionGraceMinutes] was last changed, on EITHER
+     * phone - lets GattSyncManager do a plain per-field last-write-wins merge (adopt the remote's value
+     * only if its timestamp is newer than this phone's own) the same way every synced entity's `updatedAt`
+     * already works, without needing a new merge concept just for settings. 0L (never changed locally)
+     * always loses to any real remote timestamp, so a fresh install correctly adopts its partner's already-
+     * configured values on first sync rather than fighting them with an untouched default. */
+    val sessionGraceMinutesUpdatedAt: Long = 0L,
     /** Reunion-count non-retroactivity feature: the CURRENT threshold used to detect a NEW reunion going
      * forward - replaces the old hardcoded StatsCalculator.REUNION_GAP_MILLIS (60 min) constant for all
      * LIVE (post-migration) reunion detection. Read live, at the exact moment of each apart->together
@@ -522,7 +529,16 @@ data class AppSettings(
      * StatsCalculator.countReunions design, which is fundamentally incompatible with a user-editable
      * threshold - the moment the constant becomes editable, "rescan everything with today's value" starts
      * silently reinterpreting history the user already celebrated under a different rule). */
-    val reunionThresholdMinutes: Int = 60
+    val reunionThresholdMinutes: Int = 60,
+    /** Couple-level settings sync: same role as [sessionGraceMinutesUpdatedAt] above, for
+     * [reunionThresholdMinutes]. Only the live threshold value/timestamp are ever synced this way -
+     * [com.ssbmedia.twogether.data.datastore.ProximityPersistedState.reunionCount] itself (the actual
+     * count) is NEVER synced or merged between phones; each phone keeps counting its own independently
+     * detected reunions, exactly as it already did before this settings-sync feature existed. Syncing the
+     * THRESHOLD just means both phones agree on which future gaps qualify - it has no bearing on the
+     * non-retroactivity guarantee, since a synced threshold change is still only ever applied to each
+     * phone's own subsequent apart->together transitions, never rescanned into either phone's past. */
+    val reunionThresholdMinutesUpdatedAt: Long = 0L
 )
 
 class SettingsStore(private val context: Context) {
@@ -549,6 +565,8 @@ class SettingsStore(private val context: Context) {
         val BIOMETRIC_UNLOCK_ENABLED = booleanPreferencesKey("biometric_unlock_enabled")
         val SESSION_GRACE_MINUTES = intPreferencesKey("session_grace_minutes")
         val REUNION_THRESHOLD_MINUTES = intPreferencesKey("reunion_threshold_minutes")
+        val SESSION_GRACE_MINUTES_UPDATED_AT = longPreferencesKey("session_grace_minutes_updated_at")
+        val REUNION_THRESHOLD_MINUTES_UPDATED_AT = longPreferencesKey("reunion_threshold_minutes_updated_at")
     }
 
     val settings: Flow<AppSettings> = context.settingsDs.data.map { p -> fromPreferences(p) }
@@ -585,7 +603,9 @@ class SettingsStore(private val context: Context) {
             photoReminderMinutes = p[Keys.PHOTO_REMINDER_MINUTES] ?: 15,
             biometricUnlockEnabled = p[Keys.BIOMETRIC_UNLOCK_ENABLED] ?: false,
             sessionGraceMinutes = p[Keys.SESSION_GRACE_MINUTES] ?: 10,
-            reunionThresholdMinutes = p[Keys.REUNION_THRESHOLD_MINUTES] ?: 60
+            sessionGraceMinutesUpdatedAt = p[Keys.SESSION_GRACE_MINUTES_UPDATED_AT] ?: 0L,
+            reunionThresholdMinutes = p[Keys.REUNION_THRESHOLD_MINUTES] ?: 60,
+            reunionThresholdMinutesUpdatedAt = p[Keys.REUNION_THRESHOLD_MINUTES_UPDATED_AT] ?: 0L
         )
     }
 
@@ -659,7 +679,23 @@ class SettingsStore(private val context: Context) {
      * historical data is ever derived from it, so unlike [setReunionThresholdMinutes] there is no
      * retroactive-recomputation concern to document here. */
     suspend fun setSessionGraceMinutes(minutes: Int) {
-        context.settingsDs.edit { it[Keys.SESSION_GRACE_MINUTES] = minutes }
+        context.settingsDs.edit {
+            it[Keys.SESSION_GRACE_MINUTES] = minutes
+            it[Keys.SESSION_GRACE_MINUTES_UPDATED_AT] = System.currentTimeMillis()
+        }
+    }
+
+    /** Couple-level settings sync: applies a value that WON a last-write-wins merge against the partner's
+     * phone (see GattSyncManager's settings-sync wiring) - writes [remoteUpdatedAt] verbatim rather than
+     * stamping "now" the way [setSessionGraceMinutes] (a genuine local user edit) does, so this phone's own
+     * notion of "when was this last changed" stays correctly anchored to whichever phone actually changed
+     * it, not to whenever the sync happened to run. Never call this for a local user edit - use
+     * [setSessionGraceMinutes] for that. */
+    suspend fun applySyncedSessionGraceMinutes(minutes: Int, remoteUpdatedAt: Long) {
+        context.settingsDs.edit {
+            it[Keys.SESSION_GRACE_MINUTES] = minutes
+            it[Keys.SESSION_GRACE_MINUTES_UPDATED_AT] = remoteUpdatedAt
+        }
     }
 
     /** Reunion-count non-retroactivity feature: persists the user's chosen reunion threshold - see
@@ -670,7 +706,23 @@ class SettingsStore(private val context: Context) {
      * NEXT apart->together transition it evaluates - every reunion already counted before this call stays
      * counted exactly as it was, forever. */
     suspend fun setReunionThresholdMinutes(minutes: Int) {
-        context.settingsDs.edit { it[Keys.REUNION_THRESHOLD_MINUTES] = minutes }
+        context.settingsDs.edit {
+            it[Keys.REUNION_THRESHOLD_MINUTES] = minutes
+            it[Keys.REUNION_THRESHOLD_MINUTES_UPDATED_AT] = System.currentTimeMillis()
+        }
+    }
+
+    /** Couple-level settings sync: same role as [applySyncedSessionGraceMinutes] above, for
+     * [AppSettings.reunionThresholdMinutes]. Writes [remoteUpdatedAt] verbatim (never "now"). Never call
+     * this for a local user edit - use [setReunionThresholdMinutes] for that. Does NOT touch
+     * [ProximityPersistedState.reunionCount] - see that field's own doc and
+     * [AppSettings.reunionThresholdMinutesUpdatedAt]'s doc for why the count itself is never synced,
+     * only the threshold going forward. */
+    suspend fun applySyncedReunionThresholdMinutes(minutes: Int, remoteUpdatedAt: Long) {
+        context.settingsDs.edit {
+            it[Keys.REUNION_THRESHOLD_MINUTES] = minutes
+            it[Keys.REUNION_THRESHOLD_MINUTES_UPDATED_AT] = remoteUpdatedAt
+        }
     }
 
     suspend fun setNotificationsEnabled(enabled: Boolean) {

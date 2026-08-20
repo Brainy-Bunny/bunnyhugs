@@ -50,9 +50,10 @@ import java.security.SecureRandom
 /**
  * Tiny custom GATT protocol piggybacked on the proximity connection: exchange ONE combined JSON
  * envelope covering date ideas, closed together-sessions (Feature A), moment metadata + per-partner
- * moment notes (Feature D), milestones (Feature F), and per-partner calendar day notes (UX-FIX-PLAN.md
- * Phase 4 item 25) as chunked bytes over one write+notify characteristic, then merge each piece locally
- * with its own table-appropriate strategy. One side acts
+ * moment notes (Feature D), milestones (Feature F), per-partner calendar day notes (UX-FIX-PLAN.md
+ * Phase 4 item 25), and two couple-level settings (session grace window + reunion threshold, plain
+ * last-write-wins scalars rather than a table) as chunked bytes over one write+notify characteristic,
+ * then merge each piece locally with its own table-appropriate strategy. One side acts
  * as GATT server (passive), the other as GATT client (initiates) - the caller decides the role via a
  * deterministic tie-break so both phones never both try the same role.
  *
@@ -181,6 +182,17 @@ class GattSyncManager(
         // sessions/moments/milestones above (a capsule deleted on this device must propagate that
         // deletion, not just live capsules).
         obj.put("timeCapsules", serializeTimeCapsules(timeCapsuleRepository.getAllIncludingDeleted()))
+        // Couple-level settings sync: sessionGraceMinutes/reunionThresholdMinutes only - see
+        // AppSettings.sessionGraceMinutesUpdatedAt/reunionThresholdMinutesUpdatedAt's own docs for why a
+        // plain per-field last-write-wins merge (by these two timestamps) is the whole mechanism, same
+        // shape as every other synced entity's updatedAt. Deliberately NOT syncing
+        // ProximityPersistedState.reunionCount itself here or anywhere - each phone's own reunion count
+        // stays independently detected, only the threshold going forward is shared.
+        val localSettings = settingsStore.current()
+        obj.put("sessionGraceMinutes", localSettings.sessionGraceMinutes)
+        obj.put("sessionGraceMinutesUpdatedAt", localSettings.sessionGraceMinutesUpdatedAt)
+        obj.put("reunionThresholdMinutes", localSettings.reunionThresholdMinutes)
+        obj.put("reunionThresholdMinutesUpdatedAt", localSettings.reunionThresholdMinutesUpdatedAt)
         return obj.toString().toByteArray(Charsets.UTF_8)
     }
 
@@ -338,6 +350,25 @@ class GattSyncManager(
         val timeCapsulesArr = root.optJSONArray("timeCapsules")
         val timeCapsulesParsed = deserializeTimeCapsules(timeCapsulesArr, peerClockOffsetMillis)
         timeCapsuleRepository.mergeRemote(timeCapsulesParsed)
+        // Couple-level settings sync: plain per-field last-write-wins, same shape as every other
+        // entity's updatedAt merge in this function, just against two bare scalars instead of a table -
+        // see AppSettings.sessionGraceMinutesUpdatedAt/reunionThresholdMinutesUpdatedAt's own docs. A
+        // peer that never touched a setting sends its timestamp as 0L, which - after the same
+        // peerClockOffsetMillis correction every other timestamp here gets - naturally loses to any real
+        // local customization (real timestamp > 0) and naturally loses to another untouched local default
+        // (0 > 0 is false either way), so no special-casing of "never touched" is needed: the ordinary
+        // comparison already does the right thing in both directions.
+        val localSettingsForMerge = settingsStore.current()
+        val remoteSessionGraceMinutes = root.optInt("sessionGraceMinutes", -1)
+        val remoteSessionGraceUpdatedAt = root.optLong("sessionGraceMinutesUpdatedAt", 0L) - peerClockOffsetMillis
+        if (shouldAdoptSyncedSetting(remoteSessionGraceMinutes, remoteSessionGraceUpdatedAt, localSettingsForMerge.sessionGraceMinutesUpdatedAt)) {
+            settingsStore.applySyncedSessionGraceMinutes(remoteSessionGraceMinutes, remoteSessionGraceUpdatedAt)
+        }
+        val remoteReunionThresholdMinutes = root.optInt("reunionThresholdMinutes", -1)
+        val remoteReunionThresholdUpdatedAt = root.optLong("reunionThresholdMinutesUpdatedAt", 0L) - peerClockOffsetMillis
+        if (shouldAdoptSyncedSetting(remoteReunionThresholdMinutes, remoteReunionThresholdUpdatedAt, localSettingsForMerge.reunionThresholdMinutesUpdatedAt)) {
+            settingsStore.applySyncedReunionThresholdMinutes(remoteReunionThresholdMinutes, remoteReunionThresholdUpdatedAt)
+        }
         // MAJOR fix (ultimate-app-review, Fable F-4, assertion 6): even with the correction above, a
         // row can still be legitimately rejected (e.g. genuinely implausible even once corrected) - the
         // sync outcome must say so instead of an unqualified "Synced!" that hides real data loss.
@@ -542,6 +573,16 @@ class GattSyncManager(
      * it's retransmitted or how much time passes, since it's simply never merged in the first place. */
     private fun isPlausibleWireUpdatedAt(wireUpdatedAt: Long): Boolean =
         wireUpdatedAt <= System.currentTimeMillis() + MAX_CLOCK_SKEW_TOLERANCE_MILLIS
+
+    /** Couple-level settings sync: the whole last-write-wins decision for one scalar setting
+     * (sessionGraceMinutes/reunionThresholdMinutes), extracted as a pure function purely so it's directly
+     * unit-testable without a real SettingsStore/DataStore - see applyPayload's settings-sync block for
+     * the two call sites. [remoteUpdatedAt] must already be peerClockOffsetMillis-corrected by the
+     * caller, same as every other wire timestamp in this file. */
+    private fun shouldAdoptSyncedSetting(remoteMinutes: Int, remoteUpdatedAt: Long, localUpdatedAt: Long): Boolean =
+        remoteMinutes in 1..MAX_SETTINGS_MINUTES &&
+            isPlausibleWireUpdatedAt(remoteUpdatedAt) &&
+            remoteUpdatedAt > localUpdatedAt
 
     /** MAJOR fix (ultimate-app-review, post-restart full-scope round, Opus): see applyPayload's own doc
      * for why an unbounded peer clock offset let an obviously-broken peer clock launder its data into a
@@ -2994,6 +3035,13 @@ class GattSyncManager(
          * ceiling - kept the doc accurate so a future maintainer doesn't reintroduce clamping here by
          * reading stale reasoning. */
         const val MAX_CLOCK_SKEW_TOLERANCE_MILLIS = 5 * 60_000L
+
+        /** Couple-level settings sync: typo/forgery guardrail on an incoming
+         * sessionGraceMinutes/reunionThresholdMinutes value, same "generous but sane" reasoning as
+         * TimeCapsuleRepository.MAX_UNLOCK_AT_HOURS - 30 days comfortably covers any real relationship
+         * configuration (a reunion threshold of "we were apart a month" is already an extreme edge case)
+         * while still rejecting an obviously-forged or corrupted value rather than silently accepting it. */
+        const val MAX_SETTINGS_MINUTES = 30 * 24 * 60
 
         /** MAJOR fix (ultimate-app-review, post-restart full-scope round, Opus): caps how large a
          * peer-reported clock offset applyPayload's correction will ever act on - see its own doc for

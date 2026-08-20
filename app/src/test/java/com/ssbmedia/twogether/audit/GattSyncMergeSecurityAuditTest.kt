@@ -26,6 +26,7 @@ import kotlinx.coroutines.Dispatchers
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.mockito.Mockito.mock
@@ -79,6 +80,7 @@ class GattSyncMergeSecurityAuditTest {
         val paramTypes = args.map {
             when (it) {
                 is Long -> Long::class.javaPrimitiveType
+                is Int -> Int::class.javaPrimitiveType
                 is JSONArray, null -> JSONArray::class.java
                 else -> it::class.java
             }
@@ -466,5 +468,63 @@ class GattSyncMergeSecurityAuditTest {
     @Test
     fun `empty bytes are rejected, not thrown`() {
         assertTrue(!looksLikeImage(ByteArray(0)))
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Couple-level settings sync (sessionGraceMinutes/reunionThresholdMinutes): shouldAdoptSyncedSetting
+    // is the entire last-write-wins decision for both, so these tests cover it directly rather than
+    // going through the full buildPayload/applyPayload round trip (which needs a real DataStore-backed
+    // SettingsStore, not just a mock).
+    // ---------------------------------------------------------------------------------------------
+
+    private fun shouldAdoptSyncedSetting(manager: GattSyncManager, remoteMinutes: Int, remoteUpdatedAt: Long, localUpdatedAt: Long): Boolean =
+        invokePrivate(manager, "shouldAdoptSyncedSetting", remoteMinutes, remoteUpdatedAt, localUpdatedAt)
+
+    @Test
+    fun `a genuinely newer remote setting is adopted`() {
+        val now = System.currentTimeMillis()
+        assertTrue(shouldAdoptSyncedSetting(newManager(), 30, now, now - 60_000L))
+    }
+
+    @Test
+    fun `an older remote setting is NOT adopted - local keeps its own newer value`() {
+        val now = System.currentTimeMillis()
+        assertFalse(shouldAdoptSyncedSetting(newManager(), 30, now - 60_000L, now))
+    }
+
+    @Test
+    fun `two untouched defaults (both timestamp 0) never adopt either way`() {
+        assertFalse(shouldAdoptSyncedSetting(newManager(), 60, 0L, 0L))
+    }
+
+    @Test
+    fun `an untouched local default correctly adopts a partner's already-configured value`() {
+        val now = System.currentTimeMillis()
+        assertTrue(shouldAdoptSyncedSetting(newManager(), 45, now, 0L))
+    }
+
+    @Test
+    fun `a customized local value is never overwritten by a partner's untouched default`() {
+        val now = System.currentTimeMillis()
+        assertFalse(shouldAdoptSyncedSetting(newManager(), 60, 0L, now))
+    }
+
+    @Test
+    fun `a zero or negative minutes value is rejected regardless of timestamp`() {
+        val now = System.currentTimeMillis()
+        assertFalse(shouldAdoptSyncedSetting(newManager(), 0, now, 0L))
+        assertFalse(shouldAdoptSyncedSetting(newManager(), -5, now, 0L))
+    }
+
+    @Test
+    fun `a forged far-future minutes value beyond the typo guardrail is rejected`() {
+        val now = System.currentTimeMillis()
+        assertFalse(shouldAdoptSyncedSetting(newManager(), 999_999, now, 0L))
+    }
+
+    @Test
+    fun `a forged far-future updatedAt is rejected, not adopted`() {
+        val now = System.currentTimeMillis()
+        assertFalse(shouldAdoptSyncedSetting(newManager(), 30, now + 999_999_999_999L, 0L))
     }
 }
