@@ -3,9 +3,11 @@ package com.ssbmedia.twogether.ui.settings
 import android.content.Context
 import android.content.Intent
 import android.util.Log
+import androidx.biometric.BiometricManager
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -18,6 +20,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -43,11 +48,14 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -61,8 +69,10 @@ import com.ssbmedia.twogether.data.datastore.ThemeMode
 import com.ssbmedia.twogether.data.update.UpdateChecker
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.lock.AppLockManager
+import com.ssbmedia.twogether.lock.BiometricGate
 import com.ssbmedia.twogether.lock.PinUtil
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import com.ssbmedia.twogether.ui.onboarding.emojiOptions
 import com.ssbmedia.twogether.ui.update.UpdateInstallActivity
 import com.ssbmedia.twogether.util.DateFormats
 import com.ssbmedia.twogether.util.RelativeTime
@@ -100,6 +110,19 @@ class SettingsViewModel : ViewModel() {
 
     fun setAutoUpdateCheckEnabled(enabled: Boolean) {
         viewModelScope.launch { ServiceLocator.settingsStore.setAutoUpdateCheckEnabled(enabled) }
+    }
+
+    /** Item 1 (deferred UX fix, 4-model advisory audit): lets the "Paired with" row's edit dialog persist
+     * a changed partner name/emoji AFTER pairing - see PairingStore.updatePartnerInfo's own doc for why
+     * this is safe to write straight through with no other side effects (purely local display data). */
+    fun updatePartnerInfo(name: String, emoji: String) {
+        viewModelScope.launch { ServiceLocator.pairingStore.updatePartnerInfo(name, emoji) }
+    }
+
+    /** Item 5 (deferred UX fix, 4-model advisory audit): persists the opt-in/opt-out for the optional
+     * biometric-unlock alternative to the PIN screen - see AppSettings.biometricUnlockEnabled's own doc. */
+    fun setBiometricUnlockEnabled(enabled: Boolean) {
+        viewModelScope.launch { ServiceLocator.settingsStore.setBiometricUnlockEnabled(enabled) }
     }
 
     /** Launched on the app-scoped coroutine (same reasoning as backupNow() below - a mid-check screen
@@ -237,12 +260,25 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
     val vm: SettingsViewModel = viewModel(factory = SimpleViewModelFactory { SettingsViewModel() })
     val settings by vm.settings.collectAsState()
     var partnerName by remember { mutableStateOf("") }
+    // Item 1 (deferred UX fix, 4-model advisory audit): tracked alongside partnerName now that the "Paired
+    // with" row also displays and edits the emoji, not just the name - see EditPartnerInfoDialog below.
+    var partnerEmoji by remember { mutableStateOf("💕") }
     var pairingCode by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) {
         val info = ServiceLocator.pairingStore.current()
         partnerName = info.partnerName
+        partnerEmoji = info.partnerEmoji
         pairingCode = info.pairPlainCode.orEmpty()
+    }
+
+    val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
+    // Item 5 (deferred UX fix, 4-model advisory audit): live hardware/enrollment check, gating whether
+    // Settings even offers the biometric-unlock toggle at all - see BiometricGate.shouldShowToggle's own
+    // doc for why a device with no usable biometric enrollment never sees it (not even disabled).
+    val biometricCanAuthenticateResult = remember {
+        BiometricManager.from(context).canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK)
     }
 
     var showPinDialog by remember { mutableStateOf(false) }
@@ -253,8 +289,9 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
     var showUnpairConfirm by remember { mutableStateOf(false) }
     var showSnoozeDialog by remember { mutableStateOf(false) }
     var showPhotoReminderDialog by remember { mutableStateOf(false) }
+    // Item 1 (deferred UX fix, 4-model advisory audit): "Paired with" row's edit dialog toggle.
+    var showEditPartnerDialog by remember { mutableStateOf(false) }
 
-    val context = LocalContext.current
     var isBackingUp by remember { mutableStateOf(false) }
     var backupMessage by remember { mutableStateOf<String?>(null) }
     var isCheckingForUpdate by remember { mutableStateOf(false) }
@@ -385,10 +422,41 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                         TextButton(onClick = { pinVerifyPurpose = PinVerifyPurpose.CHANGE }) { Text("Change") }
                     }
                 }
+                // Item 5 (deferred UX fix, 4-model advisory audit): only ever shown when PIN lock is
+                // already on AND this device genuinely has usable biometric enrollment - see
+                // BiometricGate.shouldShowToggle's own doc. Default OFF (AppSettings.biometricUnlockEnabled),
+                // and PIN entry on the lock screen is never affected by this either way - see
+                // PinLockScreen's own doc for the always-available-fallback guarantee.
+                if (BiometricGate.shouldShowToggle(settings.pinEnabled, biometricCanAuthenticateResult)) {
+                    SettingsRow(
+                        label = "Unlock with fingerprint/face",
+                        subtitle = if (settings.biometricUnlockEnabled) {
+                            "On — offered as a faster alternative to your PIN"
+                        } else {
+                            "Off — PIN only"
+                        }
+                    ) {
+                        Switch(
+                            checked = settings.biometricUnlockEnabled,
+                            onCheckedChange = { vm.setBiometricUnlockEnabled(it) }
+                        )
+                    }
+                }
             }
 
             SettingsSection(title = "Pairing") {
-                SettingsRow(label = "Paired with", subtitle = partnerName.ifBlank { "—" }) {}
+                // Item 1 (deferred UX fix, 4-model advisory audit): partner name/emoji were set once during
+                // onboarding and read-only forever after - the edit icon opens EditPartnerInfoDialog below,
+                // which writes through PairingStore.updatePartnerInfo (purely local display data - see its
+                // own doc).
+                SettingsRow(
+                    label = "Paired with",
+                    subtitle = if (partnerName.isBlank()) "—" else "$partnerEmoji $partnerName"
+                ) {
+                    IconButton(onClick = { showEditPartnerDialog = true }) {
+                        Icon(Icons.Filled.Edit, contentDescription = "Edit partner name and emoji")
+                    }
+                }
                 if (pairingCode.isNotBlank()) {
                     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
                         Text("Your pairing code", style = MaterialTheme.typography.bodyLarge)
@@ -408,6 +476,40 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                                 fontWeight = FontWeight.Bold,
                                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp)
                             )
+                        }
+                        // Item 2 (deferred UX fix, 4-model advisory audit): copy/share for the pairing code
+                        // redisplayed here - same pattern as PairingScreen's own ShowCodeContent (the
+                        // original onboarding display), so a partner who lost their copy (reinstall,
+                        // factory reset) doesn't have to read this aloud or retype it by hand either.
+                        var justCopied by remember { mutableStateOf(false) }
+                        LaunchedEffect(justCopied) {
+                            if (justCopied) {
+                                delay(1500)
+                                justCopied = false
+                            }
+                        }
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.padding(top = 8.dp)
+                        ) {
+                            IconButton(onClick = {
+                                clipboardManager.setText(AnnotatedString(pairingCode))
+                                justCopied = true
+                            }) {
+                                Icon(
+                                    Icons.Filled.ContentCopy,
+                                    contentDescription = if (justCopied) "Copied" else "Copy pairing code"
+                                )
+                            }
+                            IconButton(onClick = {
+                                val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                                    type = "text/plain"
+                                    putExtra(Intent.EXTRA_TEXT, "Here's my Twogether pairing code: $pairingCode")
+                                }
+                                context.startActivity(Intent.createChooser(sendIntent, null))
+                            }) {
+                                Icon(Icons.Filled.Share, contentDescription = "Share pairing code")
+                            }
                         }
                     }
                 }
@@ -582,6 +684,23 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
         SetPinDialog(onDismiss = { showPinDialog = false }, onSave = { pin, onResult -> vm.setPin(pin, onResult) })
     }
 
+    // Item 1 (deferred UX fix, 4-model advisory audit): saves optimistically into partnerName/partnerEmoji
+    // right here (rather than waiting on a Flow re-collection) so the "Paired with" row reflects the edit
+    // the instant the dialog closes.
+    if (showEditPartnerDialog) {
+        EditPartnerInfoDialog(
+            currentName = partnerName,
+            currentEmoji = partnerEmoji,
+            onDismiss = { showEditPartnerDialog = false },
+            onSave = { name, emoji ->
+                partnerName = name
+                partnerEmoji = emoji
+                vm.updatePartnerInfo(name, emoji)
+                showEditPartnerDialog = false
+            }
+        )
+    }
+
     pinVerifyPurpose?.let { purpose ->
         VerifyCurrentPinDialog(
             currentPinHash = settings.pinHash,
@@ -666,6 +785,58 @@ private fun ThemeModeChip(label: String, selected: Boolean, modifier: Modifier =
         onClick = onClick,
         label = { Text(label) },
         modifier = modifier
+    )
+}
+
+/** Item 1 (deferred UX fix, 4-model advisory audit): the post-pairing "edit partner name/emoji" dialog -
+ * reuses [emojiOptions] (onboarding's own picker list, made `internal` for exactly this reuse - see its
+ * own doc) and mirrors PairingScreen's PartnerInfoContent's FlowRow-picker shape almost line-for-line,
+ * rather than inventing a second, potentially-drifting picker UI for structurally the same choice. */
+@Composable
+private fun EditPartnerInfoDialog(
+    currentName: String,
+    currentEmoji: String,
+    onDismiss: () -> Unit,
+    onSave: (name: String, emoji: String) -> Unit
+) {
+    var name by remember { mutableStateOf(currentName) }
+    var emoji by remember { mutableStateOf(currentEmoji) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Edit partner info") },
+        text = {
+            Column {
+                Text(
+                    "This is just for your phone — it's never sent to your partner's.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Their name") },
+                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp)
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    emojiOptions.forEach { option ->
+                        val selected = option == emoji
+                        Card(
+                            onClick = { emoji = option },
+                            colors = CardDefaults.cardColors(
+                                containerColor = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
+                            ),
+                            shape = MaterialTheme.shapes.medium
+                        ) {
+                            Text(option, fontSize = 22.sp, modifier = Modifier.padding(10.dp))
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(name, emoji) }) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
     )
 }
 

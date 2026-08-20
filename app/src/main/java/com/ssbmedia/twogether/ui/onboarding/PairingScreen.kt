@@ -15,19 +15,25 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -35,7 +41,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -52,6 +60,7 @@ import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
 import com.ssbmedia.twogether.util.Hashing
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -143,7 +152,10 @@ class PairingViewModel(private val pairingStore: PairingStore) : ViewModel() {
     }
 }
 
-private val emojiOptions = listOf("💕", "😍", "🥰", "💛", "🐢", "🐰", "🌸", "✨")
+// Item 1 (deferred UX fix, 4-model advisory audit): internal (module-wide), not private - SettingsScreen's
+// post-pairing "edit partner name/emoji" dialog reuses this exact same picker list rather than defining a
+// second, potentially-drifting copy of it.
+internal val emojiOptions = listOf("💕", "😍", "🥰", "💛", "🐢", "🐰", "🌸", "✨")
 
 /**
  * SECURITY fix: an independent testing round found that [PairingViewModel], scoped via `viewModel()` to
@@ -303,6 +315,19 @@ private fun LandingContent(
 
 @Composable
 private fun ShowCodeContent(code: String, onContinue: () -> Unit, onBack: () -> Unit) {
+    val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
+    // Item 2 (deferred UX fix, 4-model advisory audit): the pairing code used to be plain, unselectable
+    // text - no way to copy or share it, forcing the user to read it aloud or retype it by hand. justCopied
+    // gives brief "Copied!" confirmation feedback, same lightweight pattern SettingsScreen's own copy
+    // button below uses.
+    var justCopied by remember { mutableStateOf(false) }
+    LaunchedEffect(justCopied) {
+        if (justCopied) {
+            delay(1500)
+            justCopied = false
+        }
+    }
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
         Text("Your pairing code", style = MaterialTheme.typography.titleMedium)
         Text(
@@ -322,7 +347,29 @@ private fun ShowCodeContent(code: String, onContinue: () -> Unit, onBack: () -> 
                 modifier = Modifier.padding(horizontal = 32.dp, vertical = 24.dp)
             )
         }
-        Spacer(modifier = Modifier.height(32.dp))
+        Spacer(modifier = Modifier.height(12.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            OutlinedButton(onClick = {
+                clipboardManager.setText(AnnotatedString(code))
+                justCopied = true
+            }) {
+                Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(if (justCopied) "Copied!" else "Copy")
+            }
+            OutlinedButton(onClick = {
+                val sendIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(android.content.Intent.EXTRA_TEXT, "Here's my Twogether pairing code: $code")
+                }
+                context.startActivity(android.content.Intent.createChooser(sendIntent, null))
+            }) {
+                Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Share")
+            }
+        }
+        Spacer(modifier = Modifier.height(24.dp))
         Button(onClick = onContinue, modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.large) {
             Text("Continue")
         }

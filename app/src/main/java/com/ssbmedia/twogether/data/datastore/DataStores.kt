@@ -242,6 +242,20 @@ class PairingStore(private val context: Context) {
         }
     }
 
+    /** Item 1 (deferred UX fix, 4-model advisory audit): lets Settings edit the locally-displayed partner
+     * name/emoji AFTER pairing - previously set once during onboarding (savePairing above) and read-only
+     * forever after. Local display data only, not synced/security-relevant (see [PairingInfo.partnerName]/
+     * [PairingInfo.partnerEmoji]'s own doc - each side's copy of "what I call my partner" is purely a
+     * per-device label, never exchanged over BLE), so this deliberately touches ONLY those two fields -
+     * secret hash, plain code, pairedAt, and the pinned partner device id are all left completely
+     * untouched. Mirrors savePairing()'s own trim/blank-fallback normalization for these two fields. */
+    suspend fun updatePartnerInfo(partnerName: String, partnerEmoji: String) {
+        context.pairingDs.edit { p ->
+            p[Keys.PARTNER_NAME] = partnerName.trim().ifBlank { "Your Person" }
+            p[Keys.PARTNER_EMOJI] = partnerEmoji.ifBlank { "💕" }
+        }
+    }
+
     /** SECURITY: trust-on-first-use device pinning - see [PairingInfo.pinnedPartnerDeviceId]'s doc for
      * why this exists. Called by GattSyncManager.applyPayload right after the FIRST sync under the
      * current pairing completes successfully; a no-op (first writer wins) on every call after that, so a
@@ -477,7 +491,15 @@ data class AppSettings(
      * Notifications.showPhotoReminder's title text). Settings' "Photo reminder interval" row lets the
      * user change this; the notification's own title text is now built from this value too, rather than
      * a hardcoded "15". */
-    val photoReminderMinutes: Int = 15
+    val photoReminderMinutes: Int = 15,
+    /** Item 5 (deferred UX fix, 4-model advisory audit): OPTIONAL biometric (fingerprint/face) unlock as a
+     * faster alternative alongside the PIN screen - see [com.ssbmedia.twogether.lock.BiometricGate]'s own
+     * doc for the gating logic and [com.ssbmedia.twogether.ui.lock.PinLockScreen] for where this is
+     * actually offered. Defaults OFF: this is a genuinely new permission-adjacent surface, so it must be
+     * an explicit opt-in, never silently on. Never a REPLACEMENT for the PIN - PIN entry stays available
+     * unconditionally regardless of this setting, since biometric auth can always fail (wet fingers, no
+     * enrollment, hardware removed) and there must always be a way in. */
+    val biometricUnlockEnabled: Boolean = false
 )
 
 class SettingsStore(private val context: Context) {
@@ -501,6 +523,7 @@ class SettingsStore(private val context: Context) {
         val PENDING_UPDATE_VERSION_NAME = stringPreferencesKey("pending_update_version_name")
         val PENDING_UPDATE_APK_PATH = stringPreferencesKey("pending_update_apk_path")
         val PHOTO_REMINDER_MINUTES = intPreferencesKey("photo_reminder_minutes")
+        val BIOMETRIC_UNLOCK_ENABLED = booleanPreferencesKey("biometric_unlock_enabled")
     }
 
     val settings: Flow<AppSettings> = context.settingsDs.data.map { p -> fromPreferences(p) }
@@ -534,7 +557,8 @@ class SettingsStore(private val context: Context) {
             pendingUpdateVersionCode = p[Keys.PENDING_UPDATE_VERSION_CODE] ?: 0,
             pendingUpdateVersionName = p[Keys.PENDING_UPDATE_VERSION_NAME],
             pendingUpdateApkPath = p[Keys.PENDING_UPDATE_APK_PATH],
-            photoReminderMinutes = p[Keys.PHOTO_REMINDER_MINUTES] ?: 15
+            photoReminderMinutes = p[Keys.PHOTO_REMINDER_MINUTES] ?: 15,
+            biometricUnlockEnabled = p[Keys.BIOMETRIC_UNLOCK_ENABLED] ?: false
         )
     }
 
@@ -617,7 +641,21 @@ class SettingsStore(private val context: Context) {
         context.settingsDs.edit {
             it.remove(Keys.PIN_HASH)
             it[Keys.PIN_ENABLED] = false
+            // Item 5: biometric unlock is only ever meaningful as a PIN-screen alternative - turning PIN
+            // lock off entirely must also turn it off, so it can't linger enabled+orphaned (no PIN screen
+            // left for it to ever be offered on) only to silently reappear if PIN lock is turned back on
+            // later without the user having consciously re-opted-in.
+            it[Keys.BIOMETRIC_UNLOCK_ENABLED] = false
         }
+    }
+
+    /** Item 5 (deferred UX fix, 4-model advisory audit): persists the user's opt-in/opt-out for the
+     * optional biometric-unlock alternative to the PIN screen - see [AppSettings.biometricUnlockEnabled]'s
+     * own doc. Settings' toggle for this only ever shows when [com.ssbmedia.twogether.lock.BiometricGate]
+     * confirms the device actually has usable biometric enrollment, but this setter itself does no such
+     * check - it trusts the caller the same way setDefaultSnoozeMinutes/setPhotoReminderMinutes do. */
+    suspend fun setBiometricUnlockEnabled(enabled: Boolean) {
+        context.settingsDs.edit { it[Keys.BIOMETRIC_UNLOCK_ENABLED] = enabled }
     }
 
     suspend fun setLastSyncAt(time: Long) {

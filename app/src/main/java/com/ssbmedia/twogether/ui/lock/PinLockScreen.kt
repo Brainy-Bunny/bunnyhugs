@@ -1,5 +1,7 @@
 package com.ssbmedia.twogether.ui.lock
 
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,6 +16,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -21,13 +24,18 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 import com.ssbmedia.twogether.ServiceLocator
+import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.lock.AppLockManager
+import com.ssbmedia.twogether.lock.BiometricGate
 import com.ssbmedia.twogether.lock.PinUtil
 import com.ssbmedia.twogether.util.Hashing
 import kotlinx.coroutines.Dispatchers
@@ -38,6 +46,7 @@ import kotlinx.coroutines.withContext
 @Composable
 fun PinLockScreen() {
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
     var pin by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     var showForgot by remember { mutableStateOf(false) }
@@ -45,6 +54,59 @@ fun PinLockScreen() {
     // on a wrong PIN, recording two failed attempts for one user intent) - see the matching fix in
     // SettingsScreen's VerifyCurrentPinDialog for the same reasoning.
     var isVerifying by remember { mutableStateOf(false) }
+
+    // Item 5 (deferred UX fix, 4-model advisory audit): OPTIONAL biometric unlock, offered as a FASTER
+    // alternative alongside PIN entry below - never a replacement, see BiometricGate's own doc. Re-checks
+    // LIVE hardware/enrollment state every time this screen appears (not just the persisted toggle), so a
+    // device that had biometrics enrolled when the setting was turned on, then later had every
+    // fingerprint/face removed, safely and silently falls back to PIN-only rather than ever launching a
+    // prompt that can no longer succeed. activity is null only if this composable is somehow hosted
+    // outside MainActivity (never happens in production - PinLockScreen is only ever shown from
+    // MainActivity's own top-level `when`, see its doc) - canOfferBiometric below simply stays false in
+    // that case, same as "no biometric hardware".
+    val settings by ServiceLocator.settingsStore.settings.collectAsState(initial = AppSettings())
+    val activity = context as? FragmentActivity
+    val biometricCanAuthenticateResult = remember {
+        BiometricManager.from(context).canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK)
+    }
+    val canOfferBiometric = activity != null &&
+        BiometricGate.canOfferBiometric(settings.biometricUnlockEnabled, biometricCanAuthenticateResult)
+
+    fun launchBiometricPrompt() {
+        val act = activity ?: return
+        val executor = ContextCompat.getMainExecutor(context)
+        val prompt = BiometricPrompt(
+            act,
+            executor,
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    AppLockManager.unlock()
+                }
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                    // User cancelled, tapped "Use PIN instead", hit their own OS-level biometric lockout,
+                    // or any other terminal failure - the PIN field below is never blocked by this, so
+                    // there's always still a way in; nothing to surface here.
+                }
+                override fun onAuthenticationFailed() {
+                    // A single non-matching biometric read (wrong finger, etc) - not terminal, the system
+                    // prompt itself keeps offering retries; nothing to do here either.
+                }
+            }
+        )
+        val promptInfo = BiometricPrompt.PromptInfo.Builder()
+            .setTitle("Unlock Twogether")
+            .setSubtitle("Use your fingerprint or face")
+            .setNegativeButtonText("Use PIN instead")
+            .build()
+        prompt.authenticate(promptInfo)
+    }
+
+    // Auto-triggers once each time biometric becomes available, so it really is the FASTER path (no extra
+    // tap needed on the common case) - re-arms if it flips off then back on (e.g. this setting was toggled
+    // on elsewhere mid-session), harmless either way.
+    LaunchedEffect(canOfferBiometric) {
+        if (canOfferBiometric) launchBiometricPrompt()
+    }
 
     // Basic throttle feedback - see AppLockManager.recordFailedPinAttempt's doc. Ticks once a second
     // only while actually locked out, purely so the countdown text stays live; harmless/no-op otherwise.
@@ -74,7 +136,15 @@ fun PinLockScreen() {
         if (!showForgot) {
             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
                 Text("🔒", fontSize = 48.sp)
-                Text("Enter your PIN", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp, bottom = 20.dp))
+                Text("Enter your PIN", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp, bottom = 4.dp))
+                // Item 5: manual retrigger for anyone who dismissed the auto-launched prompt above (or
+                // whose first attempt failed/errored) - PIN entry right below remains the fallback either
+                // way, this is purely a faster alternative path, never gating anything.
+                if (canOfferBiometric) {
+                    TextButton(onClick = { launchBiometricPrompt() }, modifier = Modifier.padding(bottom = 12.dp)) {
+                        Text("Use fingerprint / face instead")
+                    }
+                }
                 OutlinedTextField(
                     value = pin,
                     onValueChange = { pin = it.filter { c -> c.isDigit() }.take(6); error = null },

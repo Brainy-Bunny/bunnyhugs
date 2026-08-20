@@ -122,6 +122,19 @@ dependencies {
 
     implementation("io.coil-kt:coil-compose:2.7.0")
 
+    // Item 5 (deferred UX fix, 4-model advisory audit): optional biometric unlock on the PIN screen.
+    // androidx.biometric 1.1.0 is the standard stable release. BiometricPrompt's constructor in this
+    // version requires a FragmentActivity (or Fragment) host - there is no ComponentActivity overload
+    // until the still-unreleased-stable 1.2.0-alpha line - so MainActivity was switched from
+    // ComponentActivity to FragmentActivity (a strict superset: FragmentActivity extends ComponentActivity,
+    // so every existing activity-compose/registerForActivityResult API MainActivity already used keeps
+    // working unchanged). fragment-ktx is declared explicitly (rather than relying on it transitively via
+    // biometric) because AndroidX artifacts commonly declare their own dependencies as `implementation`,
+    // not `api`, in their Gradle module metadata - which would make FragmentActivity resolve at runtime
+    // but fail to even COMPILE against from this module without an explicit dependency of our own.
+    implementation("androidx.biometric:biometric:1.1.0")
+    implementation("androidx.fragment:fragment-ktx:1.8.4")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation("junit:junit:4.13.2")

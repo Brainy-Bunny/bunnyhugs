@@ -3,7 +3,6 @@ package com.ssbmedia.twogether
 import android.content.Intent
 import android.os.Bundle
 import android.view.KeyEvent
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -27,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.text.font.FontWeight
 import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 import com.ssbmedia.twogether.ble.BlePermissions
 import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.data.datastore.PairingInfo
@@ -43,7 +43,12 @@ import com.ssbmedia.twogether.ui.onboarding.PairingScreen
 import com.ssbmedia.twogether.ui.theme.TwogetherTheme
 import com.ssbmedia.twogether.util.VolumeShutterKeyHandler
 
-class MainActivity : ComponentActivity() {
+// Item 5 (deferred UX fix, 4-model advisory audit): FragmentActivity, not ComponentActivity - required by
+// androidx.biometric.BiometricPrompt's 1.1.0 constructor (see PinLockScreen's own doc + build.gradle.kts's
+// comment on the biometric dependency for why). FragmentActivity extends ComponentActivity, so every
+// existing API this class already used (setContent, registerForActivityResult, dispatchKeyEvent,
+// onNewIntent) keeps working completely unchanged.
+class MainActivity : FragmentActivity() {
 
     private val cameraTrigger = mutableIntStateOf(0)
     private val milestoneTrigger = mutableStateOf<String?>(null)
