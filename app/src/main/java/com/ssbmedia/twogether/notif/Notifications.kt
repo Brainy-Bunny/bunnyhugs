@@ -6,6 +6,8 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
+import android.media.RingtoneManager
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import com.ssbmedia.twogether.MainActivity
@@ -18,7 +20,23 @@ import java.io.File
 
 object Notifications {
     const val CHANNEL_STATUS = "status"
-    const val CHANNEL_REMINDERS = "reminders"
+    /** UX-FIX-PLAN.md Phase 3 item 23: bumped from IMPORTANCE_DEFAULT (no DND bypass, default sound) to a
+     * genuinely loud, `setBypassDnd(true)` channel - the whole point of a "you've been together Xh, snap a
+     * photo?" or list/item reminder is to actually be noticed, not sit silently in the shade the way a
+     * DEFAULT-importance notification can under a phone's Do Not Disturb schedule. Exactly the same
+     * "channel importance is immutable once created on a real device, so the id itself must change" problem
+     * CHANNEL_UPDATES already solved below - see its own doc for the full explanation. CHANNEL_REMINDERS_
+     * LEGACY (the old "reminders" id) is deleted in ensureChannels() below so upgrading users don't end up
+     * with a dead duplicate channel sitting in system notification settings. Note: `setBypassDnd(true)` on
+     * the channel is only actually honored once the user has ALSO separately granted this app Do Not
+     * Disturb access (ACCESS_NOTIFICATION_POLICY / NotificationManager.isNotificationPolicyAccessGranted) -
+     * see util/DndAccess.kt and the item-22 notification-inbox panel, which explicitly asks for that grant
+     * rather than silently relying on this flag alone. */
+    const val CHANNEL_REMINDERS = "reminders_v2"
+    /** The pre-item-23 channel id (IMPORTANCE_DEFAULT, no DND bypass) - see CHANNEL_REMINDERS' own doc for
+     * why this can't just be upgraded in place. Deleted in ensureChannels() on every app start;
+     * deleteNotificationChannel is a harmless no-op for an install that never had this channel. */
+    private const val CHANNEL_REMINDERS_LEGACY = "reminders"
     const val CHANNEL_MILESTONES = "milestones"
     /** Item 14 (update-nag reach fix): bumped from IMPORTANCE_DEFAULT to IMPORTANCE_HIGH so a granted-
      * permission "Update available" notification actually heads-up-pops instead of sitting quietly in
@@ -104,10 +122,25 @@ object Notifications {
             description = "Shows whether you two are currently together"
             setShowBadge(false)
         }
+        // UX-FIX-PLAN.md Phase 3 item 23: IMPORTANCE_HIGH + setBypassDnd(true) + a real vibration pattern +
+        // explicit AudioAttributes, so this channel actually heads-up-pops and can ring through Do Not
+        // Disturb (once the user has separately granted DND access - see CHANNEL_REMINDERS' own doc) -
+        // instead of the old IMPORTANCE_DEFAULT channel that could sit silently unnoticed in the shade.
         val reminderChannel = NotificationChannel(
-            CHANNEL_REMINDERS, "Photo reminders", NotificationManager.IMPORTANCE_DEFAULT
+            CHANNEL_REMINDERS, "Photo & list reminders", NotificationManager.IMPORTANCE_HIGH
         ).apply {
-            description = "A gentle nudge to snap a photo when you've been together a while"
+            description = "A gentle but LOUD nudge to snap a photo or check a reminder when you've been " +
+                "together a while - rings even during Do Not Disturb if you've granted that access"
+            enableVibration(true)
+            vibrationPattern = longArrayOf(0, 250, 250, 250)
+            setBypassDnd(true)
+            setSound(
+                RingtoneManager.getActualDefaultRingtoneUri(context, RingtoneManager.TYPE_NOTIFICATION),
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_NOTIFICATION_EVENT)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build()
+            )
         }
         val milestoneChannel = NotificationChannel(
             CHANNEL_MILESTONES, "Anniversaries & milestones", NotificationManager.IMPORTANCE_DEFAULT
@@ -147,6 +180,9 @@ object Notifications {
         // alongside the new CHANNEL_UPDATES one. No-op if it was never created (fresh install) or was
         // already deleted on a previous app start.
         manager.deleteNotificationChannel(CHANNEL_UPDATES_LEGACY)
+        // See CHANNEL_REMINDERS_LEGACY's doc - same reasoning, for the old DEFAULT-importance "reminders"
+        // channel this item-23 loud/DND-bypassing channel replaces.
+        manager.deleteNotificationChannel(CHANNEL_REMINDERS_LEGACY)
     }
 
     fun buildStatusNotification(context: Context, contentText: String): Notification {
@@ -203,7 +239,12 @@ object Notifications {
             .setAutoCancel(true)
             .setContentIntent(cameraPendingIntent)
             .addAction(0, "Snooze", snoozePendingIntent)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            // UX-FIX-PLAN.md Phase 3 item 23: CATEGORY_REMINDER (tells the system/OEM what KIND of
+            // notification this is, independent of the channel's own importance) + PRIORITY_HIGH (the
+            // pre-O fallback NotificationCompat still reads on API < 26, harmless no-op on this app's real
+            // minSdk 26+ where the channel's own IMPORTANCE_HIGH governs instead).
+            .setCategory(NotificationCompat.CATEGORY_REMINDER)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
             .build()
 
         // On API 33+, notify() without POST_NOTIFICATIONS granted just silently never shows anything -
@@ -248,7 +289,8 @@ object Notifications {
             .setContentText("\"$ideaText\" — from your $listName list")
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setCategory(NotificationCompat.CATEGORY_REMINDER)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
             .build()
 
         manager.notify(notificationId, notification)
@@ -281,7 +323,8 @@ object Notifications {
             .setContentText("You've been together a while — take a look?")
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setCategory(NotificationCompat.CATEGORY_REMINDER)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
             .build()
 
         manager.notify(notificationId, notification)

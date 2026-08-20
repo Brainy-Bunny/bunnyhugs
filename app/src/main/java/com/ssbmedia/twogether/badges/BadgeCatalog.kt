@@ -14,6 +14,36 @@ data class Badge(
 
 data class BadgeStatus(val badge: Badge, val unlocked: Boolean, val progressLabel: String)
 
+/**
+ * UX-FIX-PLAN.md Phase 3 item 21: one row of the Badges screen's 4 headline progress bars (Hours/Daily
+ * streak/Weekly streak/Reunions - deliberately NOT Perfect weeks, which stays grid-only, see [BadgeCatalog.CAPS]'s
+ * doc). Pulled out as a plain, non-Compose data class - computed once by [BadgeCatalog.progressRows] - so
+ * the exact same threshold/fraction/caption math powers BOTH BadgesScreen's full 4-bar section AND Home's
+ * single compact "closest to your next badge" card ([BadgeCatalog.closestToNextBadge]), instead of Home
+ * growing a second, independently-derived copy of this logic that could silently drift from the real one.
+ */
+data class BadgeProgressRow(
+    val type: BadgeType,
+    val emoji: String,
+    val label: String,
+    /** True once this category has reached its absolute ceiling (see [BadgeCatalog.CAPS]) - there's no
+     * "next badge" left, so [fraction] is always 1f and [caption] is the maxed-out celebration line rather
+     * than a countdown. */
+    val maxed: Boolean,
+    /** Fraction of the way from [prevThreshold] to [nextThreshold], clamped to [0,1]. Always 1f when
+     * [maxed]. Used both to size the progress bar AND (via [BadgeCatalog.closestToNextBadge]) to decide
+     * which of the 4 categories is "closest" for Home's single compact card - the categories track wildly
+     * different units (hours/days/weeks/reunions), so this normalized fraction is the only apples-to-apples
+     * way to compare "how close" across them. */
+    val fraction: Float,
+    val prevThreshold: Int,
+    val nextThreshold: Int,
+    /** Always a Double (even for the 3 whole-number categories) - see [BadgeProgressBarRow]'s own doc in
+     * BadgesScreen.kt for why: Hours is the one category genuinely tracked as a fraction of an hour. */
+    val current: Double,
+    val caption: String
+)
+
 object BadgeCatalog {
 
     /** The curated, hand-picked thresholds each badge type started with - the starting point
@@ -181,4 +211,46 @@ object BadgeCatalog {
         val prev = thresholds.lastOrNull { it <= current } ?: 0
         return prev to next
     }
+
+    /** One [BadgeProgressRow] for [type] against the couple's [stats] - shared by [progressRows] (the
+     * fixed 4-row list) and unit tests. Deliberately takes the already-computed `current` value (Double,
+     * see [BadgeProgressRow.current]'s doc) rather than re-deriving it from [type], since HOURS is tracked
+     * as a fraction (stats.totalHoursAllTime) while the other 3 categories use their own whole-number int
+     * field - the caller already knows which. */
+    private fun progressRow(type: BadgeType, emoji: String, label: String, current: Double, singularUnit: String): BadgeProgressRow {
+        val currentInt = current.toInt()
+        if (isMaxed(type, currentInt)) {
+            val badge = maxedBadge(type)!!
+            return BadgeProgressRow(type, badge.emoji, label, maxed = true, fraction = 1f, prevThreshold = 0, nextThreshold = 0, current = current, caption = "${badge.title} 💛")
+        }
+        val (prev, next) = nextAndPrevThreshold(type, currentInt)
+        val span = (next - prev).coerceAtLeast(1)
+        val fraction = ((current - prev) / span).toFloat().coerceIn(0f, 1f)
+        val caption = if (type == BadgeType.HOURS) {
+            "${"%.1f".format((next - current).coerceAtLeast(0.0))}h to your next badge"
+        } else {
+            val remaining = (next - currentInt).coerceAtLeast(0)
+            // BUG fix (carried over from the original inline version): "1 days/weeks/reunions to your
+            // next badge" was reachable whenever exactly 1 more unit would complete the badge.
+            "$remaining $singularUnit" + (if (remaining == 1) "" else "s") + " to your next badge"
+        }
+        return BadgeProgressRow(type, emoji, label, maxed = false, fraction = fraction, prevThreshold = prev, nextThreshold = next, current = current, caption = caption)
+    }
+
+    /** The 4 headline progress rows, in the fixed order the Badges screen's own section has always shown
+     * them (Hours, Days streak, Week streak, Reunions) - see [BadgeProgressRow]'s doc. */
+    fun progressRows(stats: TogetherStats): List<BadgeProgressRow> = listOf(
+        progressRow(BadgeType.HOURS, "💛", "Hours", stats.totalHoursAllTime, "hour"),
+        progressRow(BadgeType.DAILY_STREAK, "🔥", "Days", stats.longestDailyStreak.toDouble(), "day"),
+        progressRow(BadgeType.WEEKLY_STREAK, "🌟", "Week Streak", stats.longestWeeklyStreak.toDouble(), "week"),
+        progressRow(BadgeType.REUNIONS, "🤗", "Reunions", stats.reunionCount.toDouble(), "reunion")
+    )
+
+    /** UX-FIX-PLAN.md Phase 3 item 21: which single category is closest to unlocking its next badge, for
+     * Home's compact "next badge" card - the one with the HIGHEST [BadgeProgressRow.fraction] among the
+     * not-yet-maxed rows (fraction is the only fair cross-category comparison, see that field's own doc).
+     * A tie keeps the first (Hours-first) row, matching Kotlin's [maxByOrNull] semantics. Returns null only
+     * if every category is maxed out - genuinely nothing left to show a "closest" countdown for. */
+    fun closestToNextBadge(rows: List<BadgeProgressRow>): BadgeProgressRow? =
+        rows.filter { !it.maxed }.maxByOrNull { it.fraction }
 }

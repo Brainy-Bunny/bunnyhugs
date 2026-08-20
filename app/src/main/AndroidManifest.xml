@@ -28,6 +28,14 @@
          granted by this manifest declaration. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- UX-FIX-PLAN.md Phase 3 item 23: normal permission (no runtime grant dialog) that lets this app
+         check NotificationManager.isNotificationPolicyAccessGranted() and launch
+         Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS - the special access screen the user must
+         separately toggle on for CHANNEL_REMINDERS' setBypassDnd(true) to actually take effect (see
+         util/DndAccess.kt and notif/Notifications.kt's CHANNEL_REMINDERS doc). The real grant is still a
+         user-facing system settings toggle, not silently granted by this manifest declaration. -->
+    <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
+
     <!-- Auto-update feature ONLY: this app is otherwise fully offline by design (no accounts, no
          servers - see the "About" text in Settings). This single deliberate exception lets
          UpdateChecker do one read-only GET against the public GitHub Releases API and, if a newer

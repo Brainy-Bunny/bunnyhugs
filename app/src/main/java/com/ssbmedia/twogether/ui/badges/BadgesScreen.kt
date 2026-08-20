@@ -225,73 +225,24 @@ private fun BadgeProgressBarsSection(stats: TogetherStats) {
             modifier = Modifier.padding(16.dp).fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Hours is the one category tracked as a fraction rather than a whole count, so it's the
-            // only row whose current value/caption keep 1-decimal precision instead of rounding to a
-            // whole number - see BadgeProgressBarRow's doc.
-            val hoursCurrent = stats.totalHoursAllTime.toInt()
-            if (BadgeCatalog.isMaxed(BadgeType.HOURS, hoursCurrent)) {
-                val badge = BadgeCatalog.maxedBadge(BadgeType.HOURS)!!
-                BadgeMaxedRow(emoji = badge.emoji, label = "Hours", caption = "${badge.title} 💛")
-            } else {
-                val (hoursPrev, hoursNext) = BadgeCatalog.nextAndPrevThreshold(BadgeType.HOURS, hoursCurrent)
-                BadgeProgressBarRow(
-                    emoji = "💛",
-                    label = "Hours",
-                    current = stats.totalHoursAllTime,
-                    prevThreshold = hoursPrev,
-                    nextThreshold = hoursNext,
-                    caption = "${"%.1f".format((hoursNext - stats.totalHoursAllTime).coerceAtLeast(0.0))}h to your next badge"
-                )
-            }
-
-            if (BadgeCatalog.isMaxed(BadgeType.DAILY_STREAK, stats.longestDailyStreak)) {
-                val badge = BadgeCatalog.maxedBadge(BadgeType.DAILY_STREAK)!!
-                BadgeMaxedRow(emoji = badge.emoji, label = "Days", caption = "${badge.title} 💛")
-            } else {
-                val (daysPrev, daysNext) = BadgeCatalog.nextAndPrevThreshold(BadgeType.DAILY_STREAK, stats.longestDailyStreak)
-                val daysRemaining = (daysNext - stats.longestDailyStreak).coerceAtLeast(0)
-                BadgeProgressBarRow(
-                    emoji = "🔥",
-                    label = "Days",
-                    current = stats.longestDailyStreak.toDouble(),
-                    prevThreshold = daysPrev,
-                    nextThreshold = daysNext,
-                    // BUG fix: "1 days to your next badge" was reachable whenever exactly 1 more day
-                    // would complete the streak.
-                    caption = "$daysRemaining day" + (if (daysRemaining == 1) "" else "s") + " to your next badge"
-                )
-            }
-
-            if (BadgeCatalog.isMaxed(BadgeType.WEEKLY_STREAK, stats.longestWeeklyStreak)) {
-                val badge = BadgeCatalog.maxedBadge(BadgeType.WEEKLY_STREAK)!!
-                BadgeMaxedRow(emoji = badge.emoji, label = "Week Streak", caption = "${badge.title} 💛")
-            } else {
-                val (weeksPrev, weeksNext) = BadgeCatalog.nextAndPrevThreshold(BadgeType.WEEKLY_STREAK, stats.longestWeeklyStreak)
-                val weeksRemaining = (weeksNext - stats.longestWeeklyStreak).coerceAtLeast(0)
-                BadgeProgressBarRow(
-                    emoji = "🌟",
-                    label = "Week Streak",
-                    current = stats.longestWeeklyStreak.toDouble(),
-                    prevThreshold = weeksPrev,
-                    nextThreshold = weeksNext,
-                    caption = "$weeksRemaining week" + (if (weeksRemaining == 1) "" else "s") + " to your next badge"
-                )
-            }
-
-            if (BadgeCatalog.isMaxed(BadgeType.REUNIONS, stats.reunionCount)) {
-                val badge = BadgeCatalog.maxedBadge(BadgeType.REUNIONS)!!
-                BadgeMaxedRow(emoji = badge.emoji, label = "Reunions", caption = "${badge.title} 💛")
-            } else {
-                val (reunionsPrev, reunionsNext) = BadgeCatalog.nextAndPrevThreshold(BadgeType.REUNIONS, stats.reunionCount)
-                val reunionsRemaining = (reunionsNext - stats.reunionCount).coerceAtLeast(0)
-                BadgeProgressBarRow(
-                    emoji = "🤗",
-                    label = "Reunions",
-                    current = stats.reunionCount.toDouble(),
-                    prevThreshold = reunionsPrev,
-                    nextThreshold = reunionsNext,
-                    caption = "$reunionsRemaining reunion" + (if (reunionsRemaining == 1) "" else "s") + " to your next badge"
-                )
+            // UX-FIX-PLAN.md Phase 3 item 21: the threshold/fraction/caption math for these 4 rows now
+            // lives in BadgeCatalog.progressRows (a plain, unit-tested pure function) instead of being
+            // computed inline here - Home's own compact "closest to your next badge" card
+            // (HomeScreen.NextBadgeProgressCard) reuses the EXACT same BadgeCatalog.progressRows /
+            // BadgeCatalog.closestToNextBadge logic, so the two surfaces can never silently drift apart.
+            BadgeCatalog.progressRows(stats).forEach { row ->
+                if (row.maxed) {
+                    BadgeMaxedRow(emoji = row.emoji, label = row.label, caption = row.caption)
+                } else {
+                    BadgeProgressBarRow(
+                        emoji = row.emoji,
+                        label = row.label,
+                        current = row.current,
+                        prevThreshold = row.prevThreshold,
+                        nextThreshold = row.nextThreshold,
+                        caption = row.caption
+                    )
+                }
             }
         }
     }
@@ -301,8 +252,11 @@ private fun BadgeProgressBarsSection(stats: TogetherStats) {
  * BadgeCatalog.CAPS/isMaxed) - a full, non-informational bar (there's no "next badge" left to count down
  * to) plus celebratory copy, rather than the "0.0h to your next badge" a literal-minded countdown would
  * otherwise show once maxed out. */
+/** Non-private: reused directly by HomeScreen.NextBadgeProgressCard (UX-FIX-PLAN.md Phase 3 item 21) so
+ * Home's compact card renders identically to this screen's own maxed-out row instead of a second
+ * hand-copied version. */
 @Composable
-private fun BadgeMaxedRow(emoji: String, label: String, caption: String) {
+internal fun BadgeMaxedRow(emoji: String, label: String, caption: String) {
     Column {
         Text(
             text = "$emoji $label",
@@ -332,8 +286,10 @@ private fun BadgeMaxedRow(emoji: String, label: String, caption: String) {
  * one category genuinely tracked as a fraction of an hour - can share this same row instead of a
  * near-duplicate Int-only version; the caller decides whether its own caption text needs decimal
  * precision (Hours) or a whole number (everything else). */
+/** Non-private: reused directly by HomeScreen.NextBadgeProgressCard - see [BadgeMaxedRow]'s doc above for
+ * why. */
 @Composable
-private fun BadgeProgressBarRow(emoji: String, label: String, current: Double, prevThreshold: Int, nextThreshold: Int, caption: String) {
+internal fun BadgeProgressBarRow(emoji: String, label: String, current: Double, prevThreshold: Int, nextThreshold: Int, caption: String) {
     Column {
         Text(
             text = "$emoji $label",

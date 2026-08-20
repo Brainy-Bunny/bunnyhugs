@@ -17,6 +17,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.ssbmedia.twogether.ble.BlePermissions
+import com.ssbmedia.twogether.notif.NotificationInbox
 import com.ssbmedia.twogether.util.BatteryOptimization
 
 /**
@@ -49,8 +51,25 @@ fun BatteryOptimizationGate() {
         // dialog this launched.
     }
 
+    // UX-FIX-PLAN.md Phase 3 item 23 point 3 (dialog-stacking bug fix): this used to fire from its own
+    // fully-independent LaunchedEffect(Unit) with no notion of anything else that might already be asking
+    // for the user's attention - live-found stacking on top of Home's own BLE-permission banner/dialog
+    // flow with no defined precedence between the two. Reuses the EXACT SAME
+    // NotificationInbox.blockingPermissionKind chain (BLE > Location Services > notification permission)
+    // Home's own banners and the item-22 notification-inbox panel are built on - not a second,
+    // independently-derived opinion about "is a more fundamental permission still missing" that could
+    // silently drift from theirs - see that function's own doc for the full priority ordering (which
+    // continues: ... > battery optimization > DND access). If any of those three is still unresolved, this
+    // dialog simply stays silent THIS app open; per this composable's own doc above, there's no persisted
+    // "don't ask again" flag, so it naturally gets another chance the next time NavHost composes fresh
+    // (next cold start) once the more fundamental blocker is out of the way.
     LaunchedEffect(Unit) {
-        if (!BatteryOptimization.isIgnoring(context)) {
+        val blockedByMoreFundamentalPermission = NotificationInbox.blockingPermissionKind(
+            hasBlePermission = BlePermissions.hasBlePermissions(context),
+            needsLocationServices = BlePermissions.needsLocationServicesEnabled(context),
+            hasNotificationPermission = BlePermissions.hasNotificationPermission(context)
+        ) != null
+        if (!blockedByMoreFundamentalPermission && !BatteryOptimization.isIgnoring(context)) {
             showDialog = true
         }
     }

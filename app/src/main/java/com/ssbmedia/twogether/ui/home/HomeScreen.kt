@@ -24,16 +24,21 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -72,6 +77,8 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import com.ssbmedia.twogether.BuildConfig
 import com.ssbmedia.twogether.ServiceLocator
+import com.ssbmedia.twogether.badges.BadgeCatalog
+import com.ssbmedia.twogether.badges.BadgeProgressRow
 import com.ssbmedia.twogether.ble.BlePermissions
 import com.ssbmedia.twogether.ble.ProximityStateMachine
 import com.ssbmedia.twogether.data.datastore.AppSettings
@@ -82,13 +89,20 @@ import com.ssbmedia.twogether.data.db.Moment
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.data.update.UpdateChecker
 import com.ssbmedia.twogether.events.AppEvents
+import com.ssbmedia.twogether.notif.InboxItem
+import com.ssbmedia.twogether.notif.InboxItemKind
+import com.ssbmedia.twogether.notif.InboxSignals
+import com.ssbmedia.twogether.notif.NotificationInbox
 import com.ssbmedia.twogether.service.ProximityForegroundService
 import com.ssbmedia.twogether.stats.OnThisDayInfo
 import com.ssbmedia.twogether.stats.StatsCalculator
+import com.ssbmedia.twogether.ui.badges.BadgeProgressBarRow
 import com.ssbmedia.twogether.ui.components.PulsingHeart
 import com.ssbmedia.twogether.ui.components.QuickLinkChip
 import com.ssbmedia.twogether.ui.components.SectionHeader
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import com.ssbmedia.twogether.util.BatteryOptimization
+import com.ssbmedia.twogether.util.DndAccess
 import com.ssbmedia.twogether.util.RelativeTime
 import com.ssbmedia.twogether.ui.update.UpdateInstallActivity
 import java.io.File
@@ -323,6 +337,32 @@ fun HomeScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    // Item 22/23 (UX-FIX-PLAN.md Phase 3): battery-exemption and DND-access state, checked live here for
+    // the FIRST time on Home (previously only the one-shot BatteryOptimizationGate dialog and the
+    // persistent OS notification tracked battery state, and DND access wasn't tracked anywhere at all) -
+    // both feed the notification-inbox panel below via InboxSignals. Same ON_RESUME re-check convention as
+    // the 3 permission banners above (coming back from the respective system Settings screen).
+    var batteryExempt by remember { mutableStateOf(BatteryOptimization.isIgnoring(context)) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                batteryExempt = BatteryOptimization.isIgnoring(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    var hasDndAccess by remember { mutableStateOf(DndAccess.isGranted(context)) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                hasDndAccess = DndAccess.isGranted(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     LaunchedEffect(moments) { vm.pickRandomMomentIfNeeded(moments) }
 
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
@@ -332,6 +372,9 @@ fun HomeScreen(
             now = System.currentTimeMillis()
         }
     }
+
+    // Item 22 (UX-FIX-PLAN.md Phase 3): whether the notification-bell panel is currently open.
+    var showInboxPanel by remember { mutableStateOf(false) }
 
     var showReunion by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
@@ -483,6 +526,92 @@ fun HomeScreen(
             )
     }
 
+    // Item 14 (update-nag reach fix): extracted to a val so both the "Update ready" banner below AND
+    // the notification-inbox panel/badge-dot (item 22) read the exact same computed result, instead of
+    // each calling UpdateChecker.isPendingUpdateActionable independently.
+    val pendingUpdateActionable = UpdateChecker.isPendingUpdateActionable(settings.pendingUpdateVersionCode, BuildConfig.VERSION_CODE)
+
+    // Item 21 (UX-FIX-PLAN.md Phase 3): the single category closest to unlocking its next badge, for the
+    // compact card below - reuses the EXACT SAME BadgeCatalog.progressRows/closestToNextBadge logic the
+    // Badges screen's own 4-bar section is now built on (see BadgesScreen.kt's BadgeProgressBarsSection),
+    // so the two surfaces can never silently drift apart. Null (nothing to show) only once every category
+    // is maxed out.
+    val nextBadgeRow: BadgeProgressRow? = remember(stats) {
+        BadgeCatalog.closestToNextBadge(BadgeCatalog.progressRows(stats))
+    }
+
+    // Item 22 (UX-FIX-PLAN.md Phase 3): one flat snapshot of every "is X currently unresolved" signal
+    // Home already independently computes for its own banners above - see NotificationInbox's own doc for
+    // why this is the ONE place both the bell panel/badge-dot AND (via
+    // NotificationInbox.blockingPermissionKind, reused directly by BatteryOptimizationGate) the
+    // dialog-stacking fix read from, rather than each growing its own parallel copy of "is X true".
+    val inboxSignals = remember(
+        hasBlePermission, needsLocationServices, hasNotificationPermission, batteryExempt, hasDndAccess,
+        pairingUnconfirmed, pairingInfo.pendingResyncRequests, pendingUpdateActionable, settings.pendingUpdateVersionName
+    ) {
+        InboxSignals(
+            hasBlePermission = hasBlePermission,
+            needsLocationServices = needsLocationServices,
+            hasNotificationPermission = hasNotificationPermission,
+            batteryExempt = batteryExempt,
+            hasDndAccess = hasDndAccess,
+            pairingUnconfirmed = pairingUnconfirmed,
+            pendingResyncCount = pairingInfo.pendingResyncRequests.size,
+            pendingUpdateActionable = pendingUpdateActionable,
+            pendingUpdateVersionName = settings.pendingUpdateVersionName
+        )
+    }
+    val inboxItems = remember(inboxSignals) { NotificationInbox.buildItems(inboxSignals) }
+
+    // Item 22 (UX-FIX-PLAN.md Phase 3): each of these does exactly what tapping its own Home banner does -
+    // pulled out as named lambdas (rather than left inline on each banner's Button) so the notification-
+    // inbox panel below can wire the SAME action to its own tap target, instead of a second hand-copied
+    // "what does resolving this item actually do" implementation that could drift from the banner's.
+    val grantBlePermissions: () -> Unit = {
+        val toRequest = (BlePermissions.required().toList() +
+            listOfNotNull(BlePermissions.notificationPermission()))
+            .filter { ContextCompat.checkSelfPermission(context, it) != android.content.pm.PackageManager.PERMISSION_GRANTED }
+        if (toRequest.isNotEmpty()) blePermissionLauncher.launch(toRequest.toTypedArray())
+    }
+    val openLocationSettings: () -> Unit = {
+        context.startActivity(Intent(android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+    }
+    val grantNotificationPermission: () -> Unit = {
+        val perm = BlePermissions.notificationPermission()
+        if (perm != null) notificationPermissionLauncher.launch(perm)
+    }
+    val openBatteryOptimizationSettings: () -> Unit = {
+        try {
+            context.startActivity(BatteryOptimization.requestIgnoreIntent(context))
+        } catch (e: Exception) {
+            // See BatteryOptimizationGate's own identical try/catch for why - a standard AOSP intent that
+            // some heavily-modified OEM builds or emulator images can nonetheless lack a handler for.
+        }
+    }
+    val openDndAccessSettings: () -> Unit = {
+        try {
+            context.startActivity(DndAccess.requestIntent())
+        } catch (e: Exception) {
+            // Same defensive reasoning as openBatteryOptimizationSettings above.
+        }
+    }
+    val installOrOpenSettingsForUpdate: () -> Unit = {
+        // Mirrors the "Update ready" banner's own onInstallClick exactly - see that card's call site
+        // below for the full reasoning on why a missing cached APK falls back to Settings instead of
+        // silently doing nothing.
+        val apkFile = settings.pendingUpdateApkPath?.let { File(it) }
+        if (apkFile != null && apkFile.isFile) {
+            context.startActivity(
+                Intent(context, UpdateInstallActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    putExtra(UpdateInstallActivity.EXTRA_APK_PATH, apkFile.absolutePath)
+                }
+            )
+        } else {
+            onNavigateSettings()
+        }
+    }
+
     // BUG fix: ReunionOverlay used to be a sibling of the LazyColumn INSIDE Scaffold's own trailing
     // content lambda - which only fills the area below topBar, since topBar is a separate Scaffold slot
     // that always composes ON TOP of the content slot regardless of what that slot renders. That let the
@@ -497,6 +626,20 @@ fun HomeScreen(
             CenterAlignedTopAppBar(
                 title = { Text("Twogether", fontWeight = FontWeight.Bold) },
                 actions = {
+                    // Item 22 (UX-FIX-PLAN.md Phase 3): the bell aggregates everything the app currently
+                    // surfaces piecemeal across banners/dialogs/one-shot notifications (see inboxItems'
+                    // own doc above) into one panel - a small dot persists on the icon for as long as
+                    // inboxItems is non-empty, and clears the moment it would be empty (fully reactive,
+                    // no separate "seen/unseen" latch to keep in sync).
+                    IconButton(onClick = { showInboxPanel = true }) {
+                        if (inboxItems.isNotEmpty()) {
+                            BadgedBox(badge = { Badge() }) {
+                                Icon(Icons.Filled.Notifications, contentDescription = "Notifications (${inboxItems.size} unresolved)")
+                            }
+                        } else {
+                            Icon(Icons.Filled.Notifications, contentDescription = "Notifications")
+                        }
+                    }
                     IconButton(onClick = onNavigateSettings) {
                         Icon(Icons.Filled.Settings, contentDescription = "Settings")
                     }
@@ -510,41 +653,19 @@ fun HomeScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             if (!hasBlePermission) {
-                item {
-                    BlePermissionWarningCard(
-                        onGrantClick = {
-                            val toRequest = (BlePermissions.required().toList() +
-                                listOfNotNull(BlePermissions.notificationPermission()))
-                                .filter { ContextCompat.checkSelfPermission(context, it) != android.content.pm.PackageManager.PERMISSION_GRANTED }
-                            if (toRequest.isNotEmpty()) blePermissionLauncher.launch(toRequest.toTypedArray())
-                        }
-                    )
-                }
+                item { BlePermissionWarningCard(onGrantClick = grantBlePermissions) }
             } else if (needsLocationServices) {
                 // Only shown once BLE permission itself is granted - a redundant "also turn on Location"
                 // banner on top of the permission banner would be confusing since granting BLE permission
                 // is the more fundamental blocker.
-                item {
-                    LocationServicesWarningCard(
-                        onOpenSettingsClick = {
-                            context.startActivity(Intent(android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS))
-                        }
-                    )
-                }
+                item { LocationServicesWarningCard(onOpenSettingsClick = openLocationSettings) }
             } else if (!hasNotificationPermission) {
                 // Same "only once the more fundamental blocker is clear" reasoning as the Location
                 // Services banner above - shown only once BLE is granted and Location Services (if
                 // relevant) is on, since a missing notification permission is real but secondary: the
                 // service still tracks together-time correctly without it, it just can't SHOW you that
                 // it's doing so (no ongoing notification, no photo-reminder/reunion/milestone alerts).
-                item {
-                    NotificationPermissionWarningCard(
-                        onGrantClick = {
-                            val perm = BlePermissions.notificationPermission()
-                            if (perm != null) notificationPermissionLauncher.launch(perm)
-                        }
-                    )
-                }
+                item { NotificationPermissionWarningCard(onGrantClick = grantNotificationPermission) }
             }
             if (pairingUnconfirmed) {
                 item {
@@ -565,29 +686,11 @@ fun HomeScreen(
             // (a missing BLE/notification permission is the more fundamental blocker to resolve first)
             // but before the status card, matching this screen's existing "important banners float to
             // the top" ordering.
-            if (UpdateChecker.isPendingUpdateActionable(settings.pendingUpdateVersionCode, BuildConfig.VERSION_CODE)) {
+            if (pendingUpdateActionable) {
                 item {
                     UpdateAvailableWarningCard(
                         versionName = settings.pendingUpdateVersionName ?: "update",
-                        onInstallClick = {
-                            // Mirrors SettingsScreen's own "Install" onClick exactly (same apk-file-still-
-                            // there check) - but on the rare edge case the cached APK has since gone
-                            // missing (cleared storage, cache eviction), routes to Settings instead of
-                            // silently doing nothing: that screen already owns the "clear the stale flag
-                            // and tell the user to re-check" recovery flow, so there's no reason to
-                            // duplicate it here.
-                            val apkFile = settings.pendingUpdateApkPath?.let { File(it) }
-                            if (apkFile != null && apkFile.isFile) {
-                                context.startActivity(
-                                    Intent(context, UpdateInstallActivity::class.java).apply {
-                                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                                        putExtra(UpdateInstallActivity.EXTRA_APK_PATH, apkFile.absolutePath)
-                                    }
-                                )
-                            } else {
-                                onNavigateSettings()
-                            }
-                        }
+                        onInstallClick = installOrOpenSettingsForUpdate
                     )
                 }
             }
@@ -628,6 +731,16 @@ fun HomeScreen(
                             Text("${stats.totalDaysTogether}", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                         }
                     }
+                }
+            }
+            // Item 21 (UX-FIX-PLAN.md Phase 3): the single category closest to its next badge - see
+            // nextBadgeRow's own doc above. Placed right after the "quick facts" stat tiles and before the
+            // throwback/on-this-day cards - another quick, forward-looking fact about the couple's
+            // progress, grouped with its stat-tile siblings rather than buried below the more nostalgic
+            // cards.
+            if (nextBadgeRow != null) {
+                item {
+                    NextBadgeProgressCard(row = nextBadgeRow, onClick = onNavigateBadges)
                 }
             }
             if (randomMoment != null) {
@@ -785,6 +898,36 @@ fun HomeScreen(
                 }
             },
             confirmButton = {}
+        )
+    }
+
+    // Item 22 (UX-FIX-PLAN.md Phase 3): the notification-bell panel. A bottom sheet (not another Screen
+    // reached via NavGraph) so it can directly share every launcher/callback Home already built for its
+    // own banners above (grantBlePermissions, notificationPermissionLauncher, etc) instead of duplicating
+    // that whole permission-request wiring a second time in a standalone destination far away from where
+    // it's defined.
+    if (showInboxPanel) {
+        NotificationInboxSheet(
+            items = inboxItems,
+            onDismiss = { showInboxPanel = false },
+            onItemClick = { kind ->
+                when (kind) {
+                    InboxItemKind.BLE_PERMISSION -> grantBlePermissions()
+                    InboxItemKind.LOCATION_SERVICES -> openLocationSettings()
+                    InboxItemKind.NOTIFICATION_PERMISSION -> grantNotificationPermission()
+                    InboxItemKind.BATTERY_OPTIMIZATION -> openBatteryOptimizationSettings()
+                    InboxItemKind.DND_ACCESS -> openDndAccessSettings()
+                    // These 3 have no separate action of their own to trigger from here - dismissing the
+                    // panel is enough to reveal whichever of Home's own always-shown surfaces already
+                    // handles them (the pairingUnconfirmed banner right above the status card, or the
+                    // blocking "Is this your partner?" dialog above), or for the update card, tapping it
+                    // installs directly.
+                    InboxItemKind.PAIRING_UNCONFIRMED -> {}
+                    InboxItemKind.PENDING_RESYNC -> {}
+                    InboxItemKind.UPDATE_AVAILABLE -> installOrOpenSettingsForUpdate()
+                }
+                showInboxPanel = false
+            }
         )
     }
 }
@@ -1139,6 +1282,88 @@ private fun UsStatusCard(isTogether: Boolean, openSession: TogetherSession?, now
                 )
                 Text("Hoping to see $partnerName again soon 💭", style = MaterialTheme.typography.bodyMedium)
             }
+        }
+    }
+}
+
+/** UX-FIX-PLAN.md Phase 3 item 21: Home's compact "closest to your next badge" card - just [row] (the
+ * single category [BadgeCatalog.closestToNextBadge] picked, see HomeScreen's own `nextBadgeRow` doc)
+ * rendered through the EXACT SAME [BadgeProgressBarRow] composable the Badges screen's own 4-bar section
+ * uses (see ui/badges/BadgesScreen.kt), just wrapped in its own tappable Card instead of BadgesScreen's
+ * bigger 4-row Column - so this card can never visually drift from what BadgesScreen itself shows for
+ * this exact category. Tapping through opens the full Badges screen. */
+@Composable
+private fun NextBadgeProgressCard(row: BadgeProgressRow, onClick: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.large,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        onClick = onClick
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            BadgeProgressBarRow(
+                emoji = row.emoji,
+                label = row.label,
+                current = row.current,
+                prevThreshold = row.prevThreshold,
+                nextThreshold = row.nextThreshold,
+                caption = row.caption
+            )
+        }
+    }
+}
+
+/** UX-FIX-PLAN.md Phase 3 item 22: the notification-bell's panel - a plain scrollable list of every
+ * [InboxItem] in [items] (already in priority order, see [NotificationInbox.buildItems]'s own doc), each
+ * one tappable straight through to [onItemClick] which does exactly what tapping its equivalent Home
+ * banner would do (see HomeScreen's own grantBlePermissions/openLocationSettings/etc lambdas). A
+ * ModalBottomSheet rather than a full Screen - see this card's own call site in HomeScreen for why. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun NotificationInboxSheet(
+    items: List<InboxItem>,
+    onDismiss: () -> Unit,
+    onItemClick: (InboxItemKind) -> Unit
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text("Notifications", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            if (items.isEmpty()) {
+                Text(
+                    "You're all caught up 💛",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 16.dp)
+                )
+            } else {
+                items.forEach { item ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = MaterialTheme.shapes.large,
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                        onClick = { onItemClick(item.kind) }
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text(
+                                item.title,
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                            Text(
+                                item.subtitle,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.padding(top = 4.dp)
+                            )
+                        }
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
         }
     }
 }
