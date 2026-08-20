@@ -2,6 +2,7 @@ package com.ssbmedia.twogether
 
 import android.content.Intent
 import android.os.Bundle
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -30,6 +31,7 @@ import com.ssbmedia.twogether.ble.BlePermissions
 import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.data.datastore.PairingInfo
 import com.ssbmedia.twogether.data.datastore.ThemeMode
+import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.lock.AppLockManager
 import com.ssbmedia.twogether.notif.Notifications
 import com.ssbmedia.twogether.service.ProximityForegroundService
@@ -39,11 +41,19 @@ import com.ssbmedia.twogether.ui.lock.PinLockScreen
 import com.ssbmedia.twogether.ui.nav.TwogetherNavHost
 import com.ssbmedia.twogether.ui.onboarding.PairingScreen
 import com.ssbmedia.twogether.ui.theme.TwogetherTheme
+import com.ssbmedia.twogether.util.VolumeShutterKeyHandler
 
 class MainActivity : ComponentActivity() {
 
     private val cameraTrigger = mutableIntStateOf(0)
     private val milestoneTrigger = mutableStateOf<String?>(null)
+
+    // Item 16 (camera overhaul), point 5: kept as a plain (non-Compose-state) field, not a State<Boolean>
+    // - it's only ever read from dispatchKeyEvent below, a regular Activity method that runs completely
+    // outside Compose's recomposition machinery, so there's no reactive-read benefit to Compose state
+    // here and a plain var is simpler. Written from TwogetherNavHost's onCameraScreenActiveChanged
+    // callback every time the current destination changes (see NavGraph.kt).
+    private var isCameraScreenActive = false
 
     // BUG fix: registered here as an Activity-level property (constructed before onCreate/onStart, per
     // AndroidX's own requirement that registerForActivityResult be called before STARTED), NOT inside any
@@ -162,12 +172,35 @@ class MainActivity : ComponentActivity() {
                             onMilestoneIdConsumed = {
                                 milestoneTrigger.value = null
                                 intent?.removeExtra(Notifications.EXTRA_OPEN_MILESTONE_ID)
-                            }
+                            },
+                            onCameraScreenActiveChanged = { isCameraScreenActive = it }
                         )
                     }
                 }
             }
         }
+    }
+
+    // Item 16 (camera overhaul), point 5: volume-button-as-shutter. Key events reach an Activity before
+    // any view (composables included) ever gets a chance at them, so this is the only place in a
+    // single-Activity Compose app that can intercept KEYCODE_VOLUME_UP/DOWN before the OS turns them into
+    // a media-volume change - by the time a View-level onKeyDown could see them it would already be too
+    // late. VolumeShutterKeyHandler holds the actual (unit-tested) decision logic; this override is
+    // deliberately just a thin adapter from the real KeyEvent onto that pure function, forwarding a
+    // shutter request over AppEvents (the same Activity/service -> UI nudge pattern already used
+    // elsewhere in this app - see AppEvents.cameraShutterRequests' own doc) when it applies.
+    //
+    // Consuming BOTH ACTION_DOWN and ACTION_UP (returning true, not calling super) for the matched key is
+    // what actually suppresses the system volume change/on-screen volume UI - only firing the capture
+    // itself on ACTION_DOWN is what stops one physical button press from triggering two captures.
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (VolumeShutterKeyHandler.shouldConsumeAsShutter(isCameraScreenActive, event.keyCode)) {
+            if (VolumeShutterKeyHandler.shouldTriggerCapture(event.action)) {
+                AppEvents.requestCameraShutter()
+            }
+            return true
+        }
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onNewIntent(intent: Intent) {

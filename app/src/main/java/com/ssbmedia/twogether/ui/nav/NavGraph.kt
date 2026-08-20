@@ -7,6 +7,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -52,7 +53,13 @@ fun TwogetherNavHost(
     onUnpaired: () -> Unit,
     openMilestoneId: String? = null,
     onCameraTriggerConsumed: () -> Unit = {},
-    onMilestoneIdConsumed: () -> Unit = {}
+    onMilestoneIdConsumed: () -> Unit = {},
+    // Item 16 (camera overhaul), point 5: MainActivity's dispatchKeyEvent is a plain Activity method, not
+    // a composable, so it can't read NavController state directly - it needs a plain boolean flag telling
+    // it whether volume-key presses should be routed to the camera shutter (see AppEvents.
+    // cameraShutterRequests) right now, versus behaving as completely normal volume keys everywhere else
+    // in the app. This callback is how that flag gets kept in sync with the actual current destination.
+    onCameraScreenActiveChanged: (Boolean) -> Unit = {}
 ) {
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
@@ -62,6 +69,18 @@ fun TwogetherNavHost(
     // resolved call. Stripping the "?..." here is what lets the bottom bar's plain Screen.Calendar.route
     // ("calendar") still match it for selection/visibility, exactly like every other bottom item.
     val currentRoute = backStackEntry?.destination?.route?.substringBefore("?")
+
+    LaunchedEffect(currentRoute) {
+        onCameraScreenActiveChanged(currentRoute == Screen.Camera.route)
+    }
+    // Safety net: if this WHOLE NavHost is torn down while Camera happened to be the active destination
+    // (e.g. MainActivity's PIN-lock branch swap, or a config change tearing down and recreating this
+    // composable), make sure the flag doesn't get stuck true with no LaunchedEffect left alive to ever
+    // flip it back - that would silently route ALL future volume-key presses to a now-gone camera
+    // shutter, everywhere else in the app, until the next time Camera happens to be visited again.
+    DisposableEffect(Unit) {
+        onDispose { onCameraScreenActiveChanged(false) }
+    }
 
     // Feature 1: covers both "first successful pairing" and "app launch while already paired" - this
     // whole NavHost only ever composes once the couple is paired, so a fresh composition of it IS
