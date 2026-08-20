@@ -751,11 +751,11 @@ class MomentNoteRepository(private val dao: MomentNoteDao) {
  * including the identical "never accept a row claiming my own deviceId" guard (see [mergeRemote]'s own
  * doc for why that matters here too).
  *
- * DELIBERATE SCOPE LIMIT: nothing calls [mergeRemote] yet - GattSyncManager.kt is intentionally untouched
- * by this feature (see this class's own file header / the task this was implemented under). This is
- * written now anyway so wiring sync support later is a small, mechanical addition (a
- * serializeDayNotes/deserializeDayNotes pair in GattSyncManager plus a call to this function) rather than
- * something that needs the merge logic designed from scratch at that point.
+ * [mergeRemote] is called from GattSyncManager.applyPayload (serializeDayNotes/deserializeDayNotes),
+ * wired in by hand once the rest of this feature (entity/DAO/repository/migration/backup/UI) was already
+ * built and verified separately - GattSyncManager.kt was kept off-limits to the sub-agent that built
+ * everything else here, specifically to protect its own already-completed security audit from an
+ * unreviewed change.
  */
 class DayNoteRepository(private val dao: DayNoteDao) {
     fun observeForDate(date: Long): Flow<List<DayNote>> = dao.observeForDate(date)

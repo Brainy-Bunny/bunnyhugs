@@ -7,6 +7,7 @@ import com.ssbmedia.twogether.data.datastore.SettingsStore
 import com.ssbmedia.twogether.data.db.AppDatabase
 import com.ssbmedia.twogether.data.db.DateIdea
 import com.ssbmedia.twogether.data.db.DateIdeaDao
+import com.ssbmedia.twogether.data.db.DayNoteDao
 import com.ssbmedia.twogether.data.db.ListCategory
 import com.ssbmedia.twogether.data.db.ListCategoryDao
 import com.ssbmedia.twogether.data.db.Milestone
@@ -18,6 +19,7 @@ import com.ssbmedia.twogether.data.db.MomentNoteDao
 import com.ssbmedia.twogether.data.db.TimeCapsuleDao
 import com.ssbmedia.twogether.data.db.TogetherSessionDao
 import com.ssbmedia.twogether.data.repo.DateIdeaRepository
+import com.ssbmedia.twogether.data.repo.DayNoteRepository
 import com.ssbmedia.twogether.data.repo.ListCategoryRepository
 import com.ssbmedia.twogether.data.repo.MilestoneRepository
 import com.ssbmedia.twogether.data.repo.MomentNoteRepository
@@ -123,6 +125,7 @@ class SyncCaptionAndChurnAuditTest {
             SessionRepository(mock(TogetherSessionDao::class.java)),
             MomentRepository(mock(MomentDao::class.java), context),
             MomentNoteRepository(mock(MomentNoteDao::class.java)),
+            DayNoteRepository(mock(DayNoteDao::class.java)),
             MilestoneRepository(mock(MilestoneDao::class.java)),
             TimeCapsuleRepository(mock(TimeCapsuleDao::class.java)),
             mock(SettingsStore::class.java),

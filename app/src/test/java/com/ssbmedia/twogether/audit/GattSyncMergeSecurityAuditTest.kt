@@ -6,6 +6,7 @@ import com.ssbmedia.twogether.data.datastore.PairingStore
 import com.ssbmedia.twogether.data.datastore.SettingsStore
 import com.ssbmedia.twogether.data.db.AppDatabase
 import com.ssbmedia.twogether.data.db.DateIdeaDao
+import com.ssbmedia.twogether.data.db.DayNoteDao
 import com.ssbmedia.twogether.data.db.ListCategoryDao
 import com.ssbmedia.twogether.data.db.MilestoneDao
 import com.ssbmedia.twogether.data.db.MomentDao
@@ -13,6 +14,7 @@ import com.ssbmedia.twogether.data.db.MomentNoteDao
 import com.ssbmedia.twogether.data.db.TimeCapsuleDao
 import com.ssbmedia.twogether.data.db.TogetherSessionDao
 import com.ssbmedia.twogether.data.repo.DateIdeaRepository
+import com.ssbmedia.twogether.data.repo.DayNoteRepository
 import com.ssbmedia.twogether.data.repo.ListCategoryRepository
 import com.ssbmedia.twogether.data.repo.MilestoneRepository
 import com.ssbmedia.twogether.data.repo.MomentNoteRepository
@@ -54,6 +56,7 @@ class GattSyncMergeSecurityAuditTest {
         val sessionRepo = SessionRepository(mock(TogetherSessionDao::class.java))
         val momentRepo = MomentRepository(mock(MomentDao::class.java), context)
         val momentNoteRepo = MomentNoteRepository(mock(MomentNoteDao::class.java))
+        val dayNoteRepo = DayNoteRepository(mock(DayNoteDao::class.java))
         val milestoneRepo = MilestoneRepository(mock(MilestoneDao::class.java))
         val timeCapsuleRepo = TimeCapsuleRepository(mock(TimeCapsuleDao::class.java))
         // Mocked, not constructed for real: SettingsStore's `settings` property initializer eagerly
@@ -68,7 +71,7 @@ class GattSyncMergeSecurityAuditTest {
         val pairingStore = mock(PairingStore::class.java)
         return GattSyncManager(
             context, dateIdeaRepo, listCategoryRepo, sessionRepo, momentRepo,
-            momentNoteRepo, milestoneRepo, timeCapsuleRepo, settingsStore, pairingStore, CoroutineScope(Dispatchers.Unconfined)
+            momentNoteRepo, dayNoteRepo, milestoneRepo, timeCapsuleRepo, settingsStore, pairingStore, CoroutineScope(Dispatchers.Unconfined)
         )
     }
 
@@ -91,6 +94,21 @@ class GattSyncMergeSecurityAuditTest {
 
     private fun deserializeDateIdeas(manager: GattSyncManager, arr: JSONArray, peerClockOffsetMillis: Long = 0L): List<*> =
         invokePrivate(manager, "deserializeDateIdeas", arr, peerClockOffsetMillis)
+
+    private fun deserializeDayNotes(manager: GattSyncManager, arr: JSONArray, peerClockOffsetMillis: Long = 0L): List<*> =
+        invokePrivate(manager, "deserializeDayNotes", arr, peerClockOffsetMillis)
+
+    private fun dayNoteJson(
+        date: Long, authorDeviceId: String, text: String, updatedAt: Long, deleted: Boolean = false
+    ): JSONArray = JSONArray().put(
+        JSONObject().apply {
+            put("date", date)
+            put("authorDeviceId", authorDeviceId)
+            put("text", text)
+            put("updatedAt", updatedAt)
+            put("deleted", deleted)
+        }
+    )
 
     private fun sessionJson(
         syncId: String, startedAt: Long, endedAt: Long, updatedAt: Long, deleted: Boolean = false
@@ -119,6 +137,34 @@ class GattSyncMergeSecurityAuditTest {
         val arr = sessionJson("poison", now - 100_000L, now + 999_999_999_999L, now)
         val result = deserializeSessions(newManager(), arr)
         assertTrue("a forged future endedAt must never merge in", result.isEmpty())
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // UX-FIX-PLAN.md Phase 4 item 25: wire-protocol tests for DayNote, added by hand alongside the
+    // GattSyncManager wiring itself (serializeDayNotes/deserializeDayNotes) - the rest of this feature
+    // (entity/DAO/repository/migration/backup/UI, including thorough DayNoteRepository.mergeRemote
+    // coverage) was built and tested separately in DayNoteAuditTest.kt; these two tests exist only to
+    // confirm the deserialize half of the wire path applies the SAME plausibility gate every other
+    // deserialize* function in this file already enforces, since that's the one piece a repository-level
+    // test can't reach.
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    fun `legitimate day note survives the wire deserialize`() {
+        val now = System.currentTimeMillis()
+        val epochDay = now / 86_400_000L
+        val arr = dayNoteJson(epochDay, "partner-device", "a real note", now)
+        val result = deserializeDayNotes(newManager(), arr)
+        assertEquals(1, result.size)
+    }
+
+    @Test
+    fun `forged far-future day note updatedAt is rejected, not clamped and accepted`() {
+        val now = System.currentTimeMillis()
+        val epochDay = now / 86_400_000L
+        val arr = dayNoteJson(epochDay, "partner-device", "poison", now + 999_999_999_999L)
+        val result = deserializeDayNotes(newManager(), arr)
+        assertTrue("a forged future updatedAt must never merge in", result.isEmpty())
     }
 
     @Test

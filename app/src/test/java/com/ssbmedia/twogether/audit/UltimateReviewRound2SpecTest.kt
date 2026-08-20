@@ -6,6 +6,7 @@ import com.ssbmedia.twogether.data.datastore.PairingStore
 import com.ssbmedia.twogether.data.datastore.SettingsStore
 import com.ssbmedia.twogether.data.db.AppDatabase
 import com.ssbmedia.twogether.data.db.DateIdeaDao
+import com.ssbmedia.twogether.data.db.DayNoteDao
 import com.ssbmedia.twogether.data.db.ListCategoryDao
 import com.ssbmedia.twogether.data.db.MilestoneDao
 import com.ssbmedia.twogether.data.db.MomentDao
@@ -13,6 +14,7 @@ import com.ssbmedia.twogether.data.db.MomentNoteDao
 import com.ssbmedia.twogether.data.db.TimeCapsuleDao
 import com.ssbmedia.twogether.data.db.TogetherSessionDao
 import com.ssbmedia.twogether.data.repo.DateIdeaRepository
+import com.ssbmedia.twogether.data.repo.DayNoteRepository
 import com.ssbmedia.twogether.data.repo.ListCategoryRepository
 import com.ssbmedia.twogether.data.repo.MilestoneRepository
 import com.ssbmedia.twogether.data.repo.MomentNoteRepository
@@ -58,13 +60,14 @@ class UltimateReviewRound2SpecTest {
         val sessionRepo = SessionRepository(mock(TogetherSessionDao::class.java))
         val momentRepo = MomentRepository(mock(MomentDao::class.java), context)
         val momentNoteRepo = MomentNoteRepository(mock(MomentNoteDao::class.java))
+        val dayNoteRepo = DayNoteRepository(mock(DayNoteDao::class.java))
         val milestoneRepo = MilestoneRepository(mock(MilestoneDao::class.java))
         val timeCapsuleRepo = TimeCapsuleRepository(mock(TimeCapsuleDao::class.java))
         val settingsStore = mock(SettingsStore::class.java)
         val pairingStore = mock(PairingStore::class.java)
         return GattSyncManager(
             context, dateIdeaRepo, listCategoryRepo, sessionRepo, momentRepo,
-            momentNoteRepo, milestoneRepo, timeCapsuleRepo, settingsStore, pairingStore, CoroutineScope(Dispatchers.Unconfined)
+            momentNoteRepo, dayNoteRepo, milestoneRepo, timeCapsuleRepo, settingsStore, pairingStore, CoroutineScope(Dispatchers.Unconfined)
         )
     }
 

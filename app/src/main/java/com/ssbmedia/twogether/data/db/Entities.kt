@@ -226,10 +226,10 @@ data class MomentNote(
  * rows authored by the OTHER id are meant to arrive purely via GattSyncManager's merge and be read-only
  * in the UI - see DayNoteRepository's doc for the full sync contract.
  *
- * NOTE (deliberate scope limit): unlike MomentNote, [DayNote] does NOT yet travel over
- * GattSyncManager's wire protocol - GattSyncManager.kt is intentionally untouched by this feature (see
- * DayNoteRepository.mergeRemote's own doc). It DOES round-trip through BackupManager's JSON backup/
- * restore, same as every other synced-shaped entity in this file.
+ * Travels over GattSyncManager's wire protocol (serializeDayNotes/deserializeDayNotes, wired in by hand
+ * after the rest of this feature was built and verified separately - see DayNoteRepository.mergeRemote's
+ * doc) exactly like MomentNote does, and also round-trips through BackupManager's JSON backup/restore
+ * like every other synced-shaped entity in this file.
  */
 @Entity(tableName = "day_notes", primaryKeys = ["date", "authorDeviceId"])
 data class DayNote(

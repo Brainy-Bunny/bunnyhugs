@@ -22,8 +22,10 @@ import com.ssbmedia.twogether.notif.MilestoneAlarmScheduler
 import com.ssbmedia.twogether.notif.Notifications
 import com.ssbmedia.twogether.data.db.Moment
 import com.ssbmedia.twogether.data.db.MomentNote
+import com.ssbmedia.twogether.data.db.DayNote
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.data.repo.DateIdeaRepository
+import com.ssbmedia.twogether.data.repo.DayNoteRepository
 import com.ssbmedia.twogether.data.repo.ListCategoryRepository
 import com.ssbmedia.twogether.data.repo.MilestoneRepository
 import com.ssbmedia.twogether.data.repo.MomentNoteRepository
@@ -48,8 +50,9 @@ import java.security.SecureRandom
 /**
  * Tiny custom GATT protocol piggybacked on the proximity connection: exchange ONE combined JSON
  * envelope covering date ideas, closed together-sessions (Feature A), moment metadata + per-partner
- * moment notes (Feature D), and milestones (Feature F) as chunked bytes over one write+notify
- * characteristic, then merge each piece locally with its own table-appropriate strategy. One side acts
+ * moment notes (Feature D), milestones (Feature F), and per-partner calendar day notes (UX-FIX-PLAN.md
+ * Phase 4 item 25) as chunked bytes over one write+notify characteristic, then merge each piece locally
+ * with its own table-appropriate strategy. One side acts
  * as GATT server (passive), the other as GATT client (initiates) - the caller decides the role via a
  * deterministic tie-break so both phones never both try the same role.
  *
@@ -105,6 +108,7 @@ class GattSyncManager(
     private val sessionRepository: SessionRepository,
     private val momentRepository: MomentRepository,
     private val momentNoteRepository: MomentNoteRepository,
+    private val dayNoteRepository: DayNoteRepository,
     private val milestoneRepository: MilestoneRepository,
     private val timeCapsuleRepository: com.ssbmedia.twogether.data.repo.TimeCapsuleRepository,
     private val settingsStore: SettingsStore,
@@ -167,6 +171,11 @@ class GattSyncManager(
         obj.put("sessions", serializeSessions(sessionRepository.getAllIncludingDeleted().filter { it.endedAt != null }))
         obj.put("moments", serializeMoments(momentRepository.getAllIncludingDeleted()))
         obj.put("notes", serializeNotes(momentNoteRepository.getAllForAuthor(deviceId)))
+        // UX-FIX-PLAN.md Phase 4 item 25: same "only ever send MY OWN authored rows" shape as notes just
+        // above - the partner already has their own copy of their own day notes, so there is nothing to
+        // gain (and a real risk of the own-deviceId guard below ever seeing a value it doesn't expect) in
+        // ever sending back rows authored by someone else.
+        obj.put("dayNotes", serializeDayNotes(dayNoteRepository.getAllForAuthor(deviceId)))
         obj.put("milestones", serializeMilestones(milestoneRepository.getAll()))
         // Feature: Time Capsule sync - full table including tombstones, same reasoning as
         // sessions/moments/milestones above (a capsule deleted on this device must propagate that
@@ -310,6 +319,11 @@ class GattSyncManager(
         val notesArr = root.optJSONArray("notes")
         val notesParsed = deserializeNotes(notesArr, peerClockOffsetMillis)
         momentNoteRepository.mergeRemote(notesParsed, deviceId)
+        // UX-FIX-PLAN.md Phase 4 item 25: see DayNoteRepository.mergeRemote's doc for the identical
+        // own-deviceId-never-trusted reasoning momentNoteRepository.mergeRemote above already applies.
+        val dayNotesArr = root.optJSONArray("dayNotes")
+        val dayNotesParsed = deserializeDayNotes(dayNotesArr, peerClockOffsetMillis)
+        dayNoteRepository.mergeRemote(dayNotesParsed, deviceId)
         // BUG fix: an independent audit round found milestones arriving via sync never got their yearly
         // alarm armed until the next cold start/boot, unlike every other way a Milestone enters the DB
         // (local add, backup restore, app start) - all of which call MilestoneAlarmScheduler right away.
@@ -335,6 +349,7 @@ class GattSyncManager(
             (sessionsArr?.length() ?: 0) - sessionsParsed.size +
             (momentsArr?.length() ?: 0) - momentsParsed.size +
             (notesArr?.length() ?: 0) - notesParsed.size +
+            (dayNotesArr?.length() ?: 0) - dayNotesParsed.size +
             (milestonesArr?.length() ?: 0) - milestonesParsed.size +
             (timeCapsulesArr?.length() ?: 0) - timeCapsulesParsed.size
         // SECURITY (Fix #3, Fable review): reaching this line at all means the sender passed the pin check
@@ -659,6 +674,47 @@ class GattSyncManager(
             }
             MomentNote(
                 momentSyncId = momentSyncId,
+                authorDeviceId = o.getString("authorDeviceId"),
+                text = o.optString("text", ""),
+                updatedAt = updatedAt,
+                deleted = o.optBoolean("deleted", false)
+            )
+        }
+    }
+
+    /** UX-FIX-PLAN.md Phase 4 item 25: wire support for DayNote, wired in by hand (not by any sub-agent -
+     * see DayNote's own doc for why) after the rest of the feature (entity/DAO/repository/migration/
+     * backup/UI) was already built and verified separately. Deliberately as close to a byte-for-byte copy
+     * of serializeNotes/deserializeNotes above as the different field names allow - same composite-key
+     * shape (date + authorDeviceId instead of momentSyncId + authorDeviceId), same plausibility gate on
+     * updatedAt, same "only my own authored rows are ever sent" restriction at the call site in
+     * buildPayload. */
+    private fun serializeDayNotes(notes: List<DayNote>): JSONArray {
+        val arr = JSONArray()
+        for (n in notes) {
+            arr.put(JSONObject().apply {
+                put("date", n.date)
+                put("authorDeviceId", n.authorDeviceId)
+                put("text", n.text)
+                put("updatedAt", n.updatedAt)
+                put("deleted", n.deleted)
+            })
+        }
+        return arr
+    }
+
+    private fun deserializeDayNotes(arr: JSONArray?, peerClockOffsetMillis: Long = 0L): List<DayNote> {
+        if (arr == null) return emptyList()
+        return (0 until arr.length()).mapNotNull { i ->
+            val o = arr.getJSONObject(i)
+            val date = o.getLong("date")
+            val updatedAt = o.getLong("updatedAt") - peerClockOffsetMillis
+            if (!isPlausibleWireUpdatedAt(updatedAt)) {
+                Log.w(TAG, "Dropping remote day note for epochDay=$date with implausible updatedAt=$updatedAt")
+                return@mapNotNull null
+            }
+            DayNote(
+                date = date,
                 authorDeviceId = o.getString("authorDeviceId"),
                 text = o.optString("text", ""),
                 updatedAt = updatedAt,

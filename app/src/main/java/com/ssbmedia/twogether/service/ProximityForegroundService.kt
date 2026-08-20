@@ -97,6 +97,7 @@ class ProximityForegroundService : LifecycleService() {
             ServiceLocator.sessionRepository,
             ServiceLocator.momentRepository,
             ServiceLocator.momentNoteRepository,
+            ServiceLocator.dayNoteRepository,
             ServiceLocator.milestoneRepository,
             ServiceLocator.timeCapsuleRepository,
             ServiceLocator.settingsStore,
