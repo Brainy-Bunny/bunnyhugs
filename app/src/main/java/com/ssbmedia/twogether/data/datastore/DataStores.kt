@@ -487,7 +487,17 @@ data class ProximityPersistedState(
     // clock change, matching the service's own checkAbsence() logic - see ProximityStateMachine's doc
     // for the full reasoning. Only meaningful within the current boot session; do not use for anything
     // user-facing (persisted session times / "last saw them X ago" text must keep using lastSeenAt).
-    val lastSeenElapsedRealtime: Long = 0L
+    val lastSeenElapsedRealtime: Long = 0L,
+    /** Item 9 (UX-FIX-PLAN.md): wall-clock instant the fast ~100s isTogether apart-flip happened, set by
+     * ProximityForegroundService.handleBecameApart the moment it flips - NOT when the underlying
+     * TogetherSession row actually gets closed, which now waits out
+     * ProximityForegroundService.SESSION_GRACE_MILLIS (~10 min) first so a brief reconnect can resume
+     * the SAME session/timer instead of restarting it. 0L means "no apart transition pending a
+     * session-close decision" (currently together, or the grace window already resolved one way or the
+     * other). Deliberately a SEPARATE field from [lastApartSince] (which anchors the reunion-gap check
+     * and must keep reflecting the CLAMPED estimated-real-apart instant, not this raw transition
+     * timestamp) - see ProximityForegroundService.handleBecameApart's doc for why both exist. */
+    val pendingApartSince: Long = 0L
 )
 
 class ProximityStateStore(private val context: Context) {
@@ -501,6 +511,7 @@ class ProximityStateStore(private val context: Context) {
         val SESSION_ID = longPreferencesKey("current_session_id")
         val PENDING_CELEBRATION = booleanPreferencesKey("pending_reunion_celebration")
         val LAST_SEEN_ELAPSED_REALTIME = longPreferencesKey("last_seen_elapsed_realtime")
+        val PENDING_APART_SINCE = longPreferencesKey("pending_apart_since")
     }
 
     val state: Flow<ProximityPersistedState> = context.proximityDs.data.map { p ->
@@ -513,7 +524,8 @@ class ProximityStateStore(private val context: Context) {
             snoozeUntil = p[Keys.SNOOZE_UNTIL] ?: 0L,
             currentSessionId = p[Keys.SESSION_ID] ?: -1L,
             pendingReunionCelebration = p[Keys.PENDING_CELEBRATION] ?: false,
-            lastSeenElapsedRealtime = p[Keys.LAST_SEEN_ELAPSED_REALTIME] ?: 0L
+            lastSeenElapsedRealtime = p[Keys.LAST_SEEN_ELAPSED_REALTIME] ?: 0L,
+            pendingApartSince = p[Keys.PENDING_APART_SINCE] ?: 0L
         )
     }
 
@@ -541,7 +553,8 @@ class ProximityStateStore(private val context: Context) {
                 snoozeUntil = p[Keys.SNOOZE_UNTIL] ?: 0L,
                 currentSessionId = p[Keys.SESSION_ID] ?: -1L,
                 pendingReunionCelebration = p[Keys.PENDING_CELEBRATION] ?: false,
-                lastSeenElapsedRealtime = p[Keys.LAST_SEEN_ELAPSED_REALTIME] ?: 0L
+                lastSeenElapsedRealtime = p[Keys.LAST_SEEN_ELAPSED_REALTIME] ?: 0L,
+                pendingApartSince = p[Keys.PENDING_APART_SINCE] ?: 0L
             )
             val updated = transform(currentState)
             p[Keys.IS_TOGETHER] = updated.isTogether
@@ -553,6 +566,7 @@ class ProximityStateStore(private val context: Context) {
             p[Keys.SESSION_ID] = updated.currentSessionId
             p[Keys.PENDING_CELEBRATION] = updated.pendingReunionCelebration
             p[Keys.LAST_SEEN_ELAPSED_REALTIME] = updated.lastSeenElapsedRealtime
+            p[Keys.PENDING_APART_SINCE] = updated.pendingApartSince
         }
     }
 }

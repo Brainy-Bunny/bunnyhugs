@@ -24,6 +24,7 @@ import com.ssbmedia.twogether.ble.BlePermissions
 import com.ssbmedia.twogether.ble.GattSyncManager
 import com.ssbmedia.twogether.ble.ProximityStateMachine
 import com.ssbmedia.twogether.ble.ScannerManager
+import com.ssbmedia.twogether.badges.BadgeCatalog
 import com.ssbmedia.twogether.data.datastore.ProximityPersistedState
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.notif.Notifications
@@ -205,9 +206,16 @@ class ProximityForegroundService : LifecycleService() {
 
         val effectiveTogether = persisted.isTogether && !isStale
         stateMachine.restoreState(effectiveTogether, persisted.lastSeenAt)
-        continuousTogetherSinceMillis = if (effectiveTogether) persisted.continuousTogetherSince else 0L
 
-        selfHealOrphanedSession(persisted, isStale, now)
+        // Item 9 (UX-FIX-PLAN.md): a persisted pendingApartSince that's still within SESSION_GRACE_MILLIS
+        // means the process died/restarted mid-grace-window - the fast isTogether flip already correctly
+        // happened (persisted.isTogether is false), but the underlying TogetherSession row and the
+        // continuous-together timer are still "live" pending a possible resume, not something to reset.
+        // See selfHealOrphanedSession's own doc for how this interacts with the stale-session self-heal.
+        val stillWithinGrace = !effectiveTogether && withinGraceWindow(persisted.pendingApartSince, now)
+        continuousTogetherSinceMillis = if (effectiveTogether || stillWithinGrace) persisted.continuousTogetherSince else 0L
+
+        selfHealOrphanedSession(persisted, isStale, stillWithinGrace, now)
 
         if (isStale) {
             // Estimate the real moment they actually went apart (last confirmed sighting + the absence
@@ -228,9 +236,16 @@ class ProximityForegroundService : LifecycleService() {
         }
     }
 
-    private suspend fun selfHealOrphanedSession(persisted: ProximityPersistedState, isStale: Boolean, now: Long) {
+    private suspend fun selfHealOrphanedSession(persisted: ProximityPersistedState, isStale: Boolean, stillWithinGrace: Boolean, now: Long) {
         val openSession = ServiceLocator.sessionRepository.getOpenSession() ?: return
         if (persisted.isTogether && !isStale) return // plausibly still together right now; normal flow (a real apart transition) will close it correctly.
+        // Item 9 (UX-FIX-PLAN.md): a session still inside its grace window when the process died is NOT
+        // orphaned/stale - it's exactly the same "waiting to see if they reconnect" state a live apart
+        // transition leaves behind, just interrupted by a restart. Leave it open; tick()'s own
+        // checkGraceExpiry (running on the next tick, since the ticker starts right after restoreState()
+        // completes) will close it for real once/if the window actually elapses, and
+        // handleBecameTogether's resume path can still pick it back up on a reconnect in the meantime.
+        if (stillWithinGrace) return
         // Bounded by the newest CONFIRMED sighting (maxOf(lastSeenAt, startedAt)) + the absence timeout,
         // never by a bare "now" - see StatsCalculator.effectiveOpenSessionEnd's doc. Falling back to
         // "now" when lastSeenAt was 0/absent used to bake the entire wall-clock gap into the row here,
@@ -331,6 +346,14 @@ class ProximityForegroundService : LifecycleService() {
             handleBecameApart(now)
         }
 
+        // Item 9 (UX-FIX-PLAN.md): checked on every tick while apart (not just the one tick where the
+        // transition happened) - a TogetherSession row handleBecameApart left open only actually gets
+        // closed once SESSION_GRACE_MILLIS has elapsed since the apart transition. See checkGraceExpiry's
+        // own doc.
+        if (!stateMachine.isTogether) {
+            checkGraceExpiry(now)
+        }
+
         if (stateMachine.isTogether) {
             checkPhotoReminder(now)
         }
@@ -348,19 +371,33 @@ class ProximityForegroundService : LifecycleService() {
             // never accelerate an unlock - see TimeCapsuleRepository.unlockEligible's doc for the full
             // anti-cheat reasoning (manual hours cancel out of the actual unlock condition entirely).
             val sessions = ServiceLocator.sessionRepository.getAll()
-            val hours = StatsCalculator.compute(
+            val stats = StatsCalculator.compute(
                 sessions,
                 now = now,
                 lastSeenAt = stateMachine.lastSeenAt,
                 absenceTimeoutMillis = stateMachine.absenceTimeoutMillis
-            ).totalHoursAllTime
+            )
             val manualCredit = StatsCalculator.manualHoursCredit(
                 sessions,
                 now = now,
                 lastSeenAt = stateMachine.lastSeenAt,
                 absenceTimeoutMillis = stateMachine.absenceTimeoutMillis
             )
-            ServiceLocator.timeCapsuleRepository.unlockEligible(hours.toFloat(), manualCredit)
+            ServiceLocator.timeCapsuleRepository.unlockEligible(stats.totalHoursAllTime.toFloat(), manualCredit)
+
+            // Item 15 (UX-FIX-PLAN.md): record each newly-unlocked badge's timestamp right here, in the
+            // background tick, rather than only when the user happens to have the Badges screen open (the
+            // old bug - BadgesViewModel.recordNewlyUnlocked was only ever invoked from a LaunchedEffect on
+            // BadgesScreen). A badge earned in March but not viewed until July used to get persisted as
+            // "unlocked on Jul 14" - wrong. This runs continuously in the background (same as the Time
+            // Capsule unlock check just above), so the timestamp is captured close to when it actually
+            // happens instead. recordUnlockIfNeeded is itself idempotent (first-write-wins, see
+            // BadgeUnlocksStore's doc), so calling it here every minute for every already-unlocked badge is
+            // harmless - only a badge crossing its threshold for the first time actually writes anything.
+            // BadgesScreen's own recording call is left in place too (still correct, just now usually a
+            // no-op) as a same-instant fallback for whoever has the screen open at the exact unlock moment.
+            val unlockedBadgeIds = BadgeCatalog.statuses(stats).filter { it.unlocked }.map { it.badge.id }
+            unlockedBadgeIds.forEach { ServiceLocator.badgeUnlocksStore.recordUnlockIfNeeded(it, now) }
         }
 
         // Catch-all periodic sync while continuously together: the transition-based trigger (on the
@@ -474,19 +511,48 @@ class ProximityForegroundService : LifecycleService() {
     private suspend fun handleBecameTogether(now: Long, device: BluetoothDevice, tieBreak: Byte) {
         val persisted = ServiceLocator.proximityStateStore.current()
         val gapMillis = if (persisted.lastApartSince > 0) now - persisted.lastApartSince else Long.MAX_VALUE
-        val isReunion = persisted.lastApartSince > 0 && gapMillis >= StatsCalculator.REUNION_GAP_MILLIS &&
-            StatsCalculator.isSameCalendarDay(persisted.lastApartSince, now)
+        // Item 10 (UX-FIX-PLAN.md): dropped the same-calendar-day requirement this used to also check
+        // (via StatsCalculator.isSameCalendarDay) - an overnight or multi-day reunion was silently never
+        // celebrated before, however long the real gap was. Only the gap threshold matters now, mirroring
+        // StatsCalculator.countReunions' own fix. Interaction with item 9: SESSION_GRACE_MILLIS (10 min)
+        // is far shorter than REUNION_GAP_MILLIS (60 min, enforced below), so a grace-window "resume" -
+        // which never touches persisted.lastApartSince in the first place, see the resume branch below -
+        // can never itself be misread as a reunion.
+        val isReunion = persisted.lastApartSince > 0 && gapMillis >= StatsCalculator.REUNION_GAP_MILLIS
 
-        val sessionId = ServiceLocator.sessionRepository.startSession(now)
-        continuousTogetherSinceMillis = now
+        // Item 9 (UX-FIX-PLAN.md): if the apart transition that just ended is still within its grace
+        // window and left a TogetherSession row open, this is a RESUME - reconnecting the SAME session
+        // rather than starting a brand new one, so the "Together for" timer (both this service's own
+        // notification text and HomeScreen's card, which reads straight off the session's startedAt)
+        // snaps back to its old running total instead of restarting from zero. Falls through to the
+        // normal "new session" path if the grace window already expired (checkGraceExpiry may have beaten
+        // this beacon sighting to it and already closed the session) or there was never a pending apart to
+        // begin with.
+        val resumableSession = if (withinGraceWindow(persisted.pendingApartSince, now)) {
+            ServiceLocator.sessionRepository.getOpenSession()
+        } else {
+            null
+        }
+
+        val sessionId: Long
+        if (resumableSession != null) {
+            sessionId = resumableSession.id
+            // Deliberately NOT touching continuousTogetherSinceMillis here (unlike the new-session branch
+            // below) - it was left untouched by handleBecameApart too, so it's still holding the original
+            // together-since instant from before the brief apart. That's the whole point of a resume.
+        } else {
+            sessionId = ServiceLocator.sessionRepository.startSession(now)
+            continuousTogetherSinceMillis = now
+        }
 
         ServiceLocator.proximityStateStore.update {
             it.copy(
                 isTogether = true,
-                continuousTogetherSince = now,
+                continuousTogetherSince = if (resumableSession != null) it.continuousTogetherSince else now,
                 currentSessionId = sessionId,
                 reminderFiredForSession = false,
                 snoozeUntil = 0L,
+                pendingApartSince = 0L,
                 pendingReunionCelebration = it.pendingReunionCelebration || isReunion
             )
         }
@@ -502,39 +568,47 @@ class ProximityForegroundService : LifecycleService() {
 
     private suspend fun handleBecameApart(now: Long) {
         val openSession = ServiceLocator.sessionRepository.getOpenSession()
-        // lastApartSince must match the session's own endedAt (the ESTIMATED real apart instant), not
-        // the raw wall-clock `now` this tick happened to run at - otherwise reunion counting drifts: the
-        // live celebration (ProximityForegroundService, keyed off lastApartSince) and the historical
-        // Stats.reunionCount (StatsCalculator, keyed off the DB session's endedAt) can end up straddling
-        // different calendar days for the exact same real-world apart event, since `now` always lags the
-        // clamped instant by however long the ticker took to notice the absence timeout - occasionally
-        // enough to cross local midnight. Mirrors restoreState()'s estimatedApartSince for the same reason.
+        // lastApartSince must match the session's own estimated real-apart instant (the CLAMPED value
+        // below), not the raw wall-clock `now` this tick happened to run at - otherwise reunion counting
+        // drifts: the live celebration (ProximityForegroundService, keyed off lastApartSince) and the
+        // historical Stats.reunionCount (StatsCalculator) can end up disagreeing about exactly when the
+        // apart event happened for the same real-world gap, since `now` always lags the clamped instant by
+        // however long the ticker took to notice the absence timeout. Mirrors restoreState()'s
+        // estimatedApartSince for the same reason. This is computed regardless of the grace window below -
+        // it's an ESTIMATE of when they actually went apart, independent of when the session row itself
+        // gets torn down.
         val apartSince = if (openSession != null) {
-            // Clamp instead of always stamping "now": if the service was asleep/dead for a stretch
-            // while genuinely together (process death, reboot) and only now catches up to the absence
-            // timeout on restart, using "now" would credit the entire downtime gap as together-time.
-            // lastSeenAt reflects the last real sighting (restored from persisted state if this is a
-            // post-restart catch-up), so the session can never be credited past that + the timeout.
-            val clampedEnd = StatsCalculator.effectiveOpenSessionEnd(
+            StatsCalculator.effectiveOpenSessionEnd(
                 startedAt = openSession.startedAt,
                 now = now,
                 lastSeenAt = stateMachine.lastSeenAt,
                 absenceTimeoutMillis = stateMachine.absenceTimeoutMillis
             ).coerceAtLeast(openSession.startedAt)
-            ServiceLocator.sessionRepository.endSession(openSession, clampedEnd)
-            clampedEnd
         } else {
             now
         }
-        continuousTogetherSinceMillis = 0L
+        // Item 9 (UX-FIX-PLAN.md): do NOT end the session (or reset the continuous-together timer) right
+        // away. The fast ~100s isTogether flip just above is intentionally immediate/honest for the
+        // Apart/Together status card - but the underlying TogetherSession row now gets a grace window
+        // (SESSION_GRACE_MILLIS, ~10 min) before it's actually torn down, tracked via pendingApartSince, so
+        // a brief reconnect (handleBecameTogether's resume path) can pick the SAME session back up instead
+        // of the "Together for" timer restarting from zero. See tick()'s checkGraceExpiry for where the
+        // session actually gets closed once/if the window elapses. continuousTogetherSinceMillis (and the
+        // persisted continuousTogetherSince mirror) are deliberately left untouched here for the same
+        // reason - a resume must find them still holding the original together-since instant.
         ServiceLocator.proximityStateStore.update {
             it.copy(
                 isTogether = false,
-                continuousTogetherSince = 0L,
-                currentSessionId = -1L,
+                // currentSessionId deliberately left untouched when there IS an open session (it already
+                // correctly points at it, and it's still "the" session pending the grace-window decision -
+                // see checkGraceExpiry, which is what actually resets this to -1). Only forced back to -1
+                // here in the (edge-case) event there was no open session to begin with, so this can never
+                // drift to point at nothing.
+                currentSessionId = if (openSession != null) it.currentSessionId else -1L,
                 reminderFiredForSession = false,
                 snoozeUntil = 0L,
-                lastApartSince = apartSince
+                lastApartSince = apartSince,
+                pendingApartSince = if (openSession != null) now else 0L
             )
         }
         Notifications.cancelPhotoReminder(this)
@@ -543,6 +617,39 @@ class ProximityForegroundService : LifecycleService() {
         gattSync.disconnectClient()
         resetClientSyncGuard()
         updateNotification(now)
+    }
+
+    /** Item 9 (UX-FIX-PLAN.md): checked every tick while apart (see tick()'s call site) - once
+     * SESSION_GRACE_MILLIS has elapsed since handleBecameApart recorded pendingApartSince, the
+     * TogetherSession row it deliberately left open is now actually closed for real, and the
+     * continuous-together timer resets. Until this fires, handleBecameTogether's resume path can still
+     * pick the same session back up on a reconnect. No-ops (cheaply) on every tick before the window
+     * elapses, and once there's no pendingApartSince to act on at all (already resolved one way or the
+     * other, or never together to begin with). */
+    private suspend fun checkGraceExpiry(now: Long) {
+        val persisted = ServiceLocator.proximityStateStore.current()
+        if (!graceWindowExpired(persisted.pendingApartSince, now)) return
+
+        val openSession = ServiceLocator.sessionRepository.getOpenSession()
+        if (openSession != null) {
+            // Same clamp formula as handleBecameApart/selfHealOrphanedSession - stateMachine.lastSeenAt
+            // hasn't moved since they went apart (no new sightings), so this resolves to the exact same
+            // estimated-real-apart instant regardless of how much of the grace window has elapsed since:
+            // effectiveOpenSessionEnd's minOf(now, lastSeenAt + absenceTimeout) picks the earlier,
+            // already-fixed bound either way. The grace window's extra wait time is never itself credited
+            // as together-time.
+            val clampedEnd = StatsCalculator.effectiveOpenSessionEnd(
+                startedAt = openSession.startedAt,
+                now = now,
+                lastSeenAt = stateMachine.lastSeenAt,
+                absenceTimeoutMillis = stateMachine.absenceTimeoutMillis
+            ).coerceAtLeast(openSession.startedAt)
+            ServiceLocator.sessionRepository.endSession(openSession, clampedEnd)
+        }
+        continuousTogetherSinceMillis = 0L
+        ServiceLocator.proximityStateStore.update {
+            it.copy(continuousTogetherSince = 0L, currentSessionId = -1L, pendingApartSince = 0L)
+        }
     }
 
     private suspend fun checkPhotoReminder(now: Long) {
@@ -769,5 +876,26 @@ class ProximityForegroundService : LifecycleService() {
     companion object {
         private const val TAG = "ProximityService"
         private const val FIFTEEN_MINUTES_MILLIS = 15 * 60 * 1000L
+
+        /** Item 9 (UX-FIX-PLAN.md): how long a TogetherSession row (and the continuous-together timer) is
+         * given after the fast ~100s isTogether apart-flip before it's actually torn down for real - see
+         * handleBecameApart/checkGraceExpiry/handleBecameTogether's resume path. Deliberately much shorter
+         * than StatsCalculator.REUNION_GAP_MILLIS (60 min) so a grace-window resume can never itself look
+         * like a reunion - see handleBecameTogether's isReunion doc (item 10's interaction note). */
+        const val SESSION_GRACE_MILLIS = 10 * 60 * 1000L
+
+        /** Pure decision helper - unit-tested directly (via reflection, since it's private - see
+         * GraceWindowAuditTest) rather than only indirectly through the full Service. True iff a reconnect
+         * at [now] should resume the session left open at [pendingApartSince] (a
+         * ProximityPersistedState.pendingApartSince value) rather than starting a brand new one. Also true
+         * for [checkGraceExpiry]'s own "should I close it yet" question via [graceWindowExpired] below -
+         * the two are complements of each other for any pendingApartSince > 0. */
+        private fun withinGraceWindow(pendingApartSince: Long, now: Long): Boolean =
+            pendingApartSince > 0L && now - pendingApartSince < SESSION_GRACE_MILLIS
+
+        /** Pure decision helper (private, unit-tested via reflection) - true iff the grace window opened
+         * at [pendingApartSince] has now elapsed and a still-open session should actually be closed. */
+        private fun graceWindowExpired(pendingApartSince: Long, now: Long): Boolean =
+            pendingApartSince > 0L && now - pendingApartSince >= SESSION_GRACE_MILLIS
     }
 }
