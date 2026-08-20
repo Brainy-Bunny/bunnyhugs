@@ -169,6 +169,79 @@ class GattSyncMergeSecurityAuditTest {
         assertTrue("a forged future updatedAt must never merge in", result.isEmpty())
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // BLOCKER fix (ultimate-app-review Round 1, Opus+Sonnet both independently live-reproduced): an
+    // unbounded DayNote.date epoch-day sailed through deserializeDayNotes with no plausibility check at
+    // all, then crashed CalendarScreen.kt's unguarded LocalDate.ofEpochDay(it.date) on every subsequent
+    // render - reproduced live both via a crafted backup restore AND over a real authenticated BLE sync
+    // between two paired phones. These tests cover the fix (MIN/MAX_PLAUSIBLE_DAY_NOTE_EPOCH_DAY bound).
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    fun `a legitimate present-day epoch day survives the merge`() {
+        val now = System.currentTimeMillis()
+        val epochDay = now / 86_400_000L
+        val arr = dayNoteJson(epochDay, "partner-device", "a real note", now)
+        val result = deserializeDayNotes(newManager(), arr)
+        assertEquals(1, result.size)
+    }
+
+    @Test
+    fun `an absurdly large forged epoch day is rejected, not left to crash LocalDate ofEpochDay later`() {
+        val now = System.currentTimeMillis()
+        // The exact value live-reproduced against CalendarScreen.kt's LocalDate.ofEpochDay(it.date) -
+        // see the Round 1 report's captured stack trace for this precise number.
+        val arr = dayNoteJson(999_999_999_999_999L, "partner-device", "poison", now)
+        val result = deserializeDayNotes(newManager(), arr)
+        assertTrue("an out-of-range epoch day must never merge in", result.isEmpty())
+    }
+
+    @Test
+    fun `Long MAX_VALUE and MIN_VALUE epoch days are both rejected`() {
+        val now = System.currentTimeMillis()
+        val maxArr = dayNoteJson(Long.MAX_VALUE, "partner-device", "poison", now)
+        val minArr = dayNoteJson(Long.MIN_VALUE, "partner-device", "poison", now)
+        assertTrue(deserializeDayNotes(newManager(), maxArr).isEmpty())
+        assertTrue(deserializeDayNotes(newManager(), minArr).isEmpty())
+    }
+
+    @Test
+    fun `a genuinely old but plausible epoch day (year 2021) still survives the merge`() {
+        // Guards against an overcorrection - the fix must not reject real historical data, only
+        // technically-out-of-LocalDate-range or absurd values.
+        val arr = dayNoteJson(18_628L, "partner-device", "an old real note", System.currentTimeMillis())
+        val result = deserializeDayNotes(newManager(), arr)
+        assertEquals(1, result.size)
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // MINOR fix (ultimate-app-review Round 1, Opus live-reproduced): isPlausibleWireUpdatedAt had no
+    // lower bound, so a peer's untouched-setting sentinel (updatedAt = 0L), after the standard
+    // peerClockOffsetMillis correction, could turn into a small POSITIVE number that passed the
+    // upper-bound-only check and could beat a genuinely untouched local default - falsifying the
+    // settings-sync merge's own documented "0 > 0 is false either way" invariant. Tested here via
+    // deserializeDayNotes (any deserializer sharing this gate would show the same behavior) since it's
+    // already wired into this file's test helpers.
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    fun `a near-zero corrected-sentinel updatedAt is rejected by the new lower bound`() {
+        val epochDay = System.currentTimeMillis() / 86_400_000L
+        // Simulates the exact live-observed failure: a raw 0L sentinel, corrected by a small clock-skew
+        // offset, lands just above zero instead of staying at zero.
+        val arr = dayNoteJson(epochDay, "partner-device", "should be rejected", 350L)
+        val result = deserializeDayNotes(newManager(), arr)
+        assertTrue("a corrected-near-zero sentinel must never pass as a plausible updatedAt", result.isEmpty())
+    }
+
+    @Test
+    fun `a genuine recent updatedAt still passes the lower bound`() {
+        val epochDay = System.currentTimeMillis() / 86_400_000L
+        val arr = dayNoteJson(epochDay, "partner-device", "genuine", System.currentTimeMillis())
+        val result = deserializeDayNotes(newManager(), arr)
+        assertEquals(1, result.size)
+    }
+
     @Test
     fun `endedAt before startedAt is rejected`() {
         val now = System.currentTimeMillis()

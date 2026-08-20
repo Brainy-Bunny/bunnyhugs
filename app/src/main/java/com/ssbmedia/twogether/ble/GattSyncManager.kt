@@ -304,6 +304,23 @@ class GattSyncManager(
         // judged against OUR clock unmodified, which correctly rejects it as implausible rather than
         // laundering it into a plausible-looking but wrong moment in the past).
         val peerClockOffsetMillis = boundPeerClockOffset(rawPeerClockOffsetMillis)
+        // MAJOR fix (ultimate-app-review Round 1, Opus - correcting an inaccurate checklist claim that
+        // deserializeDayNotes alone used throwing getters "unlike every other deserializer in this file":
+        // false, EVERY deserializeX function below uses throwing getString/getLong/getBoolean/getInt, same
+        // as this one always has. The real, confirmed defect was structural, not in any one deserializer:
+        // there was no try/catch around each entity-type's parse+merge step, nor around the individual
+        // deserializeX calls, so a single malformed row of ANY type (a missing required key, wrong JSON
+        // type) threw a JSONException straight out of this function and aborted every entity type
+        // sequenced after it in the same payload - live-verified: milestones, time capsules, the settings
+        // merge, the stale-pending-resync clear, and the partner-pin write all never ran. A malicious peer
+        // holding the pairing code could permanently deny sync with one bad row, and every retry would hit
+        // the identical payload and fail the identical way. Each entity type below is now independently
+        // try/caught: a failure in one type is logged and treated as "this type contributed nothing this
+        // sync" (same shape as the existing implausible-row-drop accounting just below), while every OTHER
+        // entity type in the same payload still merges normally - matching this file's own per-row
+        // `return@mapNotNull null` skip pattern, just one level up (per-entity-type instead of per-row) for
+        // the class of failure a single skip can't catch (a thrown exception, not a rejected value).
+        //
         // Self-heal: a remote idea can arrive pointing at a list that got deleted on the OTHER device
         // while this one was independently adding to it (see DateIdeaRepository.reassignOrphans' doc for
         // the exact race). Both merges + the reassign sweep run as ONE atomic transaction (see
@@ -312,62 +329,115 @@ class GattSyncManager(
         // state where one table's merge has committed but the other's hasn't yet.
         val listCategoriesArr = root.optJSONArray("listCategories")
         val dateIdeasArr = root.optJSONArray("dateIdeas")
-        val listCategoriesParsed = deserializeListCategories(listCategoriesArr, peerClockOffsetMillis)
-        val dateIdeasParsed = deserializeDateIdeas(dateIdeasArr, peerClockOffsetMillis)
-        listCategoryRepository.mergeRemoteWithIdeas(listCategoriesParsed, dateIdeasParsed)
+        var listCategoriesParsed = emptyList<ListCategory>()
+        var dateIdeasParsed = emptyList<DateIdea>()
+        try {
+            listCategoriesParsed = deserializeListCategories(listCategoriesArr, peerClockOffsetMillis)
+            dateIdeasParsed = deserializeDateIdeas(dateIdeasArr, peerClockOffsetMillis)
+            listCategoryRepository.mergeRemoteWithIdeas(listCategoriesParsed, dateIdeasParsed)
+        } catch (e: Exception) {
+            Log.w(TAG, "Sync: listCategories/dateIdeas block failed, skipping just this entity type", e)
+        }
         val sessionsArr = root.optJSONArray("sessions")
-        val sessionsParsed = deserializeSessions(sessionsArr, peerClockOffsetMillis)
-        sessionRepository.mergeRemoteSessions(sessionsParsed)
-        // UX (user-requested follow-up): see SessionRepository.adoptEarlierOpenSessionStart's doc. Only
-        // runs on an already-trusted payload (below the pin-mismatch check above), same as every other
-        // merge in this function - corrected into OUR clock's frame with the same peerClockOffsetMillis
-        // every other timestamp here uses.
-        if (!root.isNull("openSessionStartedAt")) {
-            sessionRepository.adoptEarlierOpenSessionStart(root.optLong("openSessionStartedAt", 0L) - peerClockOffsetMillis)
+        var sessionsParsed = emptyList<TogetherSession>()
+        try {
+            sessionsParsed = deserializeSessions(sessionsArr, peerClockOffsetMillis)
+            sessionRepository.mergeRemoteSessions(sessionsParsed)
+            // UX (user-requested follow-up): see SessionRepository.adoptEarlierOpenSessionStart's doc. Only
+            // runs on an already-trusted payload (below the pin-mismatch check above), same as every other
+            // merge in this function - corrected into OUR clock's frame with the same peerClockOffsetMillis
+            // every other timestamp here uses.
+            if (!root.isNull("openSessionStartedAt")) {
+                sessionRepository.adoptEarlierOpenSessionStart(root.optLong("openSessionStartedAt", 0L) - peerClockOffsetMillis)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Sync: sessions block failed, skipping just this entity type", e)
         }
         val momentsArr = root.optJSONArray("moments")
-        val momentsParsed = deserializeMoments(momentsArr, peerClockOffsetMillis)
-        momentRepository.mergeRemoteStubs(momentsParsed)
+        var momentsParsed = emptyList<Moment>()
+        try {
+            momentsParsed = deserializeMoments(momentsArr, peerClockOffsetMillis)
+            momentRepository.mergeRemoteStubs(momentsParsed)
+        } catch (e: Exception) {
+            Log.w(TAG, "Sync: moments block failed, skipping just this entity type", e)
+        }
         val notesArr = root.optJSONArray("notes")
-        val notesParsed = deserializeNotes(notesArr, peerClockOffsetMillis)
-        momentNoteRepository.mergeRemote(notesParsed, deviceId)
+        var notesParsed = emptyList<MomentNote>()
+        try {
+            notesParsed = deserializeNotes(notesArr, peerClockOffsetMillis)
+            momentNoteRepository.mergeRemote(notesParsed, deviceId)
+        } catch (e: Exception) {
+            Log.w(TAG, "Sync: notes block failed, skipping just this entity type", e)
+        }
         // UX-FIX-PLAN.md Phase 4 item 25: see DayNoteRepository.mergeRemote's doc for the identical
         // own-deviceId-never-trusted reasoning momentNoteRepository.mergeRemote above already applies.
         val dayNotesArr = root.optJSONArray("dayNotes")
-        val dayNotesParsed = deserializeDayNotes(dayNotesArr, peerClockOffsetMillis)
-        dayNoteRepository.mergeRemote(dayNotesParsed, deviceId)
+        var dayNotesParsed = emptyList<DayNote>()
+        try {
+            dayNotesParsed = deserializeDayNotes(dayNotesArr, peerClockOffsetMillis)
+            dayNoteRepository.mergeRemote(dayNotesParsed, deviceId)
+        } catch (e: Exception) {
+            Log.w(TAG, "Sync: dayNotes block failed, skipping just this entity type", e)
+        }
         // BUG fix: an independent audit round found milestones arriving via sync never got their yearly
         // alarm armed until the next cold start/boot, unlike every other way a Milestone enters the DB
         // (local add, backup restore, app start) - all of which call MilestoneAlarmScheduler right away.
         // Arms only what was actually upserted here, not the whole table, for the same reason
         // BackupManager.scheduleAll is only ever called once per restore rather than on every sync.
         val milestonesArr = root.optJSONArray("milestones")
-        val (milestonesParsed, milestonesMissingLinkedMomentField) = deserializeMilestones(milestonesArr, peerClockOffsetMillis)
-        val upsertedMilestones = milestoneRepository.mergeRemote(milestonesParsed, milestonesMissingLinkedMomentField)
-        MilestoneAlarmScheduler.scheduleAll(context, upsertedMilestones.filter { !it.deleted })
+        var milestonesParsed = emptyList<Milestone>()
+        try {
+            val (parsed, milestonesMissingLinkedMomentField) = deserializeMilestones(milestonesArr, peerClockOffsetMillis)
+            milestonesParsed = parsed
+            val upsertedMilestones = milestoneRepository.mergeRemote(milestonesParsed, milestonesMissingLinkedMomentField)
+            MilestoneAlarmScheduler.scheduleAll(context, upsertedMilestones.filter { !it.deleted })
+        } catch (e: Exception) {
+            Log.w(TAG, "Sync: milestones block failed, skipping just this entity type", e)
+        }
         // Feature: Time Capsule sync. See TimeCapsuleRepository.mergeRemote's doc for why unlockedAt is
         // never trusted from this parsed data even though the definitional fields are.
         val timeCapsulesArr = root.optJSONArray("timeCapsules")
-        val timeCapsulesParsed = deserializeTimeCapsules(timeCapsulesArr, peerClockOffsetMillis)
-        timeCapsuleRepository.mergeRemote(timeCapsulesParsed)
+        var timeCapsulesParsed = emptyList<com.ssbmedia.twogether.data.db.TimeCapsule>()
+        try {
+            timeCapsulesParsed = deserializeTimeCapsules(timeCapsulesArr, peerClockOffsetMillis)
+            timeCapsuleRepository.mergeRemote(timeCapsulesParsed)
+        } catch (e: Exception) {
+            Log.w(TAG, "Sync: timeCapsules block failed, skipping just this entity type", e)
+        }
         // Couple-level settings sync: plain per-field last-write-wins, same shape as every other
         // entity's updatedAt merge in this function, just against two bare scalars instead of a table -
-        // see AppSettings.sessionGraceMinutesUpdatedAt/reunionThresholdMinutesUpdatedAt's own docs. A
-        // peer that never touched a setting sends its timestamp as 0L, which - after the same
-        // peerClockOffsetMillis correction every other timestamp here gets - naturally loses to any real
-        // local customization (real timestamp > 0) and naturally loses to another untouched local default
-        // (0 > 0 is false either way), so no special-casing of "never touched" is needed: the ordinary
-        // comparison already does the right thing in both directions.
+        // see AppSettings.sessionGraceMinutesUpdatedAt/reunionThresholdMinutesUpdatedAt's own docs.
+        //
+        // MINOR fix (ultimate-app-review Round 1, Opus live-reproduced): the doc that used to sit here
+        // claimed "a peer that never touched a setting sends its timestamp as 0L, which... naturally
+        // loses to another untouched local default (0 > 0 is false either way), so no special-casing of
+        // 'never touched' is needed" - that reasoning silently assumed the compared value stays 0. It
+        // doesn't: `shouldAdoptSyncedSetting` receives `remoteUpdatedAt` AFTER peerClockOffsetMillis
+        // correction (`0L - peerClockOffsetMillis`), and isPlausibleWireUpdatedAt only bounds the upper
+        // end - a peer whose clock reads slightly BEHIND ours (or, live-observed, purely from ordinary
+        // BLE transfer latency being read as skew) turns that 0 into a small POSITIVE number, which then
+        // wins a `remoteUpdatedAt > 0` comparison against a genuinely untouched local default. Live
+        // evidence: an untouched setting on both phones ended up stamped with 1970-era timestamps a few
+        // hundred milliseconds apart, matching the two devices' own clock offset exactly - proving the
+        // sentinel was adopted, not rejected. Harmless in practice here (the adopted value equals the
+        // local default either way, so no visible behavior change), but the documented invariant was
+        // false, so isPlausibleWireUpdatedAt now has a real lower bound (see its own doc) that rejects a
+        // corrected-0-ish value outright rather than relying on a comparison that only worked by accident
+        // when clocks happened to be in sync.
         val localSettingsForMerge = settingsStore.current()
-        val remoteSessionGraceMinutes = root.optInt("sessionGraceMinutes", -1)
-        val remoteSessionGraceUpdatedAt = root.optLong("sessionGraceMinutesUpdatedAt", 0L) - peerClockOffsetMillis
-        if (shouldAdoptSyncedSetting(remoteSessionGraceMinutes, remoteSessionGraceUpdatedAt, localSettingsForMerge.sessionGraceMinutesUpdatedAt)) {
-            settingsStore.applySyncedSessionGraceMinutes(remoteSessionGraceMinutes, remoteSessionGraceUpdatedAt)
-        }
-        val remoteReunionThresholdMinutes = root.optInt("reunionThresholdMinutes", -1)
-        val remoteReunionThresholdUpdatedAt = root.optLong("reunionThresholdMinutesUpdatedAt", 0L) - peerClockOffsetMillis
-        if (shouldAdoptSyncedSetting(remoteReunionThresholdMinutes, remoteReunionThresholdUpdatedAt, localSettingsForMerge.reunionThresholdMinutesUpdatedAt)) {
-            settingsStore.applySyncedReunionThresholdMinutes(remoteReunionThresholdMinutes, remoteReunionThresholdUpdatedAt)
+        try {
+            val remoteSessionGraceMinutes = root.optInt("sessionGraceMinutes", -1)
+            val remoteSessionGraceUpdatedAt = root.optLong("sessionGraceMinutesUpdatedAt", 0L) - peerClockOffsetMillis
+            if (shouldAdoptSyncedSetting(remoteSessionGraceMinutes, remoteSessionGraceUpdatedAt, localSettingsForMerge.sessionGraceMinutesUpdatedAt)) {
+                settingsStore.applySyncedSessionGraceMinutes(remoteSessionGraceMinutes, remoteSessionGraceUpdatedAt)
+            }
+            val remoteReunionThresholdMinutes = root.optInt("reunionThresholdMinutes", -1)
+            val remoteReunionThresholdUpdatedAt = root.optLong("reunionThresholdMinutesUpdatedAt", 0L) - peerClockOffsetMillis
+            if (shouldAdoptSyncedSetting(remoteReunionThresholdMinutes, remoteReunionThresholdUpdatedAt, localSettingsForMerge.reunionThresholdMinutesUpdatedAt)) {
+                settingsStore.applySyncedReunionThresholdMinutes(remoteReunionThresholdMinutes, remoteReunionThresholdUpdatedAt)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Sync: settings block failed, skipping just this entity type", e)
         }
         // MAJOR fix (ultimate-app-review, Fable F-4, assertion 6): even with the correction above, a
         // row can still be legitimately rejected (e.g. genuinely implausible even once corrected) - the
@@ -571,8 +641,20 @@ class GattSyncManager(
      * outright instead (used at every LWW merge call site below, same as deserializeSessions above)
      * eliminates the drift entirely: an implausible remote value can never win, no matter how many times
      * it's retransmitted or how much time passes, since it's simply never merged in the first place. */
+    /** MINOR fix (ultimate-app-review Round 1, Opus live-reproduced): this used to have only an upper
+     * bound. The settings-sync feature's own doc claimed a peer's untouched-setting sentinel (`updatedAt
+     * = 0L`) would always lose an LWW comparison against a real local value ("0 > 0 is false either way")
+     * - true only if the compared value actually stays 0. It doesn't: this function receives the value
+     * AFTER peerClockOffsetMillis correction (`0L - offset`), and a peer whose clock reads slightly behind
+     * ours (or, live-observed, ordinary BLE transfer latency alone being read as skew) turns that 0 into a
+     * small POSITIVE number - which then passes this function's old upper-bound-only check and can beat a
+     * genuinely untouched local 0. Live-verified: an untouched setting on both phones ended up stamped
+     * with 1970-era timestamps a few hundred milliseconds apart, matching the two devices' clock offset
+     * exactly. A real lower bound closes this the same "reject, never launder" way the upper bound already
+     * does: anything at or before this app could plausibly have first been installed is exactly as
+     * implausible as something impossibly far in the future, corrected-sentinel-near-zero included. */
     private fun isPlausibleWireUpdatedAt(wireUpdatedAt: Long): Boolean =
-        wireUpdatedAt <= System.currentTimeMillis() + MAX_CLOCK_SKEW_TOLERANCE_MILLIS
+        wireUpdatedAt in MIN_PLAUSIBLE_WIRE_UPDATED_AT_MILLIS..(System.currentTimeMillis() + MAX_CLOCK_SKEW_TOLERANCE_MILLIS)
 
     /** Couple-level settings sync: the whole last-write-wins decision for one scalar setting
      * (sessionGraceMinutes/reunionThresholdMinutes), extracted as a pure function purely so it's directly
@@ -749,6 +831,25 @@ class GattSyncManager(
         return (0 until arr.length()).mapNotNull { i ->
             val o = arr.getJSONObject(i)
             val date = o.getLong("date")
+            // BLOCKER fix (ultimate-app-review Round 1, Opus+Sonnet both independently live-reproduced):
+            // this field was the one untrusted-ingestion value in the whole file with NO plausibility gate
+            // at all - a forged/corrupt epoch-day sailed straight through into Room, and
+            // CalendarScreen.kt's unguarded `LocalDate.ofEpochDay(it.date)` then threw DateTimeException on
+            // every subsequent render of that screen, permanently (no in-app recovery short of clearing all
+            // app data). Live-verified reachable both via a crafted backup restore AND, since a device's own
+            // authored rows are trusted verbatim into its own outgoing payload, over a real authenticated BLE
+            // sync between two paired phones. Same "reject, never clamp" convention every other untrusted
+            // field in this file already uses (isPlausibleWireUpdatedAt, SessionBoundsValidator) - there is
+            // no sensible "clamped" epoch-day for an out-of-range value the way month 0/13 can clamp to 1/12,
+            // so this is a plain bounds-reject, not a coerceIn. Bound is deliberately generous (1970-01-01 to
+            // 2100-01-01, ~47482 days) rather than LocalDate's own technical limit (~365 billion days) -
+            // no legitimate calendar-day note for this app will ever fall outside that window, so this is a
+            // typo/forgery guardrail in the same spirit as TimeCapsuleRepository.MAX_UNLOCK_AT_HOURS, not a
+            // real product constraint.
+            if (date !in MIN_PLAUSIBLE_DAY_NOTE_EPOCH_DAY..MAX_PLAUSIBLE_DAY_NOTE_EPOCH_DAY) {
+                Log.w(TAG, "Dropping remote day note with implausible epochDay=$date")
+                return@mapNotNull null
+            }
             val updatedAt = o.getLong("updatedAt") - peerClockOffsetMillis
             if (!isPlausibleWireUpdatedAt(updatedAt)) {
                 Log.w(TAG, "Dropping remote day note for epochDay=$date with implausible updatedAt=$updatedAt")
@@ -3042,6 +3143,19 @@ class GattSyncManager(
          * configuration (a reunion threshold of "we were apart a month" is already an extreme edge case)
          * while still rejecting an obviously-forged or corrupted value rather than silently accepting it. */
         const val MAX_SETTINGS_MINUTES = 30 * 24 * 60
+
+        /** BLOCKER fix (ultimate-app-review Round 1): plausibility bound for DayNote.date - see
+         * deserializeDayNotes' own doc for the full reasoning. 1970-01-01 (epoch day 0) through
+         * 2100-01-01 (LocalDate.of(2100, 1, 1).toEpochDay(), computed once here as a literal since these
+         * are compile-time constants and the class isn't available in a `const val` initializer). */
+        const val MIN_PLAUSIBLE_DAY_NOTE_EPOCH_DAY = 0L
+        const val MAX_PLAUSIBLE_DAY_NOTE_EPOCH_DAY = 47_482L
+
+        /** MINOR fix (ultimate-app-review Round 1): isPlausibleWireUpdatedAt's new lower bound - see its
+         * own doc. 2020-01-01T00:00:00Z in epoch millis, well before this app existed, generous enough to
+         * never reject genuine user data while still definitively catching a near-zero (1970-epoch)
+         * corrected sentinel value. */
+        const val MIN_PLAUSIBLE_WIRE_UPDATED_AT_MILLIS = 1_577_836_800_000L
 
         /** MAJOR fix (ultimate-app-review, post-restart full-scope round, Opus): caps how large a
          * peer-reported clock offset applyPayload's correction will ever act on - see its own doc for
