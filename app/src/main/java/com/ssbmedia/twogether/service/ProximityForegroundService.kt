@@ -26,6 +26,7 @@ import com.ssbmedia.twogether.ble.ProximityStateMachine
 import com.ssbmedia.twogether.ble.ScannerManager
 import com.ssbmedia.twogether.badges.BadgeCatalog
 import com.ssbmedia.twogether.data.datastore.ProximityPersistedState
+import com.ssbmedia.twogether.data.update.UpdateChecker
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.notif.Notifications
 import com.ssbmedia.twogether.stats.StatsCalculator
@@ -432,6 +433,28 @@ class ProximityForegroundService : LifecycleService() {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Periodic catch-all sync failed - will retry in 15 minutes", e)
+            }
+        }
+
+        // Item 14 (update-nag reach fix): piggybacks a periodic update check on this service's own
+        // ticker, using the same cadence-gating pattern as the two blocks above (secondsElapsed % N ==
+        // 0L) - rather than relying only on WorkManager's own OS-level scheduling (UpdateWorker, which
+        // Doze or an OEM battery manager can defer/skip) or the app-start check (which only fires once
+        // per PROCESS start - and this long-lived foreground service is exactly what can keep the
+        // process alive for days without a fresh start, which is how a real user went days on v2.6
+        // without ever being prompted to update to v2.7's data-loss fix). Checked every 30 minutes here;
+        // UpdateChecker.MIN_CHECK_INTERVAL_MS (the same constant the app-start check throttles against)
+        // is what actually rate-limits real network calls to at most once per 6h - this cadence just
+        // decides how often to even CONSIDER checking, not how often it hits the network.
+        if (secondsElapsed % 1800 == 0L) {
+            try {
+                val settings = ServiceLocator.settingsStore.current()
+                if (settings.autoUpdateCheckEnabled && now - settings.lastUpdateCheckAt > UpdateChecker.MIN_CHECK_INTERVAL_MS) {
+                    ServiceLocator.settingsStore.setLastUpdateCheckAt(now)
+                    UpdateChecker.checkAndNotify(this)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Periodic update check from the foreground service failed - will retry next cadence", e)
             }
         }
 

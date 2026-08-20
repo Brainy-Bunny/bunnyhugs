@@ -467,7 +467,7 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                 // (app-level or OS-permission-level), and there was no way back to it short of manually
                 // tapping "Check for updates now" again. This persists regardless of notification state,
                 // reading the same durable flag UpdateChecker sets the moment it finishes downloading.
-                if (settings.pendingUpdateVersionCode > BuildConfig.VERSION_CODE) {
+                if (UpdateChecker.isPendingUpdateActionable(settings.pendingUpdateVersionCode, BuildConfig.VERSION_CODE)) {
                     val pendingName = settings.pendingUpdateVersionName ?: "update"
                     val pendingPath = settings.pendingUpdateApkPath
                     Card(

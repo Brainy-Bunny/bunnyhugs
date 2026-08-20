@@ -20,7 +20,23 @@ object Notifications {
     const val CHANNEL_STATUS = "status"
     const val CHANNEL_REMINDERS = "reminders"
     const val CHANNEL_MILESTONES = "milestones"
-    const val CHANNEL_UPDATES = "updates"
+    /** Item 14 (update-nag reach fix): bumped from IMPORTANCE_DEFAULT to IMPORTANCE_HIGH so a granted-
+     * permission "Update available" notification actually heads-up-pops instead of sitting quietly in
+     * the shade - a real user shipped v2.7 (a genuine data-loss bug fix) and went days without noticing
+     * it was ready. Android notification channel importance is IMMUTABLE once a channel is created on a
+     * real device - simply changing IMPORTANCE_DEFAULT to IMPORTANCE_HIGH in ensureChannels' own
+     * NotificationChannel(...) call below does nothing at all for anyone who already has the OLD
+     * "updates" channel from a prior install (their channel stays stuck at whatever importance it was
+     * first created with, forever, regardless of what this code says from here on). A new channel id is
+     * the only way to actually take effect for upgrading users - see CHANNEL_UPDATES_LEGACY below, which
+     * ensureChannels explicitly deletes so the old channel doesn't linger as a dead, still-visible entry
+     * in system notification settings. */
+    const val CHANNEL_UPDATES = "updates_v2"
+    /** The pre-item-14 channel id (IMPORTANCE_DEFAULT) - see CHANNEL_UPDATES' own doc for why this can't
+     * just be upgraded in place. Deleted in ensureChannels() on every app start; deleteNotificationChannel
+     * is a harmless no-op for an install that never had this channel (fresh installs, or one already
+     * upgraded past this point). */
+    private const val CHANNEL_UPDATES_LEGACY = "updates"
     /** Separate (and deliberately LOW-importance, silent) channel from CHANNEL_STATUS, so the battery
      * nag is clearly distinguishable from the normal always-on "together/apart" status notification
      * rather than folded into its text - see buildBatteryWarningNotification's doc. */
@@ -83,7 +99,7 @@ object Notifications {
             description = "Yearly reminders for the dates you two have marked as milestones"
         }
         val updatesChannel = NotificationChannel(
-            CHANNEL_UPDATES, "App updates", NotificationManager.IMPORTANCE_DEFAULT
+            CHANNEL_UPDATES, "App updates", NotificationManager.IMPORTANCE_HIGH
         ).apply {
             description = "Lets you know when a newer version of Twogether is ready to install"
         }
@@ -110,6 +126,11 @@ object Notifications {
         manager.createNotificationChannel(batteryChannel)
         manager.createNotificationChannel(backupChannel)
         manager.createNotificationChannel(pairingChannel)
+        // See CHANNEL_UPDATES_LEGACY's doc - removes the old lower-importance "updates" channel so
+        // upgrading users don't end up with a dead duplicate sitting in system notification settings
+        // alongside the new CHANNEL_UPDATES one. No-op if it was never created (fresh install) or was
+        // already deleted on a previous app start.
+        manager.deleteNotificationChannel(CHANNEL_UPDATES_LEGACY)
     }
 
     fun buildStatusNotification(context: Context, contentText: String): Notification {
