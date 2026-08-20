@@ -267,7 +267,11 @@ fun HomeScreen(
     val vm: HomeViewModel = viewModel(factory = SimpleViewModelFactory { HomeViewModel() })
     val pairingInfo by vm.pairingInfo.collectAsState()
     val sessions by vm.sessions.collectAsState()
-    val openSession by vm.openSession.collectAsState()
+    // Session-split fix: UsStatusCard no longer reads the open session's startedAt directly (see its own
+    // call site comment below for why - after a grace-window resume, startedAt is only the current
+    // segment's start, not the true streak start) - proximityState.continuousTogetherSince (the service's
+    // rebased display accumulator) is what it reads instead, so `vm.openSession` itself is no longer
+    // subscribed to here.
     val proximityState by vm.proximityState.collectAsState()
     val moments by vm.moments.collectAsState()
     val randomMoment by vm.randomMoment.collectAsState()
@@ -695,7 +699,23 @@ fun HomeScreen(
                 }
             }
             item {
-                UsStatusCard(isTogether = effectivelyTogether, openSession = openSession, now = now, partnerName = pairingInfo.partnerName, partnerEmoji = pairingInfo.partnerEmoji)
+                UsStatusCard(
+                    isTogether = effectivelyTogether,
+                    // Session-split fix: reads proximityState.continuousTogetherSince (the service's
+                    // display-purpose accumulator - see ProximityForegroundService.
+                    // resumedContinuousTogetherSince) instead of openSession.startedAt. After a
+                    // grace-window resume, the open session's startedAt is only the CURRENT segment's
+                    // start (the reconnect instant) - it no longer represents when this continuous
+                    // together-streak truly began, since a resume now closes the old row and opens a
+                    // genuinely new one rather than reusing it (see that file's class doc). continuousTogetherSince
+                    // is rebased on every resume to keep `now - continuousTogetherSince` correct: frozen
+                    // through an apart gap, then resuming from that exact frozen value - never jumping to
+                    // include the gap the way reading openSession.startedAt directly would.
+                    continuousTogetherSinceMillis = proximityState.continuousTogetherSince,
+                    now = now,
+                    partnerName = pairingInfo.partnerName,
+                    partnerEmoji = pairingInfo.partnerEmoji
+                )
             }
             item {
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
@@ -1249,7 +1269,7 @@ private fun UpdateAvailableWarningCard(versionName: String, onInstallClick: () -
 }
 
 @Composable
-private fun UsStatusCard(isTogether: Boolean, openSession: TogetherSession?, now: Long, partnerName: String, partnerEmoji: String) {
+private fun UsStatusCard(isTogether: Boolean, continuousTogetherSinceMillis: Long, now: Long, partnerName: String, partnerEmoji: String) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.extraLarge,
@@ -1264,7 +1284,7 @@ private fun UsStatusCard(isTogether: Boolean, openSession: TogetherSession?, now
         ) {
             if (isTogether) {
                 PulsingHeart()
-                val elapsed = openSession?.let { now - it.startedAt } ?: 0L
+                val elapsed = if (continuousTogetherSinceMillis > 0L) (now - continuousTogetherSinceMillis).coerceAtLeast(0L) else 0L
                 Text(
                     text = "Together for ${RelativeTime.formatDuration(elapsed)}",
                     style = MaterialTheme.typography.titleLarge,

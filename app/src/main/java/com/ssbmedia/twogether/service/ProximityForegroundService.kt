@@ -633,13 +633,19 @@ class ProximityForegroundService : LifecycleService() {
         val graceMillis = settings.sessionGraceMinutes.coerceAtLeast(1) * 60_000L
 
         // Item 9 (UX-FIX-PLAN.md): if the apart transition that just ended is still within its grace
-        // window and left a TogetherSession row open, this is a RESUME - reconnecting the SAME session
-        // rather than starting a brand new one, so the "Together for" timer (both this service's own
-        // notification text and HomeScreen's card, which reads straight off the session's startedAt)
-        // snaps back to its old running total instead of restarting from zero. Falls through to the
-        // normal "new session" path if the grace window already expired (checkGraceExpiry may have beaten
-        // this beacon sighting to it and already closed the session) or there was never a pending apart to
-        // begin with.
+        // window and left a TogetherSession row open, this is a RESUME - a brief BLE gap that must not
+        // reset the couple's continuous "together" streak. Falls through to the normal "new session" path
+        // if the grace window already expired (checkGraceExpiry may have beaten this beacon sighting to
+        // it and already closed the session) or there was never a pending apart to begin with.
+        //
+        // STORED-SESSION FIX (session-split): a resume used to pick the SAME session row back up
+        // (sessionId = resumableSession.id, startedAt left untouched) so the row's eventual endedAt-minus-
+        // startedAt span silently included the apart gap itself as together-time - a real, confirmed bug
+        // (a 1h/15min-gap/1h round trip reported 2h15m of together-time instead of 2h00m). A resume now
+        // closes the OLD row for real at the TRUE apart instant and opens a genuinely NEW row at this
+        // reconnect instant, so the couple's history ends up as two accurate segments (0-60min, 75-135min
+        // in that example) whose SUM is exactly 2h00m - StatsCalculator's existing interval-merge/sum logic
+        // needs no changes at all, it already correctly sums whatever real closed intervals exist.
         val resumableSession = if (withinGraceWindow(persisted.pendingApartSince, now, graceMillis)) {
             ServiceLocator.sessionRepository.getOpenSession()
         } else {
@@ -648,10 +654,40 @@ class ProximityForegroundService : LifecycleService() {
 
         val sessionId: Long
         if (resumableSession != null) {
-            sessionId = resumableSession.id
-            // Deliberately NOT touching continuousTogetherSinceMillis here (unlike the new-session branch
-            // below) - it was left untouched by handleBecameApart too, so it's still holding the original
-            // together-since instant from before the brief apart. That's the whole point of a resume.
+            // persisted.lastApartSince already holds the TRUE apart instant, clamped exactly the same way
+            // every other "when did they actually go apart" read in this file is (StatsCalculator.
+            // effectiveOpenSessionEnd, via handleBecameApart's own apartSince computation just above -
+            // see its doc) - it is NOT recomputed here via effectiveOpenSessionEnd directly, because by
+            // this point stateMachine.lastSeenAt has already been advanced to `now` by this same beacon
+            // sighting's earlier onBeaconSeen(now) call (see onPartnerSeen), which would make that clamp
+            // resolve to `now` (the RECONNECT instant) instead of the pre-gap sighting - reproducing
+            // exactly the same inflation bug this fix exists to remove. lastApartSince was captured by
+            // handleBecameApart BEFORE the gap, from the correct (then-current) stateMachine.lastSeenAt,
+            // so it's the right value to reuse verbatim. coerceAtLeast defends against a degenerate span
+            // the same way every sibling clamp call site in this file already does.
+            val trueApartInstant = persisted.lastApartSince.coerceAtLeast(resumableSession.startedAt)
+            ServiceLocator.sessionRepository.endSession(resumableSession, trueApartInstant)
+            sessionId = ServiceLocator.sessionRepository.startSession(now)
+
+            // DISPLAY-TIMER FIX: continuousTogetherSinceMillis (and its persisted mirror) used to be left
+            // completely untouched across a resume, on the theory that the row itself was being resumed
+            // unchanged - now that the row is genuinely new (see above), leaving this reference pointing at
+            // the ORIGINAL streak start would double-count the gap a second way: `now - continuousSince`
+            // would jump to include the 15-minute gap the instant reconnect happens (e.g. reading 1h15m
+            // immediately on reconnect in the worked example, then climbing to 2h15m by the end) - the same
+            // shape of bug as the stored-session one above, just in the live display instead of the DB.
+            // resumedContinuousTogetherSince rebases this reference so `now - result` evaluates back to
+            // EXACTLY however much genuine together-time had accrued as of trueApartInstant (persisted.
+            // continuousTogetherSince still holds that pre-freeze reference - handleBecameApart
+            // deliberately never touches it, see its own doc), then grows normally in real time from here.
+            // A pure, unit-tested function (see SessionSplitDisplayTimerAuditTest) - it also correctly folds in
+            // however many prior resumes already happened, since each one's rebase already absorbed the
+            // ones before it.
+            continuousTogetherSinceMillis = resumedContinuousTogetherSince(
+                priorContinuousTogetherSince = persisted.continuousTogetherSince,
+                trueApartInstant = trueApartInstant,
+                now = now
+            )
         } else {
             sessionId = ServiceLocator.sessionRepository.startSession(now)
             continuousTogetherSinceMillis = now
@@ -660,7 +696,11 @@ class ProximityForegroundService : LifecycleService() {
         ServiceLocator.proximityStateStore.update {
             it.copy(
                 isTogether = true,
-                continuousTogetherSince = if (resumableSession != null) it.continuousTogetherSince else now,
+                // Always continuousTogetherSinceMillis now (computed just above for BOTH branches) rather
+                // than the old `if (resumableSession != null) it.continuousTogetherSince else now` - see
+                // the DISPLAY-TIMER FIX comment above for why the resume branch needs a freshly rebased
+                // value rather than the untouched original.
+                continuousTogetherSince = continuousTogetherSinceMillis,
                 currentSessionId = sessionId,
                 reminderFiredForSession = false,
                 snoozeUntil = 0L,
@@ -717,11 +757,17 @@ class ProximityForegroundService : LifecycleService() {
         // away. The fast ~100s isTogether flip just above is intentionally immediate/honest for the
         // Apart/Together status card - but the underlying TogetherSession row now gets a grace window
         // (SESSION_GRACE_MILLIS, ~10 min) before it's actually torn down, tracked via pendingApartSince, so
-        // a brief reconnect (handleBecameTogether's resume path) can pick the SAME session back up instead
-        // of the "Together for" timer restarting from zero. See tick()'s checkGraceExpiry for where the
-        // session actually gets closed once/if the window elapses. continuousTogetherSinceMillis (and the
-        // persisted continuousTogetherSince mirror) are deliberately left untouched here for the same
-        // reason - a resume must find them still holding the original together-since instant.
+        // a brief reconnect within that window doesn't reset the couple's continuous "together" streak to
+        // zero. See tick()'s checkGraceExpiry for where the session actually gets closed for real once/if
+        // the window elapses with no reconnect. continuousTogetherSinceMillis (and the persisted
+        // continuousTogetherSince mirror) are deliberately left untouched here - a resume needs them still
+        // holding the PRE-freeze reference (see handleBecameTogether's resumedContinuousTogetherSince,
+        // which reads this exact value to compute the rebased display reference), not reset or advanced.
+        // STORED-SESSION FIX (session-split): a resume no longer picks this exact row back up - see
+        // handleBecameTogether's resumableSession branch doc - it closes THIS row for real at the true
+        // apart instant and opens a brand new one, so the gap itself is never silently credited as
+        // together-time once the couple's streak eventually ends. lastApartSince (set right below) is
+        // exactly the true-apart instant that close will use.
         ServiceLocator.proximityStateStore.update {
             it.copy(
                 isTogether = false,
@@ -1107,6 +1153,29 @@ class ProximityForegroundService : LifecycleService() {
          * actually be closed. */
         private fun graceWindowExpired(pendingApartSince: Long, now: Long, graceMillis: Long): Boolean =
             pendingApartSince > 0L && now - pendingApartSince >= graceMillis
+
+        /** DISPLAY-TIMER FIX (session-split feature): pure helper - unit-tested directly via reflection
+         * (see SessionSplitDisplayTimerAuditTest), mirroring withinGraceWindow/graceWindowExpired's established
+         * pattern. Computes the rebased "continuous together since" reference to use the instant a
+         * grace-window RESUME happens (handleBecameTogether's resumableSession branch), such that `now -
+         * result` evaluates to exactly [priorContinuousTogetherSince]..[trueApartInstant]'s span (i.e. the
+         * genuine together-time accrued before the gap), FROZEN through the gap and then growing normally
+         * in real time from this instant on - never crediting the gap itself.
+         *
+         * [priorContinuousTogetherSince] is the pre-freeze reference from BEFORE this resume - handleBecameApart
+         * never touches continuousTogetherSince, so it's still whatever it was when the couple was last
+         * genuinely, continuously together (which may itself already be a rebased value from an EARLIER
+         * resume in the same streak - see this function's own chained-resume unit test for why that still
+         * folds in correctly rather than double-counting or losing time). [trueApartInstant] is the same
+         * clamped true-apart instant [handleBecameTogether] closes the old session row at.
+         *
+         * coerceAtLeast(0L) defends against a (should-be-impossible) negative accumulated span from a
+         * corrupted/hand-edited persisted value - never lets a resume start the display timer count DOWN
+         * or into negative territory. */
+        private fun resumedContinuousTogetherSince(priorContinuousTogetherSince: Long, trueApartInstant: Long, now: Long): Long {
+            val frozenAccumulatedMillis = (trueApartInstant - priorContinuousTogetherSince).coerceAtLeast(0L)
+            return now - frozenAccumulatedMillis
+        }
 
         /** Reunion-count non-retroactivity feature: pure decision helper - unit-tested directly via
          * reflection (see ReunionNonRetroactivityAuditTest), mirroring [withinGraceWindow]/
