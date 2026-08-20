@@ -215,6 +215,41 @@ interface MomentNoteDao {
 }
 
 @Dao
+interface DayNoteDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(note: DayNote)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAll(notes: List<DayNote>)
+
+    /** Every (mine + partner's) non-tombstoned note for one specific day - feeds CalendarScreen's
+     * day-detail dialog, same shape as MomentNoteDao.observeForMoment. */
+    @Query("SELECT * FROM day_notes WHERE date = :date AND deleted = 0")
+    fun observeForDate(date: Long): Flow<List<DayNote>>
+
+    /** Every non-tombstoned note across every day - feeds CalendarScreen's month-grid "has a note" marker
+     * on DayCell, the same "aggregate across all days, not just the selected one" need MomentDao.
+     * observeActive already serves for the photo marker (see CalendarViewModel.dayNotes / daysWithNotes). */
+    @Query("SELECT * FROM day_notes WHERE deleted = 0")
+    fun observeActive(): Flow<List<DayNote>>
+
+    @Query("SELECT * FROM day_notes WHERE authorDeviceId = :deviceId")
+    suspend fun getAllForAuthor(deviceId: String): List<DayNote>
+
+    /** Raw/unfiltered - includes soft-deleted (tombstoned) rows. Used by BackupManager (so backups
+     * round-trip tombstones) and, once GattSyncManager.kt is wired for this entity, by the sync payload
+     * builder and DayNoteRepository.mergeRemote (which needs to see already-tombstoned local rows to
+     * match (date, authorDeviceId) regardless of deletion state) - same pattern as MomentNoteDao.getAll. */
+    @Query("SELECT * FROM day_notes")
+    suspend fun getAll(): List<DayNote>
+
+    /** Wipes every row - used only by Feature 4's backup restore, which always fully repopulates this
+     * table immediately afterward inside the same DB transaction. */
+    @Query("DELETE FROM day_notes")
+    suspend fun clearAll()
+}
+
+@Dao
 interface MilestoneDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(milestone: Milestone)

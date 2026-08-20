@@ -208,6 +208,42 @@ data class MomentNote(
 )
 
 /**
+ * UX-FIX-PLAN.md Phase 4 item 25: a free-text note attached to a specific calendar day (not tied to any
+ * Moment/photo) - lets the couple jot something about a day even without a photo. Structurally mirrors
+ * [MomentNote] as closely as possible (see that entity's own doc for the full sync-contract reasoning
+ * this one repeats): composite-keyed by (date, authorDeviceId) rather than a synthetic id - there is at
+ * most one note per author per day (writing again just replaces it), which maps naturally onto a REPLACE
+ * upsert, and lets both partners independently have their own note on the same day with no merge
+ * conflict (two different rows entirely) - no separate syncId is needed, same reasoning MomentNote's own
+ * composite key already establishes.
+ *
+ * [date] is an epoch-day Long (`LocalDate.toEpochDay()`) - the same cross-boundary "day" representation
+ * CalendarScreen.kt already uses everywhere it needs to pass a day as a plain value (`jumpToEpochDay`,
+ * `onOpenMoments`), matching that existing convention rather than inventing a new date representation
+ * (an ISO string, a separate year/month/day column set like Milestone's) for this one feature.
+ *
+ * Each device only ever writes rows where authorDeviceId == SettingsStore.getOrCreateLocalDeviceId();
+ * rows authored by the OTHER id are meant to arrive purely via GattSyncManager's merge and be read-only
+ * in the UI - see DayNoteRepository's doc for the full sync contract.
+ *
+ * NOTE (deliberate scope limit): unlike MomentNote, [DayNote] does NOT yet travel over
+ * GattSyncManager's wire protocol - GattSyncManager.kt is intentionally untouched by this feature (see
+ * DayNoteRepository.mergeRemote's own doc). It DOES round-trip through BackupManager's JSON backup/
+ * restore, same as every other synced-shaped entity in this file.
+ */
+@Entity(tableName = "day_notes", primaryKeys = ["date", "authorDeviceId"])
+data class DayNote(
+    val date: Long,
+    val authorDeviceId: String,
+    val text: String,
+    val updatedAt: Long,
+    /** Tombstone, mirroring MomentNote's pattern: saving blank text sets this instead of deleting the row
+     * outright, so the clearing itself is something that can propagate to the partner once wire-protocol
+     * support for this entity is added. */
+    val deleted: Boolean = false
+)
+
+/**
  * Feature F: a free-form dated milestone (Anniversary, First Kiss, custom label, ...). [id] doubles as
  * the sync identity (same pattern as DateIdea.id) - a client-generated UUID string, union+tombstone
  * merged by (id, updatedAt) rather than last-write-wins-replace-everything, matching DateIdeaRepository.

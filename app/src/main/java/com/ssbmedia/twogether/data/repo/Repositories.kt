@@ -6,6 +6,8 @@ import com.ssbmedia.twogether.data.db.AppDatabase
 import com.ssbmedia.twogether.data.db.DEFAULT_LIST_ID
 import com.ssbmedia.twogether.data.db.DateIdea
 import com.ssbmedia.twogether.data.db.DateIdeaDao
+import com.ssbmedia.twogether.data.db.DayNote
+import com.ssbmedia.twogether.data.db.DayNoteDao
 import com.ssbmedia.twogether.data.db.ListCategory
 import com.ssbmedia.twogether.data.db.ListCategoryDao
 import com.ssbmedia.twogether.data.db.Milestone
@@ -736,6 +738,75 @@ class MomentNoteRepository(private val dao: MomentNoteDao) {
         // doc for the full reasoning behind this guard on all four LWW merges in this file.
         val toUpsert = incoming.filter { r ->
             val l = localByKey[r.momentSyncId to r.authorDeviceId] ?: return@filter true
+            r.updatedAt > l.updatedAt && !(r.text == l.text && r.deleted == l.deleted)
+        }
+        if (toUpsert.isNotEmpty()) dao.upsertAll(toUpsert)
+    }
+}
+
+/**
+ * UX-FIX-PLAN.md Phase 4 item 25: a free-text note attached to a specific calendar day (see DayNote's own
+ * doc for the full shape/reasoning). Structurally mirrors [MomentNoteRepository] as closely as possible -
+ * same saveMyNote blank-means-tombstone semantics, same per-author-composite-key LWW mergeRemote,
+ * including the identical "never accept a row claiming my own deviceId" guard (see [mergeRemote]'s own
+ * doc for why that matters here too).
+ *
+ * DELIBERATE SCOPE LIMIT: nothing calls [mergeRemote] yet - GattSyncManager.kt is intentionally untouched
+ * by this feature (see this class's own file header / the task this was implemented under). This is
+ * written now anyway so wiring sync support later is a small, mechanical addition (a
+ * serializeDayNotes/deserializeDayNotes pair in GattSyncManager plus a call to this function) rather than
+ * something that needs the merge logic designed from scratch at that point.
+ */
+class DayNoteRepository(private val dao: DayNoteDao) {
+    fun observeForDate(date: Long): Flow<List<DayNote>> = dao.observeForDate(date)
+
+    /** Every active (non-deleted) note across every day - feeds CalendarScreen's month-grid "has a note"
+     * marker, same "all days at once, not just the selected one" need MomentRepository.observeAll serves
+     * for the photo marker via MomentDao.observeActive. */
+    fun observeActive(): Flow<List<DayNote>> = dao.observeActive()
+    suspend fun getAll(): List<DayNote> = dao.getAll()
+    suspend fun getAllForAuthor(deviceId: String): List<DayNote> = dao.getAllForAuthor(deviceId)
+
+    /** Saves (or, for blank text, tombstones) THIS device's own note for a day - never the partner's;
+     * each side only ever writes rows keyed by its own [authorDeviceId], see Entities.kt's doc on
+     * DayNote. Blank text sets deleted=true (mirroring MomentNoteRepository.saveMyNote) so clearing a
+     * previously-saved note is itself something that can propagate to the partner once wire-protocol
+     * support for this entity is added. */
+    suspend fun saveMyNote(date: Long, authorDeviceId: String, text: String) {
+        dao.upsert(
+            DayNote(
+                date = date,
+                authorDeviceId = authorDeviceId,
+                text = text.trim(),
+                updatedAt = System.currentTimeMillis(),
+                deleted = text.isBlank()
+            )
+        )
+    }
+
+    /**
+     * Last-write-wins merge of the PARTNER's day notes into local storage, keyed by
+     * (date, authorDeviceId) + updatedAt - EXACT same shape as MomentNoteRepository.mergeRemote, but
+     * per-day rather than per-moment, since both partners can each have their own note on the same day
+     * with no real conflict between them (they're different rows entirely).
+     *
+     * Rows claiming OUR OWN [myDeviceId] as author are dropped outright: a device's own note must only
+     * ever come from its own local edits, never overwritten by something arriving over the wire (that
+     * would mean either a protocol bug, or - after a Feature 4 restore onto a different physical device -
+     * a genuinely confusing "which copy is really mine" situation neither side should silently resolve).
+     * See MomentNoteRepository.mergeRemote's own doc for the identical reasoning this repeats verbatim -
+     * this guard is copied deliberately, not just structurally similar, since the whole point is that a
+     * remote/BLE-sourced payload's claim about authorship can never be trusted for identity purposes, no
+     * matter which entity it's attached to.
+     */
+    suspend fun mergeRemote(remote: List<DayNote>, myDeviceId: String) {
+        val incoming = remote.filter { it.authorDeviceId.isNotBlank() && it.authorDeviceId != myDeviceId }
+        if (incoming.isEmpty()) return
+        val localByKey = dao.getAll().associateBy { it.date to it.authorDeviceId }
+        // Content-identical rows are skipped rather than re-written - see DateIdeaRepository.mergeRemote's
+        // doc for the full reasoning behind this guard on every LWW merge in this file.
+        val toUpsert = incoming.filter { r ->
+            val l = localByKey[r.date to r.authorDeviceId] ?: return@filter true
             r.updatedAt > l.updatedAt && !(r.text == l.text && r.deleted == l.deleted)
         }
         if (toUpsert.isNotEmpty()) dao.upsertAll(toUpsert)

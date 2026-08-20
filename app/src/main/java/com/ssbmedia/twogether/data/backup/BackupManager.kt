@@ -16,6 +16,7 @@ import com.ssbmedia.twogether.data.datastore.LastConnectionInfo
 import com.ssbmedia.twogether.data.datastore.PairingInfo
 import com.ssbmedia.twogether.data.db.DEFAULT_LIST_ID
 import com.ssbmedia.twogether.data.db.DateIdea
+import com.ssbmedia.twogether.data.db.DayNote
 import com.ssbmedia.twogether.data.db.ListCategory
 import com.ssbmedia.twogether.data.db.Milestone
 import com.ssbmedia.twogether.data.db.Moment
@@ -114,7 +115,10 @@ object BackupManager {
      * parseDateIdeas below defaults a missing listId to [DEFAULT_LIST_ID] the same way parseSessions
      * defaults a missing syncId - so a pre-"Our Lists" backup restores every one of its date ideas
      * straight into the default "Date Ideas" list, and restoreBackup()'s own fallback (see its doc)
-     * synthesizes that list's row if the backup predates listCategories entirely. */
+     * synthesizes that list's row if the backup predates listCategories entirely.
+     * Also since v3, no format-version bump (UX-FIX-PLAN.md Phase 4 item 25): added the dayNotes[]
+     * section - same optional/missing-means-empty treatment as momentNotes/milestones/listCategories, so
+     * a pre-this-feature backup restores with zero day notes rather than failing. */
     private const val BACKUP_FORMAT_VERSION = 3
     const val BACKUP_FOLDER_NAME = "Twogether Backups"
     private val RELATIVE_DIR = Environment.DIRECTORY_DOWNLOADS + "/" + BACKUP_FOLDER_NAME
@@ -183,6 +187,7 @@ object BackupManager {
             val momentNotes = db.momentNoteDao().getAll()
             val milestones = db.milestoneDao().getAll()
             val listCategories = db.listCategoryDao().getAll()
+            val dayNotes = db.dayNoteDao().getAll()
             val pairing = ServiceLocator.pairingStore.current()
             val lastConnection = ServiceLocator.pairingStore.currentLastConnection()
             val settings = ServiceLocator.settingsStore.current()
@@ -194,7 +199,7 @@ object BackupManager {
 
             val manifest = buildManifest(
                 sessions, dateIdeas, timeCapsules, moments, momentNotes, milestones, listCategories,
-                pairing, lastConnection, settings, badgeUnlocks, lastSeenAtMillis
+                dayNotes, pairing, lastConnection, settings, badgeUnlocks, lastSeenAtMillis
             )
 
             // Write to a cache-dir temp file first and only move it into the real backups folder once
@@ -273,6 +278,7 @@ object BackupManager {
         momentNotes: List<MomentNote>,
         milestones: List<Milestone>,
         listCategories: List<ListCategory>,
+        dayNotes: List<DayNote>,
         pairing: PairingInfo,
         lastConnection: LastConnectionInfo,
         settings: AppSettings,
@@ -468,6 +474,20 @@ object BackupManager {
                     // Item 24 (UX-FIX-PLAN.md): same local-only-for-now field as dateIdeas' matching
                     // addition just above - see ListCategory.defaultRemindAfterTogetherMinutes' own doc.
                     put("defaultRemindAfterTogetherMinutes", c.defaultRemindAfterTogetherMinutes ?: JSONObject.NULL)
+                })
+            }
+        })
+
+        // UX-FIX-PLAN.md Phase 4 item 25: same shape as momentNotes above (see DayNote's own doc) -
+        // written including tombstones, same as every other table in this manifest.
+        put("dayNotes", JSONArray().apply {
+            dayNotes.forEach { n ->
+                put(JSONObject().apply {
+                    put("date", n.date)
+                    put("authorDeviceId", n.authorDeviceId)
+                    put("text", n.text)
+                    put("updatedAt", n.updatedAt)
+                    put("deleted", n.deleted)
                 })
             }
         })
@@ -733,6 +753,11 @@ object BackupManager {
             val rawMomentNotesArr = root.optJSONArray("momentNotes")
             val rawMilestonesArr = root.optJSONArray("milestones")
             val rawListCategoriesArr = root.optJSONArray("listCategories")
+            // UX-FIX-PLAN.md Phase 4 item 25: optJSONArray, not getJSONArray - same "not in requiredKeys,
+            // missing == empty" backward-compat shape as momentNotes/milestones/listCategories above, so a
+            // pre-this-feature backup restores cleanly with zero day notes rather than failing the whole
+            // restore.
+            val rawDayNotesArr = root.optJSONArray("dayNotes")
             // BLOCKER fix (ultimate-app-review round 2): extracted once so every parser anchors its
             // isPlausibleBackupUpdatedAt floor against the SAME backupCreatedAt - see that function's own
             // doc for why a floor is needed at all.
@@ -746,6 +771,7 @@ object BackupManager {
                     momentNotes = parseMomentNotes(rawMomentNotesArr, backupCreatedAt),
                     milestones = parseMilestones(rawMilestonesArr, backupCreatedAt),
                     listCategories = parseListCategories(rawListCategoriesArr, backupCreatedAt),
+                    dayNotes = parseDayNotes(rawDayNotesArr, backupCreatedAt),
                     pairingJson = root.getJSONObject("pairing"),
                     settingsJson = root.getJSONObject("settings"),
                     badgeUnlocks = root.getJSONObject("badgeUnlocks").let { obj ->
@@ -773,6 +799,10 @@ object BackupManager {
                 if (parsed.milestones.isNotEmpty()) db.milestoneDao().upsertAll(parsed.milestones)
                 db.listCategoryDao().clearAll()
                 if (parsed.listCategories.isNotEmpty()) db.listCategoryDao().upsertAll(parsed.listCategories)
+                // UX-FIX-PLAN.md Phase 4 item 25: same clearAll-then-repopulate shape as every other
+                // table in this transaction.
+                db.dayNoteDao().clearAll()
+                if (parsed.dayNotes.isNotEmpty()) db.dayNoteDao().upsertAll(parsed.dayNotes)
                 // Fallback for a backup made before "Our Lists" existed (no listCategories section at
                 // all, or one that's simply empty for some other reason): every restored DateIdea above
                 // was defaulted to DEFAULT_LIST_ID by parseDateIdeas' own fallback, so without a matching
@@ -896,7 +926,8 @@ object BackupManager {
                 (rawMomentsArr.length() - parsed.moments.size) +
                 ((rawMomentNotesArr?.length() ?: 0) - parsed.momentNotes.size) +
                 ((rawMilestonesArr?.length() ?: 0) - parsed.milestones.size) +
-                ((rawListCategoriesArr?.length() ?: 0) - parsed.listCategories.size)
+                ((rawListCategoriesArr?.length() ?: 0) - parsed.listCategories.size) +
+                ((rawDayNotesArr?.length() ?: 0) - parsed.dayNotes.size)
             BackupResult(
                 true, zipUri,
                 "Restored ${parsed.sessions.size} session(s), ${parsed.moments.size} photo(s), " +
@@ -936,6 +967,7 @@ object BackupManager {
         val momentNotes: List<MomentNote>,
         val milestones: List<Milestone>,
         val listCategories: List<ListCategory>,
+        val dayNotes: List<DayNote>,
         val pairingJson: JSONObject,
         val settingsJson: JSONObject,
         val badgeUnlocks: Map<String, Long>
@@ -1352,6 +1384,29 @@ object BackupManager {
                 // matching field - an old backup made before this feature existed simply won't have this
                 // key, which isNull already treats identically to an explicit null.
                 linkedMomentSyncId = if (o.isNull("linkedMomentSyncId")) null else o.getString("linkedMomentSyncId")
+            )
+        }
+    }
+
+    /** UX-FIX-PLAN.md Phase 4 item 25: same shape/rigor as [parseMomentNotes] above - the same
+     * [isPlausibleBackupUpdatedAt] reject-gate this file already applies to every other untrusted-backup
+     * timestamp, not a laxer parser for this one entity. */
+    private fun parseDayNotes(arr: JSONArray?, backupCreatedAt: Long): List<DayNote> {
+        if (arr == null) return emptyList()
+        return (0 until arr.length()).mapNotNull { i ->
+            val o = arr.getJSONObject(i)
+            val date = o.getLong("date")
+            val updatedAt = o.getLong("updatedAt")
+            if (!isPlausibleBackupUpdatedAt(updatedAt, backupCreatedAt)) {
+                Log.w(TAG, "Rejecting implausible day note from backup: date=$date updatedAt=$updatedAt")
+                return@mapNotNull null
+            }
+            DayNote(
+                date = date,
+                authorDeviceId = o.getString("authorDeviceId"),
+                text = o.optString("text", ""),
+                updatedAt = updatedAt,
+                deleted = o.optBoolean("deleted", false)
             )
         }
     }

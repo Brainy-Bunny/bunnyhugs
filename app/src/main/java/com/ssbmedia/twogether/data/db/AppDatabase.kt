@@ -9,7 +9,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 import java.util.UUID
 
 @Database(
-    entities = [TogetherSession::class, DateIdea::class, TimeCapsule::class, Moment::class, MomentNote::class, Milestone::class, ListCategory::class],
+    entities = [TogetherSession::class, DateIdea::class, TimeCapsule::class, Moment::class, MomentNote::class, Milestone::class, ListCategory::class, DayNote::class],
     // NOTE(merge): incoming branch (Cluster I, item 24) originally shipped this feature as its own
     // v8 -> v9 migration on top of a database that, on THIS branch, was already at v11 by the time of
     // merge (Group J's independent work). Both branches also independently named their v8->v9
@@ -17,7 +17,10 @@ import java.util.UUID
     // vs. reminder columns there) - a real collision, not just a duplicate. Renumbered Cluster I's
     // migration to MIGRATION_11_12 (see below) and bumped this version to 12 accordingly, rather than
     // picking one side.
-    version = 12,
+    //
+    // v12 -> v13, UX-FIX-PLAN.md Phase 4 item 25: adds the new day_notes table (see MIGRATION_12_13
+    // below and DayNote's own doc).
+    version = 13,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -28,6 +31,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun momentNoteDao(): MomentNoteDao
     abstract fun milestoneDao(): MilestoneDao
     abstract fun listCategoryDao(): ListCategoryDao
+    abstract fun dayNoteDao(): DayNoteDao
 
     companion object {
         @Volatile private var INSTANCE: AppDatabase? = null
@@ -338,6 +342,33 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         /**
+         * v12 -> v13, UX-FIX-PLAN.md Phase 4 item 25: adds the new day_notes table - a free-text note
+         * attached to a specific calendar day, not tied to any Moment/photo (see DayNote's own doc for
+         * the full shape/reasoning). CREATE TABLE, not an ALTER TABLE ADD COLUMN, since this is a
+         * brand-new entity - same recipe as MIGRATION_2_3's moment_notes/milestones table creation
+         * (column set matched exactly against the @Entity: TEXT/INTEGER NOT NULL for every non-nullable
+         * Kotlin field, INTEGER NOT NULL DEFAULT 0 for the `deleted` Boolean, composite PRIMARY KEY
+         * matching @Entity's `primaryKeys = ["date", "authorDeviceId"]`). Nothing to backfill - no
+         * pre-existing table's rows map onto this one, unlike e.g. MIGRATION_7_8's date_ideas rebuild.
+         */
+        val MIGRATION_12_13 = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS day_notes (
+                        date INTEGER NOT NULL,
+                        authorDeviceId TEXT NOT NULL,
+                        text TEXT NOT NULL,
+                        updatedAt INTEGER NOT NULL,
+                        deleted INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY(date, authorDeviceId)
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
+        /**
          * Seeds the default "Date Ideas" list (id == DEFAULT_LIST_ID) for a genuinely BRAND-NEW install -
          * i.e. no pre-existing database file at all, so Room creates the schema fresh at the CURRENT
          * version and none of MIGRATION_1_2..MIGRATION_7_8 ever run (migrations only fire when upgrading
@@ -367,7 +398,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "twogether.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13)
                     .addCallback(SEED_DEFAULT_LIST_CALLBACK)
                     // Safety net only for a FUTURE schema version we didn't write a real migration for -
                     // the 1->2 and 2->3 paths above are always handled for real, so existing users'

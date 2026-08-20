@@ -7,6 +7,7 @@ import com.ssbmedia.twogether.data.datastore.ProximityStateStore
 import com.ssbmedia.twogether.data.datastore.SettingsStore
 import com.ssbmedia.twogether.data.db.AppDatabase
 import com.ssbmedia.twogether.data.repo.DateIdeaRepository
+import com.ssbmedia.twogether.data.repo.DayNoteRepository
 import com.ssbmedia.twogether.data.repo.ListCategoryRepository
 import com.ssbmedia.twogether.data.repo.MilestoneRepository
 import com.ssbmedia.twogether.data.repo.MomentNoteRepository
@@ -57,6 +58,7 @@ object ServiceLocator {
     val momentNoteRepository: MomentNoteRepository by lazy { MomentNoteRepository(database.momentNoteDao()) }
     val milestoneRepository: MilestoneRepository by lazy { MilestoneRepository(database.milestoneDao()) }
     val listCategoryRepository: ListCategoryRepository by lazy { ListCategoryRepository(database.listCategoryDao(), dateIdeaRepository, database) }
+    val dayNoteRepository: DayNoteRepository by lazy { DayNoteRepository(database.dayNoteDao()) }
 
     val pairingStore: PairingStore by lazy { PairingStore(appContext) }
     val settingsStore: SettingsStore by lazy { SettingsStore(appContext) }
