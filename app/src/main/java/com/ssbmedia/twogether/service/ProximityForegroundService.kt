@@ -567,6 +567,21 @@ class ProximityForegroundService : LifecycleService() {
         lastSeenTieBreak = tieBreak
         lifecycleScope.launch {
             try {
+                // MINOR fix (ultimate-app-review round 1): both partners derive their advertised secret
+                // prefix from the same shared pairing code, so nothing app-level otherwise distinguishes
+                // "this is my partner's phone" from "this is my own advertisement echoing back to my own
+                // scanner." Real Android hardware never delivers a device's own BLE adverts back to its
+                // own scanner - this is theoretically impossible on real separate hardware - but the guard
+                // is free, and it's exactly what let one Round 1 reviewer's paired-emulator sandbox count
+                // 4+ minutes of "together" time with its partner's Bluetooth radio verified off. A sighting
+                // whose reported tie-break byte matches THIS device's own tie-break byte (see
+                // isSelfEchoBeacon below) is never treated as "partner seen" - skip it entirely, before it
+                // can advance the state machine or arm GATT sync.
+                val ownTieBreak = ServiceLocator.settingsStore.getOrCreateTieBreakByte().toByte()
+                if (isSelfEchoBeacon(tieBreak, ownTieBreak)) {
+                    Log.w(TAG, "Ignoring self-echo beacon sighting (sighted tieBreak matches this device's own)")
+                    return@launch
+                }
                 val now = System.currentTimeMillis()
                 val becameTogether = stateMachine.onBeaconSeen(now)
                 val shouldArmGattSync = becameTogether || (stateMachine.isTogether && !gattReadyForSession)
@@ -1147,6 +1162,16 @@ class ProximityForegroundService : LifecycleService() {
          * pendingApartSince > 0. */
         private fun withinGraceWindow(pendingApartSince: Long, now: Long, graceMillis: Long): Boolean =
             pendingApartSince > 0L && now - pendingApartSince < graceMillis
+
+        /** MINOR fix (ultimate-app-review round 1): pure decision helper - unit-tested directly via
+         * reflection (see SelfEchoGuardAuditTest), mirroring [withinGraceWindow]/[graceWindowExpired]'s
+         * established pattern. True iff [sightedTieBreak] (the tie-break byte parsed off a BLE sighting by
+         * ScannerManager) equals [ownTieBreak] (this install's own SettingsStore.getOrCreateTieBreakByte
+         * value) - i.e. the sighting is this device's own advertisement echoing back, not the partner's
+         * phone. See onPartnerSeen's own comment for why this can't happen on real separate hardware but
+         * is guarded against anyway. */
+        private fun isSelfEchoBeacon(sightedTieBreak: Byte, ownTieBreak: Byte): Boolean =
+            sightedTieBreak == ownTieBreak
 
         /** Pure decision helper (private, unit-tested via reflection) - true iff the grace window of
          * [graceMillis] opened at [pendingApartSince] has now elapsed and a still-open session should
