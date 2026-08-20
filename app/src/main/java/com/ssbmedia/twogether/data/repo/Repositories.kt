@@ -770,7 +770,7 @@ class DayNoteRepository(private val dao: DayNoteDao) {
          * every other untrusted field (see TimeCapsuleRepository.MAX_UNLOCK_AT_HOURS for the precedent) -
          * the Round 2 regression is a direct, live-proven demonstration of what happens when a new field's
          * validation doesn't follow that convention from the start. Bound is deliberately generous
-         * (2020-01-01 through 2100-01-01, epoch days 0..47482) rather than LocalDate's own technical limit
+         * (1970-01-01 through 2100-01-01, epoch days 0..47482) rather than LocalDate's own technical limit
          * (~365 billion days) - no legitimate calendar-day note for this app will ever fall outside that
          * window, so this is a typo/forgery guardrail, not a real product constraint. */
         const val MIN_PLAUSIBLE_EPOCH_DAY = 0L

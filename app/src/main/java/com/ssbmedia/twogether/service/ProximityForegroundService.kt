@@ -579,10 +579,14 @@ class ProximityForegroundService : LifecycleService() {
                 // live-reproducing the exact scenario this guard was built for (partner's Bluetooth fully
                 // disabled) showed the "4+ minutes together with partner's radio off" symptom happening
                 // regardless of the guard, with the phantom sightings carrying the PARTNER's tie-break
-                // byte, not this device's own - so the self-echo diagnosis was wrong to begin with; this
-                // looks like an emulator BLE stack re-delivering a cached advert to an already-registered
-                // scan callback, not a real self-echo, and is very unlikely to occur on real hardware
-                // (which never delivers a device's own adverts back to its own scanner).
+                // byte, not this device's own - so the self-echo diagnosis was wrong to begin with.
+                // Round 3 (Opus) narrowed this further: force-restarting the SCANNING device (a fresh
+                // process, fresh scan registration) did NOT stop the phantom sightings, but killing the
+                // ADVERTISING device's emulator process did, instantly - so this is the emulator's
+                // virtualized Bluetooth transport continuing to serve the guest's advert on the host side
+                // after the guest radio reports off, not a scanner-side cache. Very unlikely to occur on
+                // real hardware (which never delivers a device's own adverts back to its own scanner, and
+                // has no such host-level advertiser artifact).
                 val now = System.currentTimeMillis()
                 val becameTogether = stateMachine.onBeaconSeen(now)
                 val shouldArmGattSync = becameTogether || (stateMachine.isTogether && !gattReadyForSession)
