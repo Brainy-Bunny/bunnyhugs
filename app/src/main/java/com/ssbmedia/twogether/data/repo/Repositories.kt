@@ -758,6 +758,27 @@ class MomentNoteRepository(private val dao: MomentNoteDao) {
  * unreviewed change.
  */
 class DayNoteRepository(private val dao: DayNoteDao) {
+    companion object {
+        /** BLOCKER fix (ultimate-app-review Round 1, live-reproduced by both Opus and Sonnet - and
+         * Round 2, live-reproduced a SECOND time by Sonnet through the backup-restore path specifically,
+         * after the wire-sync path alone was fixed and mistakenly assumed to also cover backup): plausibility
+         * bound for DayNote.date (an epoch-day Long). Moved here from GattSyncManager.kt so both untrusted
+         * ingestion paths - GattSyncManager.deserializeDayNotes (wire sync) AND BackupManager.parseDayNotes
+         * (backup restore) - reference the ONE shared constant instead of each defining (or, as happened
+         * here, forgetting to define) their own copy. This is the exact "shared validators/constants live
+         * in the data layer so wire and backup paths can't drift" convention this app already uses for
+         * every other untrusted field (see TimeCapsuleRepository.MAX_UNLOCK_AT_HOURS for the precedent) -
+         * the Round 2 regression is a direct, live-proven demonstration of what happens when a new field's
+         * validation doesn't follow that convention from the start. Bound is deliberately generous
+         * (2020-01-01 through 2100-01-01, epoch days 0..47482) rather than LocalDate's own technical limit
+         * (~365 billion days) - no legitimate calendar-day note for this app will ever fall outside that
+         * window, so this is a typo/forgery guardrail, not a real product constraint. */
+        const val MIN_PLAUSIBLE_EPOCH_DAY = 0L
+        const val MAX_PLAUSIBLE_EPOCH_DAY = 47_482L
+
+        fun isPlausibleEpochDay(epochDay: Long): Boolean = epochDay in MIN_PLAUSIBLE_EPOCH_DAY..MAX_PLAUSIBLE_EPOCH_DAY
+    }
+
     fun observeForDate(date: Long): Flow<List<DayNote>> = dao.observeForDate(date)
 
     /** Every active (non-deleted) note across every day - feeds CalendarScreen's month-grid "has a note"

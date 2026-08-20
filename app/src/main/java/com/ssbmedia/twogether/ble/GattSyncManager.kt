@@ -846,7 +846,7 @@ class GattSyncManager(
             // no legitimate calendar-day note for this app will ever fall outside that window, so this is a
             // typo/forgery guardrail in the same spirit as TimeCapsuleRepository.MAX_UNLOCK_AT_HOURS, not a
             // real product constraint.
-            if (date !in MIN_PLAUSIBLE_DAY_NOTE_EPOCH_DAY..MAX_PLAUSIBLE_DAY_NOTE_EPOCH_DAY) {
+            if (!DayNoteRepository.isPlausibleEpochDay(date)) {
                 Log.w(TAG, "Dropping remote day note with implausible epochDay=$date")
                 return@mapNotNull null
             }
@@ -3143,13 +3143,6 @@ class GattSyncManager(
          * configuration (a reunion threshold of "we were apart a month" is already an extreme edge case)
          * while still rejecting an obviously-forged or corrupted value rather than silently accepting it. */
         const val MAX_SETTINGS_MINUTES = 30 * 24 * 60
-
-        /** BLOCKER fix (ultimate-app-review Round 1): plausibility bound for DayNote.date - see
-         * deserializeDayNotes' own doc for the full reasoning. 1970-01-01 (epoch day 0) through
-         * 2100-01-01 (LocalDate.of(2100, 1, 1).toEpochDay(), computed once here as a literal since these
-         * are compile-time constants and the class isn't available in a `const val` initializer). */
-        const val MIN_PLAUSIBLE_DAY_NOTE_EPOCH_DAY = 0L
-        const val MAX_PLAUSIBLE_DAY_NOTE_EPOCH_DAY = 47_482L
 
         /** MINOR fix (ultimate-app-review Round 1): isPlausibleWireUpdatedAt's new lower bound - see its
          * own doc. 2020-01-01T00:00:00Z in epoch millis, well before this app existed, generous enough to

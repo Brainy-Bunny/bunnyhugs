@@ -25,6 +25,7 @@ import com.ssbmedia.twogether.data.db.MomentNote
 import com.ssbmedia.twogether.data.db.TimeCapsule
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.data.repo.DateIdeaRepository
+import com.ssbmedia.twogether.data.repo.DayNoteRepository
 import com.ssbmedia.twogether.data.repo.MomentRepository
 import com.ssbmedia.twogether.data.repo.TimeCapsuleRepository
 import com.ssbmedia.twogether.notif.MilestoneAlarmScheduler
@@ -1430,6 +1431,10 @@ object BackupManager {
             val o = arr.getJSONObject(i)
             val date = o.getLong("date")
             val updatedAt = o.getLong("updatedAt")
+            if (!DayNoteRepository.isPlausibleEpochDay(date)) {
+                Log.w(TAG, "Rejecting implausible day note from backup: date=$date updatedAt=$updatedAt")
+                return@mapNotNull null
+            }
             if (!isPlausibleBackupUpdatedAt(updatedAt, backupCreatedAt)) {
                 Log.w(TAG, "Rejecting implausible day note from backup: date=$date updatedAt=$updatedAt")
                 return@mapNotNull null
