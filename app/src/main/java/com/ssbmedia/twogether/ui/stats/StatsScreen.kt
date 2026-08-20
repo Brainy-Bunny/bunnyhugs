@@ -31,13 +31,12 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.stats.DateRange
 import com.ssbmedia.twogether.stats.StatsCalculator
-import com.ssbmedia.twogether.stats.Trend
 import com.ssbmedia.twogether.ui.components.SectionHeader
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
 import com.ssbmedia.twogether.ui.components.StatCard
+import com.ssbmedia.twogether.util.DateFormats
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
-import java.time.format.DateTimeFormatter
 import java.time.format.TextStyle
 import java.util.Locale
 
@@ -182,17 +181,21 @@ fun StatsScreen(
                     StatCard(
                         emoji = "💞",
                         label = "Together since",
-                        value = stats.togetherSince?.format(DateTimeFormatter.ofPattern("MMM d, yyyy")) ?: "—",
+                        value = stats.togetherSince?.let { DateFormats.formatDate(it) } ?: "—",
                         modifier = Modifier.weight(1f),
                         onClick = stats.togetherSince?.let { date ->
                             { onOpenCalendarWithArgs(date.toEpochDay(), null, null) }
                         }
                     )
                     StatCard(
-                        emoji = trendEmoji(stats.monthTrend),
+                        // Feature 1 / Phase 1 item 5: emoji now tracks the actual day-delta being shown
+                        // (not the separate hours-based Trend enum below it), so the arrow can never
+                        // point a different direction than the number next to it.
+                        emoji = monthTrendDeltaEmoji(stats.monthTrendDeltaDays),
                         label = "This month vs last",
-                        value = trendLabel(stats.monthTrend),
-                        modifier = Modifier.weight(1f)
+                        value = monthTrendDeltaLabel(stats.monthTrendDeltaDays),
+                        modifier = Modifier.weight(1f),
+                        onClick = { onOpenMonthlyDetail("days") }
                     )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
@@ -231,13 +234,12 @@ fun StatsScreen(
                 }
                 stats.longestSingleDay?.let {
                     Text(
-                        text = "Longest day together was ${it.date.format(DateTimeFormatter.ofPattern("MMM d, yyyy"))}.",
+                        text = "Longest day together was ${DateFormats.formatDate(it.date)}.",
                         style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.padding(top = 8.dp)
                     )
                 }
                 stats.longestApart?.let { gap ->
-                    val fmt = DateTimeFormatter.ofPattern("MMM d, yyyy")
                     val start = java.time.Instant.ofEpochMilli(gap.startMillis).atZone(java.time.ZoneId.systemDefault()).toLocalDate()
                     val end = java.time.Instant.ofEpochMilli(gap.endMillis).atZone(java.time.ZoneId.systemDefault()).toLocalDate()
                     Row(
@@ -248,7 +250,7 @@ fun StatsScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "Longest apart: ${"%.1f".format(gap.days)} days (${start.format(fmt)} – ${end.format(fmt)}).",
+                            text = "Longest apart: ${"%.1f".format(gap.days)} days (${DateFormats.formatDate(start)} – ${DateFormats.formatDate(end)}).",
                             style = MaterialTheme.typography.bodySmall,
                             modifier = Modifier.weight(1f)
                         )
@@ -270,23 +272,24 @@ fun StatsScreen(
     }
 }
 
-private fun formatMinutes(totalMinutes: Long): String {
-    val hours = totalMinutes / 60
-    val minutes = totalMinutes % 60
-    return if (hours > 0) "${hours}h ${minutes}m" else "${minutes}m"
-}
+private fun formatMinutes(totalMinutes: Long): String =
+    com.ssbmedia.twogether.util.RelativeTime.formatDuration(totalMinutes * 60_000L)
 
 private fun monthLabel(yearMonth: java.time.YearMonth): String =
     "${yearMonth.month.getDisplayName(TextStyle.SHORT, Locale.getDefault())} ${yearMonth.year}"
 
-private fun trendEmoji(trend: Trend): String = when (trend) {
-    Trend.UP -> "📈"
-    Trend.DOWN -> "📉"
-    Trend.FLAT -> "➡️"
+/** Phase 1 item 5: the actual day-count delta for "This month vs last" (user explicitly wants DAYS, not
+ * hours) - e.g. "Down 3 days" / "Up 2 days" / "Same", replacing the old 3-way Trend enum label that
+ * discarded the real number [StatsCalculator.compute] already computes. See
+ * [TogetherStats.monthTrendDeltaDays]'s doc for exactly what's compared. */
+private fun monthTrendDeltaLabel(delta: Int): String = when {
+    delta > 0 -> "Up $delta day" + (if (delta == 1) "" else "s")
+    delta < 0 -> "Down ${-delta} day" + (if (-delta == 1) "" else "s")
+    else -> "Same"
 }
 
-private fun trendLabel(trend: Trend): String = when (trend) {
-    Trend.UP -> "Up"
-    Trend.DOWN -> "Down"
-    Trend.FLAT -> "About the same"
+private fun monthTrendDeltaEmoji(delta: Int): String = when {
+    delta > 0 -> "📈"
+    delta < 0 -> "📉"
+    else -> "➡️"
 }

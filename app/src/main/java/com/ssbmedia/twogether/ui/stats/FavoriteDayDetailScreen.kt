@@ -2,7 +2,6 @@ package com.ssbmedia.twogether.ui.stats
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -24,6 +23,8 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -102,6 +103,13 @@ fun FavoriteDayDetailScreen(onBack: () -> Unit) {
     }
 }
 
+/**
+ * Phase 1 item 4 of UX-FIX-PLAN.md: labels used to be drawn in a separate [Row] of equal-`weight(1f)`
+ * columns below the [Canvas], using different layout math than the bars' own fixed-dp-gap positioning -
+ * so labels drifted out of alignment with their bars, worse toward the edges. Both are now drawn inside
+ * the same [Canvas] using the exact same per-bar `left`/`barWidth` geometry, so there's no second layout
+ * pass left to disagree with the first.
+ */
 @Composable
 private fun WeekdayBarChart(data: List<Pair<DayOfWeek, Int>>, modifier: Modifier = Modifier) {
     val maxVal = (data.maxOfOrNull { it.second } ?: 0).coerceAtLeast(1)
@@ -109,52 +117,49 @@ private fun WeekdayBarChart(data: List<Pair<DayOfWeek, Int>>, modifier: Modifier
     val bestColor = MaterialTheme.colorScheme.tertiary
     val gridColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)
     val bestDay = data.maxByOrNull { it.second }?.first
+    val labelColor = MaterialTheme.colorScheme.onSurfaceVariant
+    val textMeasurer = rememberTextMeasurer()
+    // Hoisted out of the Canvas draw block below: MaterialTheme.typography is a @Composable getter and
+    // can't be read from inside Canvas's onDraw lambda (a plain DrawScope, not composable context) -
+    // .copy() on an already-resolved TextStyle is a regular function call, so that part stays inside.
+    val dayLabelBaseStyle = MaterialTheme.typography.labelMedium.copy(color = labelColor, textAlign = TextAlign.Center)
+    val countLabelStyle = MaterialTheme.typography.labelSmall.copy(color = labelColor, textAlign = TextAlign.Center)
 
     Column(modifier = modifier.fillMaxWidth()) {
-        Canvas(modifier = Modifier.fillMaxWidth().height(240.dp).padding(bottom = 4.dp)) {
+        Canvas(modifier = Modifier.fillMaxWidth().height(280.dp).padding(bottom = 4.dp)) {
             val barCount = data.size
             if (barCount == 0) return@Canvas
             val gap = 16.dp.toPx()
+            val labelAreaHeight = 42.dp.toPx()
+            val barAreaHeight = (size.height - labelAreaHeight).coerceAtLeast(0f)
             val barWidth = ((size.width - gap * (barCount - 1)) / barCount).coerceAtLeast(1f)
             data.forEachIndexed { i, (day, count) ->
                 val fraction = count.toFloat() / maxVal.toFloat()
-                val barHeight = (fraction * size.height).coerceAtLeast(if (count > 0) 3f else 0f)
+                val barHeight = (fraction * barAreaHeight).coerceAtLeast(if (count > 0) 3f else 0f)
                 val left = i * (barWidth + gap)
+                val centerX = left + barWidth / 2f
+                val isBest = day == bestDay
                 drawRoundRect(
-                    color = if (day == bestDay && count > 0) bestColor else barColor,
-                    topLeft = Offset(left, size.height - barHeight),
+                    color = if (isBest && count > 0) bestColor else barColor,
+                    topLeft = Offset(left, barAreaHeight - barHeight),
                     size = Size(barWidth, barHeight),
                     cornerRadius = CornerRadius(6.dp.toPx(), 6.dp.toPx())
+                )
+                val dayLabelStyle = dayLabelBaseStyle.copy(fontWeight = if (isBest) FontWeight.Bold else FontWeight.Normal)
+                val dayLayout = textMeasurer.measure(day.getDisplayName(TextStyle.SHORT, Locale.getDefault()), dayLabelStyle)
+                drawText(dayLayout, topLeft = Offset(centerX - dayLayout.size.width / 2f, barAreaHeight + 2.dp.toPx()))
+                val countLayout = textMeasurer.measure("$count", countLabelStyle)
+                drawText(
+                    countLayout,
+                    topLeft = Offset(centerX - countLayout.size.width / 2f, barAreaHeight + 2.dp.toPx() + dayLayout.size.height)
                 )
             }
             drawLine(
                 color = gridColor,
-                start = Offset(0f, size.height),
-                end = Offset(size.width, size.height),
+                start = Offset(0f, barAreaHeight),
+                end = Offset(size.width, barAreaHeight),
                 strokeWidth = 1.5.dp.toPx()
             )
-        }
-        Row(modifier = Modifier.fillMaxWidth()) {
-            data.forEach { (day, count) ->
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = day.getDisplayName(TextStyle.SHORT, Locale.getDefault()),
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = if (day == bestDay) FontWeight.Bold else FontWeight.Normal,
-                        textAlign = TextAlign.Center,
-                        maxLines = 1,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Text(
-                        text = "$count",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center,
-                        maxLines = 1,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-            }
         }
     }
 }

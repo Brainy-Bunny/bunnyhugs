@@ -78,6 +78,14 @@ data class TogetherStats(
      * unfairly always trend down until the month is almost over. UP/DOWN uses a 5% deadband either side
      * so tiny noise doesn't flip-flop the label. */
     val monthTrend: Trend,
+    /** Phase 1 item 5 of UX-FIX-PLAN.md: the actual day-count delta behind [monthTrend], in the user's
+     * own explicitly-requested unit (DAYS, not hours) - "this month's distinct together-days so far" vs
+     * "the same elapsed window last month" (the exact same day-count comparison [monthTrend] makes in
+     * hours, just counted in qualifying days instead). Positive = more days met so far this month than
+     * the same point last month, negative = fewer, 0 = the same. Independent of [monthTrend]'s own
+     * hours-based 5%-deadband UP/DOWN/FLAT classification - the two CAN disagree at the margins (e.g.
+     * fewer, but longer, meetups this month), which is expected since they measure different things. */
+    val monthTrendDeltaDays: Int,
     /** Average calendar-day gap between consecutive distinct together-days (null if fewer than 2
      * together-days exist yet). A "meetup" is one distinct calendar day with ANY together-time - the
      * exact same qualifying-day set [totalDaysTogether]/the streak stats use - so meeting twice in one
@@ -168,7 +176,7 @@ object StatsCalculator {
                 currentDailyStreak = 0, longestDailyStreak = 0, currentWeeklyStreak = 0, longestWeeklyStreak = 0,
                 longestSessionMinutes = 0, reunionCount = 0, perfectWeekCount = 0, favoriteDayOfWeek = null, totalDaysTogether = 0,
                 mostMetMonth = null, mostHoursMonth = null, longestSingleDay = null, togetherSince = togetherSince,
-                monthTrend = Trend.FLAT, avgDaysBetweenMeetups = null, longestApart = null
+                monthTrend = Trend.FLAT, monthTrendDeltaDays = 0, avgDaysBetweenMeetups = null, longestApart = null
             )
         }
 
@@ -255,6 +263,27 @@ object StatsCalculator {
             else -> Trend.FLAT
         }
 
+        // Same "this month so far" vs "the same elapsed window last month" comparison as monthTrend
+        // above, just counted in distinct qualifying DAYS instead of hours (user's own explicit ask -
+        // see monthTrendDeltaDays' own doc). Deliberately worked out directly in whole calendar days
+        // (not by converting the millis-based hours window above back into dates) - the elapsed-hours
+        // window's boundaries fall mid-day, and re-deriving day counts from a mid-day millis cutoff would
+        // need its own off-by-one reasoning; counting calendar days directly is both simpler and exactly
+        // matches what "N days met" means to begin with.
+        val thisMonthWindowStartDate = today.withDayOfMonth(1)
+        val daysElapsedThisMonth = ChronoUnit.DAYS.between(thisMonthWindowStartDate, today) + 1
+        val lastMonthWindowStartDate = today.minusMonths(1).withDayOfMonth(1)
+        val lastMonthLengthDays = YearMonth.from(lastMonthWindowStartDate).lengthOfMonth().toLong()
+        // Never let the "last month" window run longer than last month actually was - same overrun
+        // guard as hoursLastMonthSameWindow's own lastMonthWindowEnd cap above, just in day units.
+        val lastMonthWindowLengthDays = daysElapsedThisMonth.coerceAtMost(lastMonthLengthDays)
+        val lastMonthWindowEndDateInclusive = lastMonthWindowStartDate.plusDays(lastMonthWindowLengthDays - 1)
+        val daysThisMonthSoFar = qualifyingDays.count { !it.isBefore(thisMonthWindowStartDate) && !it.isAfter(today) }
+        val daysLastMonthSameWindow = qualifyingDays.count {
+            !it.isBefore(lastMonthWindowStartDate) && !it.isAfter(lastMonthWindowEndDateInclusive)
+        }
+        val monthTrendDeltaDays = daysThisMonthSoFar - daysLastMonthSameWindow
+
         val gaps = dayGapsFromQualifyingDays(qualifyingDays.toList(), zone)
         val avgDaysBetweenMeetups = if (gaps.isNotEmpty()) gaps.map { it.days }.average() else null
         val longestApart = gaps.maxByOrNull { it.days }
@@ -277,6 +306,7 @@ object StatsCalculator {
             longestSingleDay = longestSingleDay,
             togetherSince = togetherSince,
             monthTrend = monthTrend,
+            monthTrendDeltaDays = monthTrendDeltaDays,
             avgDaysBetweenMeetups = avgDaysBetweenMeetups,
             longestApart = longestApart
         )

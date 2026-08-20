@@ -29,11 +29,11 @@ import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.notif.Notifications
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.util.BatteryOptimization
+import com.ssbmedia.twogether.util.RelativeTime
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.util.concurrent.TimeUnit
 
 /**
  * Long-running foreground service: advertises + scans BLE to detect the paired partner nearby,
@@ -718,11 +718,14 @@ class ProximityForegroundService : LifecycleService() {
         val text = if (stateMachine.isTogether) {
             val since = if (continuousTogetherSinceMillis > 0L) continuousTogetherSinceMillis else now
             val elapsedMillis = (now - since).coerceAtLeast(0L)
-            "💕 Together for ${formatDuration(elapsedMillis)}"
+            "💕 Together for ${RelativeTime.formatDuration(elapsedMillis)}"
         } else {
             if (stateMachine.lastSeenAt > 0L) {
+                // BUG fix (Phase 1 item 2 of UX-FIX-PLAN.md): was `formatDuration(elapsed) + " ago"`,
+                // which caps at hours and never rolls to days ("96h 12m ago" instead of "4d ago") -
+                // relativeAgo already produces "ago"-style text with the correct day rollover.
                 val elapsed = (now - stateMachine.lastSeenAt).coerceAtLeast(0L)
-                "Apart · last saw them ${formatDuration(elapsed)} ago"
+                "Apart · last saw them ${RelativeTime.relativeAgo(elapsed)}"
             } else {
                 "Apart · haven't seen them yet"
             }
@@ -776,13 +779,6 @@ class ProximityForegroundService : LifecycleService() {
      * can never get stuck permanently true if that external teardown happens to suppress the callback. */
     private fun resetClientSyncGuard() {
         synchronized(syncGuardLock) { clientSyncAttemptInProgress = false }
-    }
-
-    private fun formatDuration(millis: Long): String {
-        val totalMinutes = TimeUnit.MILLISECONDS.toMinutes(millis)
-        val hours = totalMinutes / 60
-        val minutes = totalMinutes % 60
-        return if (hours > 0) "${hours}h ${minutes}m" else "${minutes}m"
     }
 
     override fun onDestroy() {

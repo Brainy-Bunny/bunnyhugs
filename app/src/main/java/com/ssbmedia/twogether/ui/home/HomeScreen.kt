@@ -86,6 +86,7 @@ import com.ssbmedia.twogether.ui.components.PulsingHeart
 import com.ssbmedia.twogether.ui.components.QuickLinkChip
 import com.ssbmedia.twogether.ui.components.SectionHeader
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import com.ssbmedia.twogether.util.RelativeTime
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
@@ -683,13 +684,9 @@ fun HomeScreen(
                     )
                     Spacer(modifier = Modifier.height(12.dp))
                     pairingInfo.pendingResyncRequests.forEach { req ->
-                        val ageMinutes = ((now - req.requestedAt) / 60_000L).coerceAtLeast(0L)
-                        val ageText = when {
-                            ageMinutes < 1 -> "just now"
-                            ageMinutes < 60 -> "${ageMinutes}m ago"
-                            ageMinutes < 24 * 60 -> "${ageMinutes / 60}h ago"
-                            else -> "${ageMinutes / (24 * 60)}d ago"
-                        }
+                        // Now the shared RelativeTime.relativeAgo utility (Phase 1 item 2) - this was the
+                        // exact hand-written "just now/Xm/Xh/Xd ago" pattern that utility was modeled on.
+                        val ageText = RelativeTime.relativeAgo((now - req.requestedAt).coerceAtLeast(0L))
                         Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
                             Column(modifier = Modifier.padding(12.dp)) {
                                 Text(
@@ -1018,7 +1015,7 @@ private fun UsStatusCard(isTogether: Boolean, openSession: TogetherSession?, now
                 PulsingHeart()
                 val elapsed = openSession?.let { now - it.startedAt } ?: 0L
                 Text(
-                    text = "Together for ${formatDuration(elapsed)}",
+                    text = "Together for ${RelativeTime.formatDuration(elapsed)}",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.padding(top = 12.dp)
@@ -1097,13 +1094,6 @@ private fun OnThisDayCard(info: OnThisDayInfo) {
             )
         }
     }
-}
-
-private fun formatDuration(millis: Long): String {
-    val totalMinutes = millis / 60000
-    val hours = totalMinutes / 60
-    val minutes = totalMinutes % 60
-    return if (hours > 0) "${hours}h ${minutes}m" else "${minutes}m"
 }
 
 private fun timeAgo(pastMillis: Long, now: Long): String {

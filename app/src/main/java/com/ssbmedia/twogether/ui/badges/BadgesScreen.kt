@@ -44,11 +44,12 @@ import com.ssbmedia.twogether.data.datastore.ProximityPersistedState
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.stats.TogetherStats
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import com.ssbmedia.twogether.util.DateFormats
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import java.text.DateFormat
-import java.util.Date
+import java.time.Instant
+import java.time.ZoneId
 
 class BadgesViewModel : ViewModel() {
     val sessions = ServiceLocator.sessionRepository.observeAll()
@@ -87,8 +88,6 @@ fun BadgesScreen(onBack: () -> Unit) {
     LaunchedEffect(statuses) {
         vm.recordNewlyUnlocked(statuses.filter { it.unlocked }.map { it.badge.id })
     }
-
-    val dateFormat = remember { DateFormat.getDateInstance(DateFormat.MEDIUM) }
 
     Scaffold(
         topBar = {
@@ -142,8 +141,11 @@ fun BadgesScreen(onBack: () -> Unit) {
                         if (status.unlocked) {
                             val unlockedAt = unlockDates[status.badge.id]
                             if (unlockedAt != null) {
+                                val unlockedDate = remember(unlockedAt) {
+                                    Instant.ofEpochMilli(unlockedAt).atZone(ZoneId.systemDefault()).toLocalDate()
+                                }
                                 Text(
-                                    text = "on ${dateFormat.format(Date(unlockedAt))}",
+                                    text = "on ${DateFormats.formatDate(unlockedDate)}",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.padding(top = 1.dp)

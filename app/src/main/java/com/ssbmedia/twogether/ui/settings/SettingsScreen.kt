@@ -64,13 +64,15 @@ import com.ssbmedia.twogether.lock.AppLockManager
 import com.ssbmedia.twogether.lock.PinUtil
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
 import com.ssbmedia.twogether.ui.update.UpdateInstallActivity
+import com.ssbmedia.twogether.util.DateFormats
+import com.ssbmedia.twogether.util.RelativeTime
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import java.time.Instant
+import java.time.ZoneId
 
 private const val SETTINGS_TAG = "SettingsViewModel"
 
@@ -259,6 +261,16 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
     var syncMessage by remember { mutableStateOf<String?>(null) }
     var isListeningRole by remember { mutableStateOf(false) }
     val syncCoroutineScope = rememberCoroutineScope()
+    // Phase 1 item 2 of UX-FIX-PLAN.md: "Last synced Xm ago" used to be computed once at composition
+    // time with no ticker, so it visibly froze the whole time this screen stayed open - matches
+    // HomeScreen's own 30s ticker pattern.
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(30_000)
+            now = System.currentTimeMillis()
+        }
+    }
 
     LaunchedEffect(Unit) {
         lastSyncAt = ServiceLocator.settingsStore.current().lastSyncAt
@@ -391,7 +403,7 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                 SettingsRow(
                     label = "Sync now",
                     subtitle = syncMessage
-                        ?: if (lastSyncAt > 0) "Last synced ${settingsMinutesAgo(lastSyncAt)}m ago" else "Not synced yet"
+                        ?: if (lastSyncAt > 0) "Last synced ${RelativeTime.relativeAgo((now - lastSyncAt).coerceAtLeast(0L))}" else "Not synced yet"
                 ) {
                     TextButton(
                         onClick = {
@@ -423,8 +435,9 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                     isBackingUp -> "Backing up…"
                     settings.lastBackupAt <= 0L -> "Never backed up yet — a weekly backup runs automatically"
                     else -> {
-                        val fmt = remember { SimpleDateFormat("MMM d, h:mm a", Locale.getDefault()) }
-                        val whenText = fmt.format(Date(settings.lastBackupAt))
+                        val whenText = DateFormats.formatDateTime(
+                            Instant.ofEpochMilli(settings.lastBackupAt).atZone(ZoneId.systemDefault()).toLocalDateTime()
+                        )
                         if (settings.lastBackupOk) "Last backup: $whenText" else "Last backup FAILED: $whenText"
                     }
                 }
@@ -600,10 +613,6 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
     }
 
 }
-
-/** Same one-line calc as OurListsScreen's own private minutesAgo - kept separate rather than shared
- * since it's this trivial and each screen already keeps its own small helpers. */
-private fun settingsMinutesAgo(pastMillis: Long): Long = ((System.currentTimeMillis() - pastMillis) / 60000L).coerceAtLeast(0)
 
 @Composable
 private fun SettingsSection(title: String, content: @Composable ColumnScope.() -> Unit) {

@@ -52,6 +52,7 @@ import com.ssbmedia.twogether.data.db.ListCategory
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.ui.components.EmptyState
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import com.ssbmedia.twogether.util.RelativeTime
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
@@ -170,6 +171,16 @@ fun OurListsScreen(onBack: () -> Unit) {
     val expandedListIds = remember { mutableStateOf(setOf<String>()) }
     val showCompletedListIds = remember { mutableStateOf(setOf<String>()) }
     val coroutineScope = rememberCoroutineScope()
+    // Phase 1 item 2 of UX-FIX-PLAN.md: "Last synced Xm ago" used to be computed once at composition
+    // time with no ticker, so it visibly froze the whole time this screen stayed open - matches
+    // HomeScreen's own 30s ticker pattern.
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        while (true) {
+            delay(30_000)
+            now = System.currentTimeMillis()
+        }
+    }
 
     androidx.compose.runtime.LaunchedEffect(Unit) {
         lastSyncAt = ServiceLocator.settingsStore.current().lastSyncAt
@@ -227,7 +238,7 @@ fun OurListsScreen(onBack: () -> Unit) {
             ) {
                 Text(
                     text = syncMessage
-                        ?: if (lastSyncAt > 0) "Last synced ${minutesAgo(lastSyncAt)}m ago" else "Not synced yet",
+                        ?: if (lastSyncAt > 0) "Last synced ${RelativeTime.relativeAgo((now - lastSyncAt).coerceAtLeast(0L))}" else "Not synced yet",
                     style = MaterialTheme.typography.bodySmall
                 )
                 TextButton(
@@ -528,5 +539,3 @@ private fun AddListDialog(onDismiss: () -> Unit, onAdd: (String) -> Unit) {
         }
     )
 }
-
-private fun minutesAgo(pastMillis: Long): Long = ((System.currentTimeMillis() - pastMillis) / 60000L).coerceAtLeast(0)

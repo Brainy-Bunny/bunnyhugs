@@ -57,6 +57,7 @@ import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import com.ssbmedia.twogether.util.DateFormats
 import com.ssbmedia.twogether.util.SessionBoundsValidator
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
@@ -302,7 +303,10 @@ fun CalendarScreen(
         AlertDialog(
             onDismissRequest = { selectedDay = null },
             confirmButton = { TextButton(onClick = { selectedDay = null }) { Text("Close") } },
-            title = { Text(day.format(DateTimeFormatter.ofPattern("EEEE, MMM d"))) },
+            // BUG fix (Phase 1 item 1 of UX-FIX-PLAN.md): was "EEEE, MMM d" with no year at all - a real
+            // bug when this dialog is reached via a deep link into a PAST year (e.g. Stats' "Longest
+            // single day"/"Together since" cards), where the missing year made the title ambiguous.
+            title = { Text(DateFormats.formatDateWithWeekday(day)) },
             text = {
                 Column {
                     Text(if (minutes > 0) "${minutes / 60}h ${minutes % 60}m together that day" else "No time together that day")
@@ -318,7 +322,7 @@ fun CalendarScreen(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    "• ${start.format(DateTimeFormatter.ofPattern("h:mm a"))} – ${end?.format(DateTimeFormatter.ofPattern("h:mm a")) ?: "now"}$manualTag",
+                                    "• ${DateFormats.formatTime(start)} – ${end?.let { DateFormats.formatTime(it) } ?: "now"}$manualTag",
                                     style = MaterialTheme.typography.bodySmall,
                                     modifier = Modifier.weight(1f)
                                 )

@@ -40,11 +40,11 @@ import com.ssbmedia.twogether.stats.GapInfo
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.EmptyState
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import com.ssbmedia.twogether.util.DateFormats
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import java.time.Instant
 import java.time.ZoneId
-import java.time.format.DateTimeFormatter
 
 class GapsDetailViewModel : ViewModel() {
     val sessions = ServiceLocator.sessionRepository.observeAll()
@@ -121,7 +121,6 @@ fun GapsDetailScreen(onBack: () -> Unit) {
 
 @Composable
 private fun GapRow(gap: GapInfo, zone: ZoneId, isLongest: Boolean) {
-    val fmt = remember { DateTimeFormatter.ofPattern("MMM d, yyyy") }
     val start = Instant.ofEpochMilli(gap.startMillis).atZone(zone).toLocalDate()
     val end = Instant.ofEpochMilli(gap.endMillis).atZone(zone).toLocalDate()
 
@@ -149,7 +148,7 @@ private fun GapRow(gap: GapInfo, zone: ZoneId, isLongest: Boolean) {
                     )
                 }
                 Text(
-                    "${start.format(fmt)} – ${end.format(fmt)}",
+                    "${DateFormats.formatDate(start)} – ${DateFormats.formatDate(end)}",
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.SemiBold
                 )

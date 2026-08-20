@@ -63,6 +63,7 @@ import com.ssbmedia.twogether.data.db.MomentNote
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.ui.components.EmptyState
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import com.ssbmedia.twogether.util.DateFormats
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
@@ -71,8 +72,6 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.time.Instant
 import java.time.ZoneId
-import java.time.format.DateTimeFormatter
-import java.time.format.FormatStyle
 
 class MomentsViewModel : ViewModel() {
     val moments = ServiceLocator.momentRepository.observeAll()
@@ -177,7 +176,7 @@ fun MomentsScreen(onBack: () -> Unit, onNavigateCamera: () -> Unit) {
                     item(key = day.toString()) {
                         Column {
                             Text(
-                                text = day.format(DateTimeFormatter.ofLocalizedDate(FormatStyle.MEDIUM)),
+                                text = DateFormats.formatDate(day),
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.SemiBold,
                                 modifier = Modifier.padding(bottom = 8.dp)
@@ -264,8 +263,7 @@ private fun MomentThumbnail(moment: Moment, isTransferring: Boolean, onClick: ()
 private fun MomentFullScreen(moment: Moment, isTransferring: Boolean, onDismiss: () -> Unit, onDelete: () -> Unit) {
     val zone = remember { ZoneId.systemDefault() }
     val dateLabel = remember(moment.takenAt) {
-        Instant.ofEpochMilli(moment.takenAt).atZone(zone).toLocalDateTime()
-            .format(DateTimeFormatter.ofLocalizedDateTime(FormatStyle.MEDIUM, FormatStyle.SHORT))
+        DateFormats.formatDateTime(Instant.ofEpochMilli(moment.takenAt).atZone(zone).toLocalDateTime())
     }
     val hasLocalPhoto = remember(moment.photoUri, moment.photoDownloaded) { moment.photoDownloaded && File(moment.photoUri).isFile }
     var showDeleteConfirm by remember { mutableStateOf(false) }
@@ -403,6 +401,14 @@ private fun MomentNotesSection(momentSyncId: String) {
     var myText by remember { mutableStateOf("") }
     var initializedMyText by remember { mutableStateOf(false) }
     var saved by remember { mutableStateOf(false) }
+    // MAJOR fix (Phase 1 item 7 of UX-FIX-PLAN.md, root cause of "I saved a note but it doesn't
+    // appear"): whether the editable field is showing right now. A saved note of your own used to have
+    // NO read-only rendering anywhere - it only ever existed as the pre-filled contents of this
+    // ALWAYS-editable field, indistinguishable at a glance from an empty draft. Now the field only shows
+    // when there's genuinely nothing saved yet, or the user explicitly tapped "Edit" on their own saved
+    // note (see hasSavedMyNote/showEditableField below) - a real saved note instead renders as its own
+    // prominent read-only card, same as the partner's.
+    var isEditingMine by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         myDeviceId = ServiceLocator.settingsStore.getOrCreateLocalDeviceId()
@@ -448,6 +454,12 @@ private fun MomentNotesSection(momentSyncId: String) {
         // them labelled as their partner's.
         if (myDeviceId == null) null else notes?.firstOrNull { it.authorDeviceId != myDeviceId && !it.deleted }
     }
+    // Whether there's a real saved note of mine to show read-only - myExisting (not the myText draft)
+    // is the source of truth here, since myText can be an in-progress, not-yet-saved edit.
+    val hasSavedMyNote = myExisting?.text?.isNotBlank() == true
+    // The editable field only shows once seeding has genuinely resolved (same guard as before,
+    // untouched) AND either nothing is saved yet, or the user explicitly tapped Edit.
+    val showEditableField = initializedMyText && (!hasSavedMyNote || isEditingMine)
 
     Column(
         modifier = Modifier
@@ -456,61 +468,104 @@ private fun MomentNotesSection(momentSyncId: String) {
             .clickable(enabled = false) {}, // swallow taps so typing/saving doesn't dismiss the overlay
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        Text("Your note", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.titleSmall)
-        OutlinedTextField(
-            value = myText,
-            onValueChange = { myText = it; saved = false },
-            placeholder = { Text("A little detail about this one…") },
-            modifier = Modifier.fillMaxWidth(),
-            // MINOR fix (independent review round 2): the field used to be editable from the very first
-            // frame, while the seeding effect above was still waiting on myDeviceId/notes. Anything typed
-            // in that window was then overwritten the instant the latch fired - the same "an effect
-            // stomped what the user typed" class of bug the seeding fix itself addresses. The window is
-            // milliseconds, and nothing could be SAVED during it (the button below is gated on the same
-            // flag), but leaving the field live invited exactly that race.
-            enabled = initializedMyText,
-            minLines = 2,
-            colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
-                focusedTextColor = androidx.compose.ui.graphics.Color.White,
-                unfocusedTextColor = androidx.compose.ui.graphics.Color.White
-            )
-        )
-        Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
-            // Defence in depth for the data-loss bug fixed in the seeding effect above: even if some
-            // future change reintroduced a too-early latch, saving is impossible until this field is
-            // known to hold the real stored value, so a blank box can never be committed as a tombstone
-            // over a note the user actually wrote.
-            TextButton(enabled = initializedMyText, onClick = {
-                val deviceId = myDeviceId ?: return@TextButton
-                coroutineScope.launch {
-                    ServiceLocator.momentNoteRepository.saveMyNote(momentSyncId, deviceId, myText)
-                    saved = true
-                    // Best-effort: nudge a sync out right away if together, same debounced-manual-sync
-                    // entry point Date Ideas uses (Feature B) - if apart, this just no-ops honestly.
-                    if (ServiceLocator.proximityStateStore.current().isTogether) {
-                        com.ssbmedia.twogether.events.AppEvents.requestManualSync()
-                    }
+        // Own saved note - read-only, ABOVE the input, with an explicit Edit affordance. This is what
+        // was missing entirely before this fix: a saved note only ever existed as the editable field's
+        // pre-filled value, with nothing ever rendered to confirm it had actually saved.
+        if (hasSavedMyNote && !isEditingMine) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Your note", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.titleSmall)
+                    TextButton(onClick = { isEditingMine = true; saved = false }) { Text("Edit") }
                 }
-            }) { Text(if (saved) "Saved ✓" else "Save note") }
+                Card(
+                    shape = MaterialTheme.shapes.medium,
+                    colors = CardDefaults.cardColors(containerColor = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.16f))
+                ) {
+                    Text(
+                        myExisting?.text.orEmpty(),
+                        color = androidx.compose.ui.graphics.Color.White,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(12.dp)
+                    )
+                }
+            }
         }
 
         if (partnerNote != null && partnerNote.text.isNotBlank()) {
-            Text(
-                "$partnerName's note",
-                color = androidx.compose.ui.graphics.Color.White,
-                style = MaterialTheme.typography.titleSmall,
-                modifier = Modifier.padding(top = 8.dp)
-            )
-            Card(
-                shape = MaterialTheme.shapes.medium,
-                colors = CardDefaults.cardColors(containerColor = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.12f))
-            ) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(
-                    partnerNote.text,
+                    "$partnerName's note",
                     color = androidx.compose.ui.graphics.Color.White,
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.padding(12.dp)
+                    style = MaterialTheme.typography.titleSmall
                 )
+                Card(
+                    shape = MaterialTheme.shapes.medium,
+                    colors = CardDefaults.cardColors(containerColor = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.12f))
+                ) {
+                    Text(
+                        partnerNote.text,
+                        color = androidx.compose.ui.graphics.Color.White,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(12.dp)
+                    )
+                }
+            }
+        }
+
+        if (showEditableField) {
+            Text("Your note", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.titleSmall)
+            OutlinedTextField(
+                value = myText,
+                onValueChange = { myText = it; saved = false },
+                placeholder = { Text("A little detail about this one…") },
+                modifier = Modifier.fillMaxWidth(),
+                // MINOR fix (independent review round 2): the field used to be editable from the very first
+                // frame, while the seeding effect above was still waiting on myDeviceId/notes. Anything typed
+                // in that window was then overwritten the instant the latch fired - the same "an effect
+                // stomped what the user typed" class of bug the seeding fix itself addresses. The window is
+                // milliseconds, and nothing could be SAVED during it (the button below is gated on the same
+                // flag), but leaving the field live invited exactly that race.
+                enabled = initializedMyText,
+                minLines = 2,
+                colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                    focusedTextColor = androidx.compose.ui.graphics.Color.White,
+                    unfocusedTextColor = androidx.compose.ui.graphics.Color.White
+                )
+            )
+            Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+                // Lets the user back out of an in-progress edit without saving, reverting the draft back
+                // to whatever's actually stored - only offered once there's something to revert TO.
+                if (hasSavedMyNote) {
+                    TextButton(onClick = {
+                        myText = myExisting?.text.orEmpty()
+                        isEditingMine = false
+                    }) { Text("Cancel") }
+                }
+                // Defence in depth for the data-loss bug fixed in the seeding effect above: even if some
+                // future change reintroduced a too-early latch, saving is impossible until this field is
+                // known to hold the real stored value, so a blank box can never be committed as a tombstone
+                // over a note the user actually wrote.
+                TextButton(enabled = initializedMyText, onClick = {
+                    val deviceId = myDeviceId ?: return@TextButton
+                    coroutineScope.launch {
+                        ServiceLocator.momentNoteRepository.saveMyNote(momentSyncId, deviceId, myText)
+                        saved = true
+                        // Back to the read-only card once saved (or, for a blank save, back to the "no
+                        // note yet" empty-field state) - the Flow above will catch up moments later
+                        // regardless, but this avoids a visible flash of the just-saved text sitting in
+                        // an editable field a beat longer than it needs to.
+                        isEditingMine = false
+                        // Best-effort: nudge a sync out right away if together, same debounced-manual-sync
+                        // entry point Date Ideas uses (Feature B) - if apart, this just no-ops honestly.
+                        if (ServiceLocator.proximityStateStore.current().isTogether) {
+                            com.ssbmedia.twogether.events.AppEvents.requestManualSync()
+                        }
+                    }
+                }) { Text(if (saved) "Saved ✓" else "Save note") }
             }
         }
     }

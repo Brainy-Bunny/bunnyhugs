@@ -2,7 +2,6 @@ package com.ssbmedia.twogether.ui.stats
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -33,6 +32,8 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -50,6 +51,26 @@ import java.time.format.TextStyle
 import java.util.Locale
 
 private const val WINDOW_SIZE = 6
+
+/** Phase 1 item 6 of UX-FIX-PLAN.md - see HoursDetailScreen's identical helper for the full doc. Kept as
+ * a small private duplicate rather than a shared util: each screen already keeps its own page-window
+ * constant/state, and this is a self-contained ~15-line pure function. */
+private fun windowBoundsAnchoredFromEnd(totalSize: Int, windowSize: Int): List<IntRange> {
+    if (totalSize <= 0) return emptyList()
+    val fullWindowCount = totalSize / windowSize
+    val remainder = totalSize % windowSize
+    val bounds = mutableListOf<IntRange>()
+    var cursor = 0
+    if (remainder > 0) {
+        bounds.add(cursor until (cursor + remainder))
+        cursor += remainder
+    }
+    repeat(fullWindowCount) {
+        bounds.add(cursor until (cursor + windowSize))
+        cursor += windowSize
+    }
+    return bounds
+}
 
 private enum class MonthlyMetric { DAYS, HOURS }
 
@@ -87,7 +108,11 @@ fun MonthlyDetailScreen(initialMetric: String, onBack: () -> Unit) {
         StatsCalculator.computeMonthlyBreakdown(sessions, lastSeenAt = proximityState.lastSeenAt)
     }
 
-    val pageCount = if (monthly.isEmpty()) 0 else (monthly.size + WINDOW_SIZE - 1) / WINDOW_SIZE
+    // Phase 1 item 6: windows anchored from the END (the current month) backward - see
+    // windowBoundsAnchoredFromEnd's own doc for why chunking from index 0 could otherwise leave the
+    // default/latest page as a short leftover chunk.
+    val pageBounds = remember(monthly) { windowBoundsAnchoredFromEnd(monthly.size, WINDOW_SIZE) }
+    val pageCount = pageBounds.size
     val pagerState = rememberPagerState(initialPage = (pageCount - 1).coerceAtLeast(0)) { pageCount }
     // See HoursDetailScreen's identical LaunchedEffect for why this is needed - `sessions` resolves
     // asynchronously after this pagerState is first created, so pageCount is 0 (and initialPage bakes in
@@ -137,9 +162,8 @@ fun MonthlyDetailScreen(initialMetric: String, onBack: () -> Unit) {
                     modifier = Modifier.padding(top = 12.dp, bottom = 8.dp)
                 )
                 HorizontalPager(state = pagerState, modifier = Modifier.fillMaxWidth()) { page ->
-                    val start = page * WINDOW_SIZE
-                    val end = minOf(start + WINDOW_SIZE, monthly.size)
-                    val windowData = monthly.subList(start, end)
+                    val bounds = pageBounds.getOrNull(page) ?: (0 until 0)
+                    val windowData = monthly.subList(bounds.first, bounds.last + 1)
                     Column {
                         val rangeLabel = if (windowData.size > 1) {
                             "${monthLabel(windowData.first().yearMonth)} – ${monthLabel(windowData.last().yearMonth)}"
@@ -155,6 +179,13 @@ fun MonthlyDetailScreen(initialMetric: String, onBack: () -> Unit) {
     }
 }
 
+/**
+ * Phase 1 item 4 of UX-FIX-PLAN.md: labels used to be drawn in a separate [Row] of equal-`weight(1f)`
+ * columns below the [Canvas], using different layout math than the bars' own fixed-dp-gap positioning -
+ * so labels drifted out of alignment with their bars, worse toward the edges. Both are now drawn inside
+ * the same [Canvas] using the exact same per-bar `left`/`barWidth` geometry, so there's no second layout
+ * pass left to disagree with the first.
+ */
 @Composable
 private fun MonthlyBarChart(data: List<MonthlyBreakdown>, metric: MonthlyMetric, modifier: Modifier = Modifier) {
     val values = data.map { if (metric == MonthlyMetric.DAYS) it.daysMet.toDouble() else it.hours }
@@ -162,6 +193,10 @@ private fun MonthlyBarChart(data: List<MonthlyBreakdown>, metric: MonthlyMetric,
     val barColor = MaterialTheme.colorScheme.secondary
     val gridColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)
     val unit = if (metric == MonthlyMetric.DAYS) "d" else "h"
+    val labelColor = MaterialTheme.colorScheme.onSurfaceVariant
+    val textMeasurer = rememberTextMeasurer()
+    val monthLabelStyle = MaterialTheme.typography.labelSmall.copy(color = labelColor, textAlign = TextAlign.Center)
+    val valueLabelStyle = MaterialTheme.typography.labelSmall.copy(color = labelColor, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
 
     Column(modifier = modifier.fillMaxWidth()) {
         Text(
@@ -169,51 +204,42 @@ private fun MonthlyBarChart(data: List<MonthlyBreakdown>, metric: MonthlyMetric,
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
-        Canvas(modifier = Modifier.fillMaxWidth().height(220.dp).padding(top = 4.dp, bottom = 4.dp)) {
+        Canvas(modifier = Modifier.fillMaxWidth().height(260.dp).padding(top = 4.dp, bottom = 4.dp)) {
             val barCount = values.size
             if (barCount == 0) return@Canvas
             val gap = 20.dp.toPx()
+            val labelAreaHeight = 36.dp.toPx()
+            val barAreaHeight = (size.height - labelAreaHeight).coerceAtLeast(0f)
             val barWidth = ((size.width - gap * (barCount - 1)) / barCount).coerceAtLeast(1f)
             values.forEachIndexed { i, value ->
                 val fraction = (value / maxVal).toFloat().coerceIn(0f, 1f)
-                val barHeight = (fraction * size.height).coerceAtLeast(if (value > 0) 3f else 0f)
+                val barHeight = (fraction * barAreaHeight).coerceAtLeast(if (value > 0) 3f else 0f)
                 val left = i * (barWidth + gap)
+                val centerX = left + barWidth / 2f
                 drawRoundRect(
                     color = barColor,
-                    topLeft = Offset(left, size.height - barHeight),
+                    topLeft = Offset(left, barAreaHeight - barHeight),
                     size = Size(barWidth, barHeight),
                     cornerRadius = CornerRadius(6.dp.toPx(), 6.dp.toPx())
+                )
+                val monthLayout = textMeasurer.measure(
+                    data[i].yearMonth.month.getDisplayName(TextStyle.SHORT, Locale.getDefault()),
+                    monthLabelStyle
+                )
+                drawText(monthLayout, topLeft = Offset(centerX - monthLayout.size.width / 2f, barAreaHeight + 2.dp.toPx()))
+                val valueText = if (metric == MonthlyMetric.DAYS) "${value.toInt()}$unit" else "${"%.1f".format(value)}$unit"
+                val valueLayout = textMeasurer.measure(valueText, valueLabelStyle)
+                drawText(
+                    valueLayout,
+                    topLeft = Offset(centerX - valueLayout.size.width / 2f, barAreaHeight + 2.dp.toPx() + monthLayout.size.height)
                 )
             }
             drawLine(
                 color = gridColor,
-                start = Offset(0f, size.height),
-                end = Offset(size.width, size.height),
+                start = Offset(0f, barAreaHeight),
+                end = Offset(size.width, barAreaHeight),
                 strokeWidth = 1.5.dp.toPx()
             )
-        }
-        Row(modifier = Modifier.fillMaxWidth()) {
-            data.forEachIndexed { i, month ->
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = month.yearMonth.month.getDisplayName(TextStyle.SHORT, Locale.getDefault()),
-                        style = MaterialTheme.typography.labelSmall,
-                        textAlign = TextAlign.Center,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    val v = values[i]
-                    Text(
-                        text = if (metric == MonthlyMetric.DAYS) "${v.toInt()}$unit" else "${"%.1f".format(v)}$unit",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.SemiBold,
-                        textAlign = TextAlign.Center,
-                        maxLines = 1,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-            }
         }
     }
 }
