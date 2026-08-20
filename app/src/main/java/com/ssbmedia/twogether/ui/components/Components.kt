@@ -101,14 +101,34 @@ fun StatCard(
                 // defensive fix applied here, once, for every StatCard rather than special-cased on one
                 // call site, so any future long value string is protected the same way without anyone
                 // having to remember to add it again.
+                //
+                // MINOR fix (ultimate-app-review round 1, item 6): maxLines = 1 was truncating the exact
+                // longer values this same UX pass introduced ("Down 12 days", "Aug 2026 (123.4h)", "Aug
+                // 2026 (31d)") - these are short, meaningful strings that just don't fit ONE line at this
+                // width, not long enough to genuinely need truncation. Now allowed to wrap to 2 lines
+                // instead (overflow/ellipsis kept as a defensive fallback for anything that's still too long
+                // even across 2 lines). minLines = 2 (not just maxLines) is what actually keeps two StatCards
+                // side by side in a Row the SAME height regardless of whether either one's value happens to
+                // wrap - reserving the same 2-line height unconditionally rather than only capping it.
                 Text(
                     text = value,
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
-                    maxLines = 1,
+                    minLines = 2,
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )
-                Text(text = label, style = MaterialTheme.typography.bodySmall)
+                // MINOR fix (ultimate-app-review round 1, item 6): this label Text had no maxLines at all -
+                // a longer label (or the value above wrapping to 2 lines and pushing layout around it) could
+                // make two StatCards in the same Row end up different heights. Same minLines/maxLines = 2
+                // treatment as the value Text above, for the same reason.
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.bodySmall,
+                    minLines = 2,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
             if (onClick != null) {
                 Icon(
