@@ -39,8 +39,10 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.badges.BadgeCatalog
+import com.ssbmedia.twogether.badges.BadgeStatus
 import com.ssbmedia.twogether.badges.BadgeType
 import com.ssbmedia.twogether.data.datastore.ProximityPersistedState
+import com.ssbmedia.twogether.stats.DateRange
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.stats.TogetherStats
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
@@ -73,7 +75,16 @@ class BadgesViewModel : ViewModel() {
 }
 
 @Composable
-fun BadgesScreen(onBack: () -> Unit) {
+fun BadgesScreen(
+    onBack: () -> Unit,
+    // UX-FIX-PLAN.md Phase 3 item 20: Badge -> the stat that earned it - same
+    // onOpenHoursDetail/onOpenGapsDetail/onOpenCalendarWithArgs shapes StatsScreen's own drill-down cards
+    // already use, wired here to whichever badge category earned each one (see the per-status onClick
+    // below).
+    onOpenHoursDetail: () -> Unit = {},
+    onOpenGapsDetail: () -> Unit = {},
+    onOpenCalendarWithArgs: (jumpToEpochDay: Long?, highlightStartEpochDay: Long?, highlightEndEpochDay: Long?) -> Unit = { _, _, _ -> }
+) {
     val vm: BadgesViewModel = viewModel(factory = SimpleViewModelFactory { BadgesViewModel() })
     val sessions by vm.sessions.collectAsState()
     val proximityState by vm.proximityState.collectAsState()
@@ -84,6 +95,14 @@ fun BadgesScreen(onBack: () -> Unit) {
         StatsCalculator.compute(sessions, lastSeenAt = proximityState.lastSeenAt)
     }
     val statuses = remember(stats) { BadgeCatalog.statuses(stats) }
+    // Same DateRange lookups StatsScreen's own "Longest streak" cards already drive - see their doc there
+    // for why min(...)-clamped LWW convergence, etc, isn't relevant here: this is a pure read.
+    val longestDailyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt) {
+        StatsCalculator.longestDailyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt)
+    }
+    val longestWeeklyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt) {
+        StatsCalculator.longestWeeklyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt)
+    }
 
     LaunchedEffect(statuses) {
         vm.recordNewlyUnlocked(statuses.filter { it.unlocked }.map { it.badge.id })
@@ -110,50 +129,80 @@ fun BadgesScreen(onBack: () -> Unit) {
                 BadgeProgressBarsSection(stats)
             }
             items(statuses, key = { it.badge.id }) { status ->
-                Card(
-                    shape = MaterialTheme.shapes.large,
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (status.unlocked) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
-                    )
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Text(
-                            text = status.badge.emoji,
-                            style = MaterialTheme.typography.displaySmall,
-                            modifier = Modifier.graphicsLayer {
-                                alpha = if (status.unlocked) 1f else 0.35f
-                            }
-                        )
-                        Text(
-                            text = status.badge.title,
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.padding(top = 8.dp)
-                        )
-                        Text(
-                            text = status.progressLabel,
-                            style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier.padding(top = 2.dp)
-                        )
-                        if (status.unlocked) {
-                            val unlockedAt = unlockDates[status.badge.id]
-                            if (unlockedAt != null) {
-                                val unlockedDate = remember(unlockedAt) {
-                                    Instant.ofEpochMilli(unlockedAt).atZone(ZoneId.systemDefault()).toLocalDate()
-                                }
-                                Text(
-                                    text = "on ${DateFormats.formatDate(unlockedDate)}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(top = 1.dp)
-                                )
-                            }
-                        }
+                // UX-FIX-PLAN.md Phase 3 item 20: Badge -> the stat that earned it. HOURS and REUNIONS
+                // route to their own dedicated detail screens; DAILY_STREAK/WEEKLY_STREAK route to
+                // Calendar highlighting the actual streak range (same DateRange lookups StatsScreen's own
+                // "Longest streak" cards use) - null (no qualifying streak yet) means no destination, so
+                // the card simply isn't clickable rather than navigating somewhere with nothing to show.
+                // PERFECT_WEEKS has no dedicated drill-down screen (grid-only by design, see
+                // BadgeProgressBarsSection's own doc), so it stays non-clickable too.
+                val onClick: (() -> Unit)? = when (status.badge.type) {
+                    BadgeType.HOURS -> onOpenHoursDetail
+                    BadgeType.REUNIONS -> onOpenGapsDetail
+                    BadgeType.DAILY_STREAK -> longestDailyStreakRange?.let { range ->
+                        { onOpenCalendarWithArgs(null, range.start.toEpochDay(), range.end.toEpochDay()) }
+                    }
+                    BadgeType.WEEKLY_STREAK -> longestWeeklyStreakRange?.let { range ->
+                        { onOpenCalendarWithArgs(null, range.start.toEpochDay(), range.end.toEpochDay()) }
+                    }
+                    BadgeType.PERFECT_WEEKS -> null
+                }
+                val cardColors = CardDefaults.cardColors(
+                    containerColor = if (status.unlocked) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
+                )
+                if (onClick != null) {
+                    Card(shape = MaterialTheme.shapes.large, colors = cardColors, onClick = onClick) {
+                        BadgeCardContent(status, unlockDates)
+                    }
+                } else {
+                    Card(shape = MaterialTheme.shapes.large, colors = cardColors) {
+                        BadgeCardContent(status, unlockDates)
                     }
                 }
+            }
+        }
+    }
+}
+
+/** The badge card's inner content, factored out so both the clickable and non-clickable [Card] overloads
+ * in [BadgesScreen] above (Material3 gives them structurally different signatures, so the same Card
+ * instance can't conditionally take an onClick) render identically. */
+@Composable
+private fun BadgeCardContent(status: BadgeStatus, unlockDates: Map<String, Long>) {
+    Column(
+        modifier = Modifier.padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = status.badge.emoji,
+            style = MaterialTheme.typography.displaySmall,
+            modifier = Modifier.graphicsLayer {
+                alpha = if (status.unlocked) 1f else 0.35f
+            }
+        )
+        Text(
+            text = status.badge.title,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(top = 8.dp)
+        )
+        Text(
+            text = status.progressLabel,
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(top = 2.dp)
+        )
+        if (status.unlocked) {
+            val unlockedAt = unlockDates[status.badge.id]
+            if (unlockedAt != null) {
+                val unlockedDate = remember(unlockedAt) {
+                    Instant.ofEpochMilli(unlockedAt).atZone(ZoneId.systemDefault()).toLocalDate()
+                }
+                Text(
+                    text = "on ${DateFormats.formatDate(unlockedDate)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 1.dp)
+                )
             }
         }
     }

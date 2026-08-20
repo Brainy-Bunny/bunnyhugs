@@ -18,17 +18,36 @@ import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DatePicker
+import androidx.compose.material3.DatePickerDialog
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SelectableDates
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TimePicker
+import androidx.compose.material3.rememberDatePickerState
+import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import com.ssbmedia.twogether.util.DateFormats
+import java.time.Instant
+import java.time.LocalDate
+import java.time.LocalTime
+import java.time.ZoneOffset
 
 @Composable
 fun SectionHeader(title: String, modifier: Modifier = Modifier) {
@@ -129,6 +148,158 @@ fun EmptyState(emoji: String, title: String, subtitle: String, modifier: Modifie
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 4.dp)
         )
+    }
+}
+
+/**
+ * UX-FIX-PLAN.md Phase 3 item 18: a read-only, tap-to-open-native-picker date field - replaces the raw
+ * ISO `yyyy-MM-dd` free-text fields this app used to have in GalleryImportFlow/CalendarScreen's
+ * AddManualSessionDialog (a picker can't produce a typo/unparseable value the way free text could).
+ * Shared by both call sites so they can't visually or behaviorally drift apart.
+ *
+ * Renders as a read-only [OutlinedTextField] (so it keeps the same label/appearance every other text
+ * field in this app has) with an invisible clickable [Box] drawn ON TOP of it - a `readOnly` text field
+ * still accepts focus/cursor taps rather than reliably surfacing a click the way a plain `enabled = false`
+ * field would (which would also visually greyed it out, which isn't wanted here); the overlay is the
+ * standard Compose pattern for "looks like a text field, behaves like a button".
+ *
+ * [minDate]/[maxDate] are enforced structurally via the picker's own [SelectableDates] (an out-of-range
+ * day simply can't be tapped) rather than left to the caller's own post-hoc validation - the caller may
+ * still keep its own error text as a backstop (per the plan's own instruction to keep existing validation
+ * even though a picker can't produce an invalid date), but the picker itself can no longer produce an
+ * out-of-range value in the first place.
+ *
+ * Deliberately converts via [ZoneOffset.UTC] on both ends, never the device's local zone: Material3's
+ * DatePicker always represents its selection as UTC-midnight epoch millis internally regardless of the
+ * device's own timezone (a well-documented API quirk) - converting through the local zone instead would
+ * silently shift the displayed/selected date by one day for any negative-UTC-offset user.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun DatePickerField(
+    label: String,
+    date: LocalDate,
+    onDateChange: (LocalDate) -> Unit,
+    modifier: Modifier = Modifier,
+    minDate: LocalDate? = null,
+    maxDate: LocalDate? = null,
+    enabled: Boolean = true
+) {
+    var showPicker by remember { mutableStateOf(false) }
+    Box(modifier = modifier) {
+        OutlinedTextField(
+            value = DateFormats.formatDate(date),
+            onValueChange = {},
+            readOnly = true,
+            enabled = enabled,
+            label = { Text(label) },
+            modifier = Modifier.fillMaxWidth()
+        )
+        if (enabled) {
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .clickable(onClick = { showPicker = true })
+            )
+        }
+    }
+    if (showPicker) {
+        val selectableDates = remember(minDate, maxDate) {
+            object : SelectableDates {
+                override fun isSelectableDate(utcTimeMillis: Long): Boolean {
+                    val d = Instant.ofEpochMilli(utcTimeMillis).atZone(ZoneOffset.UTC).toLocalDate()
+                    if (minDate != null && d.isBefore(minDate)) return false
+                    if (maxDate != null && d.isAfter(maxDate)) return false
+                    return true
+                }
+            }
+        }
+        val state = rememberDatePickerState(
+            initialSelectedDateMillis = date.atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli(),
+            selectableDates = selectableDates
+        )
+        DatePickerDialog(
+            onDismissRequest = { showPicker = false },
+            confirmButton = {
+                TextButton(onClick = {
+                    state.selectedDateMillis?.let {
+                        onDateChange(Instant.ofEpochMilli(it).atZone(ZoneOffset.UTC).toLocalDate())
+                    }
+                    showPicker = false
+                }) { Text("OK") }
+            },
+            dismissButton = { TextButton(onClick = { showPicker = false }) { Text("Cancel") } }
+        ) {
+            DatePicker(state = state)
+        }
+    }
+}
+
+/**
+ * UX-FIX-PLAN.md Phase 3 item 18: a read-only, tap-to-open-native-picker time field - replaces the raw
+ * 24-hour `H:MM` free-text time fields this app used to have. Same "read-only text field + invisible
+ * clickable overlay" shape as [DatePickerField] - see its own doc for why.
+ *
+ * Material3 (the version this project is pinned to via its compose-bom) ships [DatePicker] with a ready-
+ * made [DatePickerDialog] wrapper but no equivalent `TimePickerDialog` wrapper for [TimePicker] - so this
+ * builds its own minimal dialog chrome (a plain [Dialog] + [Surface] + Cancel/OK row) around the bare
+ * [TimePicker] composable rather than depending on an API this BOM doesn't provide.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun TimePickerField(
+    label: String,
+    time: LocalTime,
+    onTimeChange: (LocalTime) -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true
+) {
+    var showPicker by remember { mutableStateOf(false) }
+    Box(modifier = modifier) {
+        OutlinedTextField(
+            value = DateFormats.formatTime(time),
+            onValueChange = {},
+            readOnly = true,
+            enabled = enabled,
+            label = { Text(label) },
+            modifier = Modifier.fillMaxWidth()
+        )
+        if (enabled) {
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .clickable(onClick = { showPicker = true })
+            )
+        }
+    }
+    if (showPicker) {
+        val state = rememberTimePickerState(initialHour = time.hour, initialMinute = time.minute, is24Hour = false)
+        Dialog(onDismissRequest = { showPicker = false }) {
+            Surface(shape = MaterialTheme.shapes.large, tonalElevation = 6.dp) {
+                Column(
+                    modifier = Modifier.padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(bottom = 12.dp)
+                    )
+                    TimePicker(state = state)
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(onClick = { showPicker = false }) { Text("Cancel") }
+                        TextButton(onClick = {
+                            onTimeChange(LocalTime.of(state.hour, state.minute))
+                            showPicker = false
+                        }) { Text("OK") }
+                    }
+                }
+            }
+        }
     }
 }
 

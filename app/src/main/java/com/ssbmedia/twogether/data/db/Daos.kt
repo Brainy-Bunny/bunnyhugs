@@ -172,6 +172,19 @@ interface MomentDao {
     @Query("UPDATE moments SET takenWhileTogether = 1 WHERE syncId = :syncId")
     suspend fun markTakenWhileTogether(syncId: String)
 
+    /** UX-FIX-PLAN.md Phase 3 item 17: a general "set to either value" counterpart to
+     * [markTakenWhileTogether] above - that one is deliberately one-way (a self-heal that can only ever
+     * flip false -> true, see its own doc), but a person manually correcting a moment's "taken apart" /
+     * "taken together" caption after the fact needs to be able to flip it either direction. Same targeted
+     * single-column UPDATE shape (not a stale-read `dao.update(moment.copy(...))` built from a snapshot)
+     * for the same reason [markTakenWhileTogether] is: this can race a concurrent photo-transfer commit
+     * (photoDownloaded) or a sync-driven self-heal, and a full-row write built from an old snapshot could
+     * silently clobber either. Also bumps updatedAt (unlike the self-heal), since this - unlike a one-time
+     * backfill of previously-missing information - genuinely is a user edit that must propagate to the
+     * partner's phone on the next sync. */
+    @Query("UPDATE moments SET takenWhileTogether = :together, updatedAt = :updatedAt WHERE syncId = :syncId")
+    suspend fun setTakenWhileTogether(syncId: String, together: Boolean, updatedAt: Long)
+
     /** Wipes every row - used only by Feature 4's backup restore, which always fully repopulates this
      * table immediately afterward inside the same DB transaction. */
     @Query("DELETE FROM moments")

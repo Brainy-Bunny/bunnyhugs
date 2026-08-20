@@ -171,7 +171,12 @@ fun TwogetherNavHost(
                     onNavigateCapsules = { navController.navigate(Screen.Capsules.route) },
                     onNavigateBadges = { navController.navigate(Screen.Badges.route) },
                     onNavigateCamera = { navController.navigate(Screen.Camera.route) },
-                    onNavigateMilestones = { navController.navigate(Screen.Milestones.route) }
+                    onNavigateMilestones = { navController.navigate(Screen.Milestones.route) },
+                    // UX-FIX-PLAN.md Phase 3 item 20: Home's throwback/on-this-day cards -> the actual
+                    // Moment/date, same Calendar.withArgs/Moments.withArgs deep-link pattern Stats already
+                    // uses for its own drill-down cards.
+                    onOpenCalendar = { day -> navController.navigate(Screen.Calendar.withArgs(jumpToEpochDay = day)) },
+                    onOpenMoments = { day -> navController.navigate(Screen.Moments.withArgs(jumpToEpochDay = day)) }
                 )
             }
             composable(
@@ -187,14 +192,20 @@ fun TwogetherNavHost(
                     onBack = { navController.popBackStack() },
                     jumpToEpochDay = args?.getLong("jumpToEpochDay")?.takeIf { it >= 0 },
                     highlightStartEpochDay = args?.getLong("highlightStartEpochDay")?.takeIf { it >= 0 },
-                    highlightEndEpochDay = args?.getLong("highlightEndEpochDay")?.takeIf { it >= 0 }
+                    highlightEndEpochDay = args?.getLong("highlightEndEpochDay")?.takeIf { it >= 0 },
+                    onOpenMoments = { day -> navController.navigate(Screen.Moments.withArgs(jumpToEpochDay = day)) }
                 )
             }
             composable(Screen.DateIdeas.route) { OurListsScreen(onBack = { navController.popBackStack() }) }
-            composable(Screen.Moments.route) {
+            composable(
+                route = Screen.Moments.routePattern,
+                arguments = listOf(navArgument("jumpToEpochDay") { type = NavType.LongType; defaultValue = -1L })
+            ) { entry ->
                 MomentsScreen(
                     onBack = { navController.popBackStack() },
-                    onNavigateCamera = { navController.navigate(Screen.Camera.route) }
+                    onNavigateCamera = { navController.navigate(Screen.Camera.route) },
+                    jumpToEpochDay = entry.arguments?.getLong("jumpToEpochDay")?.takeIf { it >= 0 },
+                    onOpenCalendar = { day -> navController.navigate(Screen.Calendar.withArgs(jumpToEpochDay = day)) }
                 )
             }
             composable(Screen.Stats.route) {
@@ -221,8 +232,26 @@ fun TwogetherNavHost(
             }
             composable(Screen.FavoriteDayDetail.route) { FavoriteDayDetailScreen(onBack = { navController.popBackStack() }) }
             composable(Screen.GapsDetail.route) { GapsDetailScreen(onBack = { navController.popBackStack() }) }
-            composable(Screen.Capsules.route) { CapsulesScreen(onBack = { navController.popBackStack() }) }
-            composable(Screen.Badges.route) { BadgesScreen(onBack = { navController.popBackStack() }) }
+            composable(Screen.Capsules.route) {
+                CapsulesScreen(
+                    onBack = { navController.popBackStack() },
+                    // UX-FIX-PLAN.md Phase 3 item 20: Time Capsule -> the day it unlocked.
+                    onOpenCalendar = { day -> navController.navigate(Screen.Calendar.withArgs(jumpToEpochDay = day)) }
+                )
+            }
+            composable(Screen.Badges.route) {
+                BadgesScreen(
+                    onBack = { navController.popBackStack() },
+                    // UX-FIX-PLAN.md Phase 3 item 20: Badge -> the stat that earned it - same
+                    // onOpenHoursDetail/onOpenGapsDetail/onOpenCalendarWithArgs pattern StatsScreen's own
+                    // drill-down cards already use.
+                    onOpenHoursDetail = { navController.navigate(Screen.HoursDetail.route) },
+                    onOpenGapsDetail = { navController.navigate(Screen.GapsDetail.route) },
+                    onOpenCalendarWithArgs = { jumpTo, highlightStart, highlightEnd ->
+                        navController.navigate(Screen.Calendar.withArgs(jumpTo, highlightStart, highlightEnd))
+                    }
+                )
+            }
             composable(Screen.Milestones.route) {
                 MilestonesScreen(
                     onBack = { navController.popBackStack() },
@@ -230,7 +259,9 @@ fun TwogetherNavHost(
                     // BUG fix: see MilestonesScreen's own doc - without this, latchedMilestoneId stayed
                     // set forever (this local `remember` only resets on a full NavHost teardown), so
                     // every later Milestones visit kept reopening the same notification's retrospective.
-                    onInitialMilestoneConsumed = { latchedMilestoneId = null }
+                    onInitialMilestoneConsumed = { latchedMilestoneId = null },
+                    // UX-FIX-PLAN.md Phase 3 item 20: Milestone -> Calendar date.
+                    onOpenCalendar = { day -> navController.navigate(Screen.Calendar.withArgs(jumpToEpochDay = day)) }
                 )
             }
             composable(Screen.Settings.route) { SettingsScreen(onBack = { navController.popBackStack() }, onUnpaired = onUnpaired) }

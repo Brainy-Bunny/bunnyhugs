@@ -522,6 +522,12 @@ class SyncCaptionAndChurnAuditTest {
             updateCount++
             rows[syncId]?.let { rows[syncId] = it.copy(takenWhileTogether = true) }
         }
+        /** UX-FIX-PLAN.md Phase 3 item 17: same one-column-only faithfulness as [markTakenWhileTogether]
+         * above, but two-way and bumping updatedAt (a real user edit, not a one-time backfill). */
+        override suspend fun setTakenWhileTogether(syncId: String, together: Boolean, updatedAt: Long) {
+            updateCount++
+            rows[syncId]?.let { rows[syncId] = it.copy(takenWhileTogether = together, updatedAt = updatedAt) }
+        }
         override suspend fun clearAll() { rows.clear() }
     }
 
@@ -604,6 +610,44 @@ class SyncCaptionAndChurnAuditTest {
         repo.mergeRemoteStubs(listOf(remoteStub("s1", takenWhileTogether = false)))
         assertTrue(dao.rows.getValue("s1").takenWhileTogether)
         assertEquals(0, dao.updateCount)
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // UX-FIX-PLAN.md Phase 3 item 17 - the manual edit toggle
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    fun `setTakenWhileTogether flips the caption either direction and bumps updatedAt`() = runBlocking {
+        val moment = remoteStub("s1", takenWhileTogether = true)
+        val dao = FakeMomentDao(listOf(moment))
+        val repo = MomentRepository(dao, mock(Context::class.java))
+
+        repo.setTakenWhileTogether(moment, together = false)
+
+        val stored = dao.rows.getValue("s1")
+        assertFalse("a manual edit must be able to move either direction, unlike the one-way self-heal", stored.takenWhileTogether)
+        assertTrue(
+            "unlike the self-heal (which deliberately never bumps updatedAt), a real user edit must " +
+                "propagate to the partner on the next sync",
+            stored.updatedAt > moment.updatedAt
+        )
+    }
+
+    @Test
+    fun `setTakenWhileTogether can flip a photo this phone took, unlike a peer's sync claim`() = runBlocking {
+        // Contrast with `a peer can never flip the caption of a photo this phone took` above: THAT test
+        // is about an untrusted peer's payload during mergeRemoteStubs. This is a deliberate local user
+        // action on this device's own moment, which must always be honored.
+        val mine = Moment(
+            id = 1L, photoUri = "/local/mine.jpg", takenAt = 1_700_000_000_000L, sessionId = null,
+            takenWhileTogether = false, syncId = "s1", isRemote = false, photoDownloaded = true, updatedAt = 1_000L
+        )
+        val dao = FakeMomentDao(listOf(mine))
+        val repo = MomentRepository(dao, mock(Context::class.java))
+
+        repo.setTakenWhileTogether(mine, together = true)
+
+        assertTrue(dao.rows.getValue("s1").takenWhileTogether)
     }
 
     @Test

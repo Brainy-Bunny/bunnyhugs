@@ -71,6 +71,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneId
 
 class MomentsViewModel : ViewModel() {
@@ -90,10 +91,32 @@ class MomentsViewModel : ViewModel() {
             }
         }
     }
+
+    /** UX-FIX-PLAN.md Phase 3 item 17: lets the user flip a Moment's "taken apart"/"taken together"
+     * caption after the fact - see MomentRepository.setTakenWhileTogether's own doc. Same "don't make it
+     * wait for the next reconnect" reasoning as [deleteMoment] above. */
+    fun setTakenWhileTogether(moment: Moment, together: Boolean) {
+        viewModelScope.launch {
+            ServiceLocator.momentRepository.setTakenWhileTogether(moment, together)
+            if (ServiceLocator.proximityStateStore.current().isTogether) {
+                AppEvents.requestManualSync()
+            }
+        }
+    }
 }
 
 @Composable
-fun MomentsScreen(onBack: () -> Unit, onNavigateCamera: () -> Unit) {
+fun MomentsScreen(
+    onBack: () -> Unit,
+    onNavigateCamera: () -> Unit,
+    // UX-FIX-PLAN.md Phase 3 item 20: Calendar day -> that day's Moments - when set, this screen scrolls
+    // to (rather than filters out everything but) that day's group, so the rest of the gallery is still
+    // one scroll away instead of vanishing.
+    jumpToEpochDay: Long? = null,
+    // The reverse direction: each day-group header below is itself clickable, jumping to that same date
+    // on Calendar.
+    onOpenCalendar: (jumpToEpochDay: Long) -> Unit = {}
+) {
     val vm: MomentsViewModel = viewModel(factory = SimpleViewModelFactory { MomentsViewModel() })
     val moments by vm.moments.collectAsState()
     // Feature 2: syncIds currently being requested/received over GATT - drives the "Receiving photo…"
@@ -104,6 +127,17 @@ fun MomentsScreen(onBack: () -> Unit, onNavigateCamera: () -> Unit) {
     val zone = remember { ZoneId.systemDefault() }
     val grouped = remember(moments) {
         moments.groupBy { Instant.ofEpochMilli(it.takenAt).atZone(zone).toLocalDate() }
+    }
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+    val jumpToDate = remember(jumpToEpochDay) { jumpToEpochDay?.let { LocalDate.ofEpochDay(it) } }
+    // grouped's key order matches the underlying moments Flow's own order (observeActive() sorts
+    // takenAt DESC), so a day's position in grouped.keys is exactly its item index in the LazyColumn
+    // below (one `item()` per day group, in the same iteration order) - no separate index bookkeeping
+    // needed.
+    LaunchedEffect(jumpToDate, grouped) {
+        val date = jumpToDate ?: return@LaunchedEffect
+        val index = grouped.keys.indexOf(date)
+        if (index >= 0) listState.animateScrollToItem(index)
     }
 
     // Backfill entry point: "Choose from gallery" sits as a small companion FAB above the existing
@@ -168,6 +202,7 @@ fun MomentsScreen(onBack: () -> Unit, onNavigateCamera: () -> Unit) {
             )
         } else {
             LazyColumn(
+                state = listState,
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
@@ -175,11 +210,15 @@ fun MomentsScreen(onBack: () -> Unit, onNavigateCamera: () -> Unit) {
                 grouped.forEach { (day, dayMoments) ->
                     item(key = day.toString()) {
                         Column {
+                            // UX-FIX-PLAN.md Phase 3 item 20: the reverse of Calendar's day -> Moments
+                            // link - tapping a day-group header jumps to that same date on Calendar.
                             Text(
                                 text = DateFormats.formatDate(day),
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.padding(bottom = 8.dp)
+                                modifier = Modifier
+                                    .clickable(onClick = { onOpenCalendar(day.toEpochDay()) })
+                                    .padding(bottom = 8.dp)
                             )
                             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 dayMoments.forEach { moment ->
@@ -198,7 +237,12 @@ fun MomentsScreen(onBack: () -> Unit, onNavigateCamera: () -> Unit) {
         }
         }
 
-        selected?.let { moment ->
+        selected?.let { sel ->
+            // UX-FIX-PLAN.md Phase 3 item 17: re-derived from the live `moments` Flow by syncId (falling
+            // back to the stale snapshot if it's ever momentarily missing) rather than rendering `sel`
+            // itself directly - so toggling "taken apart"/"taken together" below is reflected immediately
+            // in this same open screen instead of only after closing and reopening it.
+            val moment = moments.firstOrNull { it.syncId == sel.syncId } ?: sel
             MomentFullScreen(
                 moment = moment,
                 isTransferring = moment.syncId in transferring,
@@ -206,7 +250,8 @@ fun MomentsScreen(onBack: () -> Unit, onNavigateCamera: () -> Unit) {
                 // Once deleted, `moment` is a stale snapshot that no longer reflects the (now-filtered)
                 // Flow - closing the detail view here sidesteps ever rendering a deleted moment's
                 // fullscreen view after the fact, rather than needing extra reactivity to notice it's gone.
-                onDelete = { vm.deleteMoment(moment); selected = null }
+                onDelete = { vm.deleteMoment(moment); selected = null },
+                onSetTakenWhileTogether = { together -> vm.setTakenWhileTogether(moment, together) }
             )
         }
         }
@@ -260,7 +305,13 @@ private fun MomentThumbnail(moment: Moment, isTransferring: Boolean, onClick: ()
 }
 
 @Composable
-private fun MomentFullScreen(moment: Moment, isTransferring: Boolean, onDismiss: () -> Unit, onDelete: () -> Unit) {
+private fun MomentFullScreen(
+    moment: Moment,
+    isTransferring: Boolean,
+    onDismiss: () -> Unit,
+    onDelete: () -> Unit,
+    onSetTakenWhileTogether: (Boolean) -> Unit
+) {
     val zone = remember { ZoneId.systemDefault() }
     val dateLabel = remember(moment.takenAt) {
         DateFormats.formatDateTime(Instant.ofEpochMilli(moment.takenAt).atZone(zone).toLocalDateTime())
@@ -328,15 +379,14 @@ private fun MomentFullScreen(moment: Moment, isTransferring: Boolean, onDismiss:
                 style = MaterialTheme.typography.bodyLarge,
                 modifier = Modifier.padding(top = 16.dp)
             )
-            Text(
-                // MAJOR fix (independent review, live-reproduced across two paired devices): was
-                // `moment.sessionId != null`, which is ALWAYS null for a moment that arrived via sync (see
-                // MomentRepository.mergeRemoteStubs) - so the identical photo read "Taken while together
-                // 💕" on the phone that shot it and "Taken apart" on the partner's. Reads the synced
-                // boolean now, so both phones agree. See Moment.takenWhileTogether's doc.
-                text = if (moment.takenWhileTogether) "Taken while together 💕" else "Taken apart",
-                color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.8f),
-                style = MaterialTheme.typography.bodyMedium
+            // UX-FIX-PLAN.md Phase 3 item 17: was a static Text - takenWhileTogether was previously set
+            // once at capture/import time and never editable again (see Moment.takenWhileTogether's own
+            // doc for the sync-safety reasoning behind the field itself). A compact two-option segmented
+            // toggle now lets either partner correct it after the fact - e.g. a gallery import that
+            // guessed wrong, or a photo taken right at the boundary of a together-session.
+            TakenWhileTogetherToggle(
+                takenWhileTogether = moment.takenWhileTogether,
+                onSetTakenWhileTogether = onSetTakenWhileTogether
             )
 
             // Delete affordance: ANY moment can be deleted regardless of isRemote - unlike a manual
@@ -382,6 +432,31 @@ private fun MomentFullScreen(moment: Moment, isTransferring: Boolean, onDismiss:
                 TextButton(onClick = { showDeleteConfirm = false; onDelete() }) { Text("Delete") }
             },
             dismissButton = { TextButton(onClick = { showDeleteConfirm = false }) { Text("Cancel") } }
+        )
+    }
+}
+
+/**
+ * UX-FIX-PLAN.md Phase 3 item 17: a compact two-option toggle letting either partner flip a Moment's
+ * "taken apart"/"taken together" caption after the fact - a pair of [FilterChip]s, one always selected
+ * (tapping the other flips it, tapping the already-selected one is a no-op via each `onClick`, so exactly
+ * one of the two is ever "on" with no way to represent an invalid third state).
+ */
+@Composable
+private fun TakenWhileTogetherToggle(takenWhileTogether: Boolean, onSetTakenWhileTogether: (Boolean) -> Unit) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.padding(top = 4.dp)
+    ) {
+        androidx.compose.material3.FilterChip(
+            selected = takenWhileTogether,
+            onClick = { onSetTakenWhileTogether(true) },
+            label = { Text("Together 💕") }
+        )
+        androidx.compose.material3.FilterChip(
+            selected = !takenWhileTogether,
+            onClick = { onSetTakenWhileTogether(false) },
+            label = { Text("Apart") }
         )
     }
 }

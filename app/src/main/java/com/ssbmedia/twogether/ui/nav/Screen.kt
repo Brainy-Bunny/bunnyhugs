@@ -4,7 +4,21 @@ sealed class Screen(val route: String) {
     data object Onboarding : Screen("onboarding")
     data object Home : Screen("home")
     data object Camera : Screen("camera")
-    data object Moments : Screen("moments")
+
+    /**
+     * UX-FIX-PLAN.md Phase 3 item 20: same optional-query-arg pattern as [Calendar] below (see its own
+     * doc) - [route] stays the plain base path so bottom-nav/quick-link call sites can keep navigating
+     * with just `navController.navigate(Screen.Moments.route)`; [withArgs]'s [jumpToEpochDay] is used by
+     * Calendar's day -> Moments link and Home's throwback card to open this screen scrolled to a specific
+     * day's photo group instead of the top of the list.
+     */
+    data object Moments : Screen("moments") {
+        const val routePattern = "moments?jumpToEpochDay={jumpToEpochDay}"
+
+        fun withArgs(jumpToEpochDay: Long? = null): String =
+            if (jumpToEpochDay != null) "$route?jumpToEpochDay=$jumpToEpochDay" else route
+    }
+
     data object Stats : Screen("stats")
 
     /**

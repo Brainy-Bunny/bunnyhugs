@@ -14,6 +14,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material3.AlertDialog
@@ -124,6 +125,13 @@ class OurListsViewModel : ViewModel() {
         scheduleAutoSyncIfTogether()
     }
 
+    /** UX-FIX-PLAN.md Phase 3 item 19: renames a list - see ListCategoryRepository.rename's own doc. */
+    fun renameList(category: ListCategory, name: String) {
+        if (name.isBlank()) return
+        viewModelScope.launch { ServiceLocator.listCategoryRepository.rename(category, name.trim()) }
+        scheduleAutoSyncIfTogether()
+    }
+
     fun add(text: String, listId: String) {
         if (text.isBlank()) return
         viewModelScope.launch { ServiceLocator.dateIdeaRepository.add(text.trim(), listId) }
@@ -137,6 +145,13 @@ class OurListsViewModel : ViewModel() {
 
     fun delete(idea: DateIdea) {
         viewModelScope.launch { ServiceLocator.dateIdeaRepository.softDelete(idea) }
+        scheduleAutoSyncIfTogether()
+    }
+
+    /** UX-FIX-PLAN.md Phase 3 item 19: renames an idea's text - see DateIdeaRepository.rename's own doc. */
+    fun renameIdea(idea: DateIdea, text: String) {
+        if (text.isBlank()) return
+        viewModelScope.launch { ServiceLocator.dateIdeaRepository.rename(idea, text.trim()) }
         scheduleAutoSyncIfTogether()
     }
 
@@ -165,6 +180,9 @@ fun OurListsScreen(onBack: () -> Unit) {
     var pendingDelete by remember { mutableStateOf<DateIdea?>(null) }
     var pendingDeleteList by remember { mutableStateOf<ListCategory?>(null) }
     var showAddListDialog by remember { mutableStateOf(false) }
+    // UX-FIX-PLAN.md Phase 3 item 19: rename affordances for both a whole list and a single idea.
+    var pendingRenameIdea by remember { mutableStateOf<DateIdea?>(null) }
+    var pendingRenameList by remember { mutableStateOf<ListCategory?>(null) }
     // Per-list UI state, keyed by ListCategory.id - each card's own expansion and its own independent
     // "show completed" toggle, exactly mirroring the single global `showCompleted` the old flat screen
     // had, just one map entry per list instead of one screen-wide bool.
@@ -301,6 +319,7 @@ fun OurListsScreen(onBack: () -> Unit) {
                                 }
                             },
                             onDeleteClick = { pendingDeleteList = list },
+                            onRenameClick = { pendingRenameList = list },
                             onAddIdea = { text -> vm.add(text, list.id) },
                             activeIdeas = activeIdeas,
                             completedIdeas = completedIdeas,
@@ -313,7 +332,8 @@ fun OurListsScreen(onBack: () -> Unit) {
                                 }
                             },
                             onToggleIdea = { idea -> vm.toggleDone(idea) },
-                            onDeleteIdea = { idea -> pendingDelete = idea }
+                            onDeleteIdea = { idea -> pendingDelete = idea },
+                            onRenameIdea = { idea -> pendingRenameIdea = idea }
                         )
                     }
                 }
@@ -351,6 +371,49 @@ fun OurListsScreen(onBack: () -> Unit) {
             onAdd = { name -> vm.addList(name); showAddListDialog = false }
         )
     }
+
+    // UX-FIX-PLAN.md Phase 3 item 19: rename dialogs, both sharing the same generic RenameDialog.
+    pendingRenameList?.let { list ->
+        RenameDialog(
+            title = "Rename list",
+            initialText = list.name,
+            onDismiss = { pendingRenameList = null },
+            onSave = { name -> vm.renameList(list, name); pendingRenameList = null }
+        )
+    }
+    pendingRenameIdea?.let { idea ->
+        RenameDialog(
+            title = "Rename idea",
+            initialText = idea.text,
+            onDismiss = { pendingRenameIdea = null },
+            onSave = { text -> vm.renameIdea(idea, text); pendingRenameIdea = null }
+        )
+    }
+}
+
+/** UX-FIX-PLAN.md Phase 3 item 19: a plain single-text-field rename dialog, shared by both a whole list
+ * and an individual idea (the only difference between the two is the title and which repository call the
+ * caller wires [onSave] to). */
+@Composable
+private fun RenameDialog(title: String, initialText: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+    var text by remember(initialText) { mutableStateOf(initialText) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                modifier = Modifier.fillMaxWidth()
+            )
+        },
+        confirmButton = {
+            TextButton(enabled = text.isNotBlank(), onClick = { onSave(text) }) { Text("Save") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }
 
 /**
@@ -365,13 +428,15 @@ private fun ListCategoryCard(
     expanded: Boolean,
     onToggleExpanded: () -> Unit,
     onDeleteClick: () -> Unit,
+    onRenameClick: () -> Unit,
     onAddIdea: (String) -> Unit,
     activeIdeas: List<DateIdea>,
     completedIdeas: List<DateIdea>,
     showCompleted: Boolean,
     onToggleShowCompleted: () -> Unit,
     onToggleIdea: (DateIdea) -> Unit,
-    onDeleteIdea: (DateIdea) -> Unit
+    onDeleteIdea: (DateIdea) -> Unit,
+    onRenameIdea: (DateIdea) -> Unit
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -394,6 +459,13 @@ private fun ListCategoryCard(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                }
+                // UX-FIX-PLAN.md Phase 3 item 19: renaming is allowed for every list, INCLUDING the
+                // default one - only its delete tombstone is specially blocked (see
+                // ListCategoryRepository.rename's own doc, "Any NON-delete update to it still applies
+                // normally").
+                IconButton(onClick = onRenameClick) {
+                    Icon(Icons.Filled.Edit, contentDescription = "Rename list")
                 }
                 // The default "Date Ideas" list is the permanent fallback DateIdeaRepository.reassignOrphans
                 // relies on always existing (see its doc) - deleting it would let a future orphaned idea get
@@ -443,6 +515,7 @@ private fun ListCategoryCard(
                                 idea = idea,
                                 onToggle = { onToggleIdea(idea) },
                                 onDelete = { onDeleteIdea(idea) },
+                                onRename = { onRenameIdea(idea) },
                                 modifier = Modifier.padding(vertical = 4.dp)
                             )
                         }
@@ -477,6 +550,7 @@ private fun ListCategoryCard(
                                     idea = idea,
                                     onToggle = { onToggleIdea(idea) },
                                     onDelete = { onDeleteIdea(idea) },
+                                    onRename = { onRenameIdea(idea) },
                                     modifier = Modifier.padding(vertical = 4.dp)
                                 )
                             }
@@ -489,7 +563,13 @@ private fun ListCategoryCard(
 }
 
 @Composable
-private fun DateIdeaRow(idea: DateIdea, onToggle: () -> Unit, onDelete: () -> Unit, modifier: Modifier = Modifier) {
+private fun DateIdeaRow(
+    idea: DateIdea,
+    onToggle: () -> Unit,
+    onDelete: () -> Unit,
+    onRename: () -> Unit,
+    modifier: Modifier = Modifier
+) {
     Card(
         modifier = modifier,
         shape = MaterialTheme.shapes.large,
@@ -509,6 +589,10 @@ private fun DateIdeaRow(idea: DateIdea, onToggle: () -> Unit, onDelete: () -> Un
                     textDecoration = if (idea.done) TextDecoration.LineThrough else null,
                     style = MaterialTheme.typography.bodyLarge
                 )
+            }
+            // UX-FIX-PLAN.md Phase 3 item 19: rename affordance alongside the existing delete one.
+            IconButton(onClick = onRename) {
+                Icon(Icons.Filled.Edit, contentDescription = "Rename idea")
             }
             IconButton(onClick = onDelete) {
                 Icon(Icons.Filled.Delete, contentDescription = "Delete")

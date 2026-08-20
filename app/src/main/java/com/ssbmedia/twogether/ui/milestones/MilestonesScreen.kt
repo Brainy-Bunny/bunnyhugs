@@ -122,6 +122,28 @@ class MilestonesViewModel : ViewModel() {
         }
     }
 
+    /** UX-FIX-PLAN.md Phase 3 item 19: a full edit (label + month/day/year, alongside the linked photo) -
+     * previously only the photo was editable (see the former EditMilestonePhotoDialog this supersedes).
+     * Always re-arms the yearly alarm via MilestoneAlarmScheduler.scheduleOne afterward (cheap and
+     * idempotent even when the date didn't change - matches [add]'s own unconditional call) so a changed
+     * month/day always re-arms correctly rather than needing a separate "did the date change" branch that
+     * could itself drift out of sync with what actually changed. */
+    fun update(
+        context: android.content.Context,
+        milestone: Milestone,
+        label: String,
+        month: Int,
+        day: Int,
+        year: Int?,
+        linkedMomentSyncId: String?
+    ) {
+        viewModelScope.launch {
+            ServiceLocator.milestoneRepository.update(milestone, label, month, day, year, linkedMomentSyncId)
+            MilestoneAlarmScheduler.scheduleOne(context, milestone.copy(label = label, month = month, day = day))
+            if (ServiceLocator.proximityStateStore.current().isTogether) AppEvents.requestManualSync()
+        }
+    }
+
     /** Changes (or clears, if [linkedMomentSyncId] is null) an EXISTING milestone's linked photo - the
      * add-time-only picker in AddMilestoneDialog covers a NEW milestone, this covers going back to add/
      * swap/remove one on a milestone that already exists. No alarm rescheduling needed here (unlike
@@ -136,7 +158,14 @@ class MilestonesViewModel : ViewModel() {
 }
 
 @Composable
-fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onInitialMilestoneConsumed: () -> Unit = {}) {
+fun MilestonesScreen(
+    onBack: () -> Unit,
+    initialMilestoneId: String? = null,
+    onInitialMilestoneConsumed: () -> Unit = {},
+    // UX-FIX-PLAN.md Phase 3 item 20: Milestone -> Calendar date - threaded down into
+    // MilestoneRetrospective below, see its own doc for exactly which taps drive it.
+    onOpenCalendar: (jumpToEpochDay: Long) -> Unit = {}
+) {
     val vm: MilestonesViewModel = viewModel(factory = SimpleViewModelFactory { MilestonesViewModel() })
     val milestones by vm.milestones.collectAsState()
     val availableMoments by vm.availableMoments.collectAsState()
@@ -151,7 +180,9 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onI
     // open silently closed it (no crash/data loss, just an inconsistency with retrospectiveForId right
     // below, which already survives rotation). Same fix, same reasoning: store only the milestone's ID
     // via rememberSaveable and derive the actual Milestone from the already-loaded list.
-    var editingPhotoForId by rememberSaveable { mutableStateOf<String?>(null) }
+    // UX-FIX-PLAN.md Phase 3 item 19: renamed from editingPhotoForId now that this drives a full
+    // label/date/photo edit, not just the photo - same rememberSaveable-by-id rotation-survival shape.
+    var editingForId by rememberSaveable { mutableStateOf<String?>(null) }
     // BUG fix: was `var retrospectiveFor by remember { mutableStateOf<Milestone?>(null) }` - a further
     // review round found that plain `remember` here defeated the ROTATION half of the fix below (making
     // NavGraph's latchedMilestoneId `rememberSaveable`): the caller's latch is nulled via
@@ -165,7 +196,7 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onI
     // rotation too.
     var retrospectiveForId by rememberSaveable { mutableStateOf<String?>(null) }
     val retrospectiveFor = milestones.firstOrNull { it.id == retrospectiveForId }
-    val editingPhotoFor = milestones.firstOrNull { it.id == editingPhotoForId }
+    val editingFor = milestones.firstOrNull { it.id == editingForId }
 
     // BUG fix: an independent review round found the caller-side latch (NavGraph.kt's
     // latchedMilestoneId, which this screen's initialMilestoneId is fed from) was never cleared after
@@ -249,8 +280,8 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onI
                                 }
                             }
                             Row {
-                                IconButton(onClick = { editingPhotoForId = milestone.id }) {
-                                    Icon(Icons.Filled.Edit, contentDescription = "Edit photo")
+                                IconButton(onClick = { editingForId = milestone.id }) {
+                                    Icon(Icons.Filled.Edit, contentDescription = "Edit milestone")
                                 }
                                 IconButton(onClick = { pendingDelete = milestone }) {
                                     Icon(Icons.Filled.Delete, contentDescription = "Delete")
@@ -285,17 +316,23 @@ fun MilestonesScreen(onBack: () -> Unit, initialMilestoneId: String? = null, onI
     }
 
     retrospectiveFor?.let { milestone ->
-        MilestoneRetrospective(milestone = milestone, moments = moments, zone = zone, onDismiss = { retrospectiveForId = null })
+        MilestoneRetrospective(
+            milestone = milestone,
+            moments = moments,
+            zone = zone,
+            onDismiss = { retrospectiveForId = null },
+            onOpenCalendar = onOpenCalendar
+        )
     }
 
-    editingPhotoFor?.let { milestone ->
-        EditMilestonePhotoDialog(
+    editingFor?.let { milestone ->
+        EditMilestoneDialog(
             milestone = milestone,
             availableMoments = availableMoments,
-            onDismiss = { editingPhotoForId = null },
-            onSave = { linkedMomentSyncId ->
-                vm.setLinkedMoment(milestone, linkedMomentSyncId)
-                editingPhotoForId = null
+            onDismiss = { editingForId = null },
+            onSave = { label, month, day, year, linkedMomentSyncId ->
+                vm.update(context, milestone, label, month, day, year, linkedMomentSyncId)
+                editingForId = null
             }
         )
     }
@@ -439,13 +476,28 @@ private fun MomentPhotoPicker(availableMoments: List<Moment>, selectedMomentSync
     }
 }
 
-/** Lets the user pick/swap/clear an EXISTING milestone's linked photo - AddMilestoneDialog's picker only
- * ever runs at creation time, this covers going back to it afterward (see MilestonesViewModel.
- * setLinkedMoment's own doc). Deliberately just the photo picker, not label/date - editing those isn't
- * supported anywhere else in this screen either, so adding it here would be scope beyond what this fix
- * needs. */
+/**
+ * UX-FIX-PLAN.md Phase 3 item 19: a full edit of an already-existing milestone - label, month/day, year,
+ * AND its linked photo, superseding the former EditMilestonePhotoDialog (which was deliberately
+ * photo-only, per its own now-obsolete doc: "editing [label/date] isn't supported anywhere else in this
+ * screen either"). Mirrors AddMilestoneDialog's own label/month/day/year field layout so the two dialogs
+ * can't visually drift apart, pre-filled from [milestone] instead of today's date. The dangling-link
+ * self-heal below is carried over unchanged from the old photo-only dialog - see its own doc for why it's
+ * a LaunchedEffect rather than a one-shot remember.
+ */
 @Composable
-private fun EditMilestonePhotoDialog(milestone: Milestone, availableMoments: List<Moment>, onDismiss: () -> Unit, onSave: (linkedMomentSyncId: String?) -> Unit) {
+private fun EditMilestoneDialog(
+    milestone: Milestone,
+    availableMoments: List<Moment>,
+    onDismiss: () -> Unit,
+    onSave: (label: String, month: Int, day: Int, year: Int?, linkedMomentSyncId: String?) -> Unit
+) {
+    var label by remember(milestone.id) { mutableStateOf(milestone.label) }
+    var month by remember(milestone.id) { mutableStateOf(milestone.month) }
+    var dayText by remember(milestone.id) { mutableStateOf(milestone.day.toString()) }
+    var yearText by remember(milestone.id) { mutableStateOf(milestone.year?.toString() ?: "") }
+    var monthMenuExpanded by remember { mutableStateOf(false) }
+
     // MAJOR fix (ultimate-app-review round 1, both reviewers independently found this): was
     // `mutableStateOf(milestone.linkedMomentSyncId)` unconditionally - if the linked Moment had since been
     // deleted (or its photo bytes aren't downloaded on this device), that syncId doesn't match anything in
@@ -483,11 +535,65 @@ private fun EditMilestonePhotoDialog(milestone: Milestone, availableMoments: Lis
         }
     }
 
+    val day = dayText.toIntOrNull()
+    val maxDay = remember(month) { YearMonth.of(2024, month).lengthOfMonth() } // 2024 is a leap year, so Feb 29 is always offered
+    val error: String? = when {
+        label.isBlank() -> "Give it a name (e.g. Anniversary)"
+        day == null || day < 1 || day > maxDay -> "Enter a valid day for this month"
+        else -> null
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Photo for \"${milestone.label}\"") },
+        title = { Text("Edit milestone") },
         text = {
             Column {
+                OutlinedTextField(
+                    value = label,
+                    onValueChange = { label = it },
+                    label = { Text("Label") },
+                    placeholder = { Text("Anniversary, First Kiss…") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(modifier = Modifier.fillMaxWidth().padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ExposedDropdownMenuBox(
+                        expanded = monthMenuExpanded,
+                        onExpandedChange = { monthMenuExpanded = it },
+                        modifier = Modifier.weight(1.4f)
+                    ) {
+                        OutlinedTextField(
+                            value = Month.of(month).getDisplayName(TextStyle.SHORT, Locale.getDefault()),
+                            onValueChange = {},
+                            readOnly = true,
+                            label = { Text("Month") },
+                            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = monthMenuExpanded) },
+                            modifier = Modifier.menuAnchor()
+                        )
+                        DropdownMenu(expanded = monthMenuExpanded, onDismissRequest = { monthMenuExpanded = false }) {
+                            (1..12).forEach { m ->
+                                DropdownMenuItem(
+                                    text = { Text(Month.of(m).getDisplayName(TextStyle.FULL, Locale.getDefault())) },
+                                    onClick = { month = m; monthMenuExpanded = false }
+                                )
+                            }
+                        }
+                    }
+                    OutlinedTextField(
+                        value = dayText,
+                        onValueChange = { dayText = it.filter { c -> c.isDigit() }.take(2) },
+                        label = { Text("Day") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                OutlinedTextField(
+                    value = yearText,
+                    onValueChange = { yearText = it.filter { c -> c.isDigit() }.take(4) },
+                    label = { Text("Year (optional)") },
+                    placeholder = { Text("e.g. 2024") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp)
+                )
                 // MINOR fix (ultimate-app-review round 3, Opus): was just `if (hadDanglingLink)` - that
                 // flag is a one-time latch (see the LaunchedEffect above) and never resets, so once a
                 // dangling link got cleared, this warning stayed on screen even after the user picked a
@@ -499,7 +605,7 @@ private fun EditMilestonePhotoDialog(milestone: Milestone, availableMoments: Lis
                         "This milestone's photo isn't available anymore — pick a new one, or tap Save to clear it.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.padding(bottom = 8.dp)
+                        modifier = Modifier.padding(top = 12.dp)
                     )
                 }
                 if (availableMoments.isEmpty()) {
@@ -508,7 +614,8 @@ private fun EditMilestonePhotoDialog(milestone: Milestone, availableMoments: Lis
                         // every other user-facing string in this file (and most of the app) uses an em
                         // dash for this kind of aside.
                         "No photos to choose from yet — take one in Moments first.",
-                        style = MaterialTheme.typography.bodyMedium
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(top = 16.dp)
                     )
                 } else {
                     MomentPhotoPicker(
@@ -517,17 +624,38 @@ private fun EditMilestonePhotoDialog(milestone: Milestone, availableMoments: Lis
                         onSelect = { selectedMomentSyncId = it }
                     )
                 }
+                error?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
+                }
             }
         },
         confirmButton = {
-            TextButton(onClick = { onSave(selectedMomentSyncId) }) { Text("Save") }
+            TextButton(
+                enabled = error == null,
+                onClick = { onSave(label.trim(), month, day ?: 1, yearText.toIntOrNull(), selectedMomentSyncId) }
+            ) { Text("Save") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
     )
 }
 
+/**
+ * @param onOpenCalendar UX-FIX-PLAN.md Phase 3 item 20: Milestone -> Calendar date. The top subtitle
+ * ("<month day> throughout the years") is always tappable, jumping to the [nearestApplicableYear] for
+ * this milestone (the milestone's own recorded [Milestone.year] if it has one, otherwise whichever of
+ * this-year/last-year's occurrence has already happened) - a sensible single default even when there are
+ * no photos to browse by year at all. Each year header below (when [byYear] isn't empty) is ALSO
+ * independently tappable, jumping to that specific year instead - "the year currently being viewed in the
+ * milestone's own retrospective," per the plan's own suggested interpretation.
+ */
 @Composable
-private fun MilestoneRetrospective(milestone: Milestone, moments: List<Moment>, zone: ZoneId, onDismiss: () -> Unit) {
+private fun MilestoneRetrospective(
+    milestone: Milestone,
+    moments: List<Moment>,
+    zone: ZoneId,
+    onDismiss: () -> Unit,
+    onOpenCalendar: (jumpToEpochDay: Long) -> Unit = {}
+) {
     // "Throughout the years": every Moment whose takenAt falls on this same month+day, in any year,
     // grouped by year - the whole point being it works even across many years of photos.
     val byYear = remember(moments, milestone.month, milestone.day) {
@@ -550,7 +678,12 @@ private fun MilestoneRetrospective(milestone: Milestone, moments: List<Moment>, 
                 monthDayLabel(milestone.month, milestone.day) + " throughout the years",
                 color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.8f),
                 style = MaterialTheme.typography.bodyMedium,
-                modifier = Modifier.padding(bottom = 16.dp)
+                modifier = Modifier
+                    .padding(bottom = 16.dp)
+                    .clickable(onClick = {
+                        val year = nearestApplicableYear(milestone.month, milestone.day, milestone.year, LocalDate.now(zone))
+                        onOpenCalendar(safeDateForYear(year, milestone.month, milestone.day).toEpochDay())
+                    })
             )
             if (byYear.isEmpty()) {
                 Text(
@@ -559,7 +692,17 @@ private fun MilestoneRetrospective(milestone: Milestone, moments: List<Moment>, 
                 )
             } else {
                 byYear.forEach { (year, yearMoments) ->
-                    Text("$year", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 12.dp, bottom = 8.dp))
+                    Text(
+                        "$year",
+                        color = androidx.compose.ui.graphics.Color.White,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier
+                            .padding(top = 12.dp, bottom = 8.dp)
+                            .clickable(onClick = {
+                                onOpenCalendar(safeDateForYear(year, milestone.month, milestone.day).toEpochDay())
+                            })
+                    )
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         yearMoments.forEach { moment ->
                             // BUG fix: was `!moment.isRemote`, the pre-Feature-2 signal for "do we hold
@@ -604,3 +747,28 @@ private fun MilestoneRetrospective(milestone: Milestone, moments: List<Moment>, 
  * defensive clamp for the exact same reason. */
 private fun monthDayLabel(month: Int, day: Int): String =
     "${Month.of(month.coerceIn(1, 12)).getDisplayName(TextStyle.FULL, Locale.getDefault())} ${day.coerceIn(1, 31)}"
+
+/** UX-FIX-PLAN.md Phase 3 item 20: builds a real [LocalDate] for [month]/[day] in [year] - same
+ * defense-in-depth clamp as [monthDayLabel] above (a pre-existing corrupted row could otherwise crash
+ * this, and specifically LocalDate.of, rather than just mis-rendering a label), matching
+ * MilestoneAlarmScheduler.safeDate's own reasoning for the exact same clamp. Internal (not private) so
+ * MilestonesScreenTest can exercise it directly without any Compose test infra. */
+internal fun safeDateForYear(year: Int, month: Int, day: Int): LocalDate {
+    val safeMonth = month.coerceIn(1, 12)
+    val maxDay = YearMonth.of(year, safeMonth).lengthOfMonth()
+    return LocalDate.of(year, safeMonth, day.coerceIn(1, maxDay))
+}
+
+/** UX-FIX-PLAN.md Phase 3 item 20: which calendar year to jump to when a milestone's date itself is
+ * tapped (rather than a specific year header in its retrospective, which always names its own year
+ * explicitly) - prefers the milestone's own recorded [milestoneYear] if one was entered (that's the one
+ * year this particular milestone is actually ABOUT), otherwise whichever of this-year/last-year's
+ * occurrence of month/day has already happened relative to [today] (so a milestone whose date is still
+ * ahead this year jumps to last year's occurrence - an already-real day on the calendar - rather than a
+ * not-yet-arrived date this year). Internal (not private) for the same test-without-Compose reason as
+ * [safeDateForYear]. */
+internal fun nearestApplicableYear(month: Int, day: Int, milestoneYear: Int?, today: LocalDate): Int {
+    if (milestoneYear != null) return milestoneYear
+    val thisYearDate = safeDateForYear(today.year, month, day)
+    return if (!thisYearDate.isAfter(today)) today.year else today.year - 1
+}

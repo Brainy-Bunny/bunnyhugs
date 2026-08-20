@@ -92,6 +92,9 @@ import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
 import com.ssbmedia.twogether.util.RelativeTime
 import com.ssbmedia.twogether.ui.update.UpdateInstallActivity
 import java.io.File
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -241,7 +244,11 @@ fun HomeScreen(
     onNavigateCapsules: () -> Unit,
     onNavigateBadges: () -> Unit,
     onNavigateCamera: () -> Unit,
-    onNavigateMilestones: () -> Unit = {}
+    onNavigateMilestones: () -> Unit = {},
+    // UX-FIX-PLAN.md Phase 3 item 20: MemoryThrowbackCard -> the Moment's own day on Moments (via
+    // Screen.Moments' new jumpToEpochDay arg), OnThisDayCard -> that same calendar date on Calendar.
+    onOpenCalendar: (jumpToEpochDay: Long) -> Unit = {},
+    onOpenMoments: (jumpToEpochDay: Long) -> Unit = {}
 ) {
     val vm: HomeViewModel = viewModel(factory = SimpleViewModelFactory { HomeViewModel() })
     val pairingInfo by vm.pairingInfo.collectAsState()
@@ -628,12 +635,32 @@ fun HomeScreen(
                     val linkedMilestoneLabel = remember(randomMoment, milestones) {
                         milestones.firstOrNull { it.linkedMomentSyncId == randomMoment!!.syncId }?.label
                     }
-                    MemoryThrowbackCard(moment = randomMoment!!, now = now, milestoneLabel = linkedMilestoneLabel)
+                    // UX-FIX-PLAN.md Phase 3 item 20: opens Moments scrolled to this photo's own day -
+                    // the closest this app can get to "open the exact Moment" without a dedicated
+                    // single-photo deep link, and consistent with Calendar's own day -> Moments link.
+                    val momentEpochDay = remember(randomMoment) {
+                        Instant.ofEpochMilli(randomMoment!!.takenAt).atZone(ZoneId.systemDefault()).toLocalDate().toEpochDay()
+                    }
+                    MemoryThrowbackCard(
+                        moment = randomMoment!!,
+                        now = now,
+                        milestoneLabel = linkedMilestoneLabel,
+                        onClick = { onOpenMoments(momentEpochDay) }
+                    )
                 }
             }
             if (onThisDayInfo != null) {
                 item {
-                    OnThisDayCard(info = onThisDayInfo)
+                    // "On this day in {info.year}" always shares today's real month/day (see
+                    // StatsCalculator.onThisDayPreviousYear's own doc - it only ever matches entries whose
+                    // month/day equal TODAY's), so LocalDate.of(info.year, today.month, today.day) can
+                    // never throw even for a Feb 29 "today": that combination could only exist in the
+                    // qualifying-days map above in the first place if info.year genuinely supports it too.
+                    val onThisDayEpochDay = remember(onThisDayInfo, now) {
+                        val today = Instant.ofEpochMilli(now).atZone(ZoneId.systemDefault()).toLocalDate()
+                        LocalDate.of(onThisDayInfo.year, today.monthValue, today.dayOfMonth).toEpochDay()
+                    }
+                    OnThisDayCard(info = onThisDayInfo, onClick = { onOpenCalendar(onThisDayEpochDay) })
                 }
             }
             item {
@@ -1117,11 +1144,12 @@ private fun UsStatusCard(isTogether: Boolean, openSession: TogetherSession?, now
 }
 
 @Composable
-private fun MemoryThrowbackCard(moment: Moment, now: Long, milestoneLabel: String? = null) {
+private fun MemoryThrowbackCard(moment: Moment, now: Long, milestoneLabel: String? = null, onClick: () -> Unit = {}) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.large,
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+        onClick = onClick
     ) {
         Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             AsyncImage(
@@ -1157,11 +1185,12 @@ private fun MemoryThrowbackCard(moment: Moment, now: Long, milestoneLabel: Strin
  * [MemoryThrowbackCard]'s Card shape/color for visual consistency; no image slot since there's no photo
  * involved here. */
 @Composable
-private fun OnThisDayCard(info: OnThisDayInfo) {
+private fun OnThisDayCard(info: OnThisDayInfo, onClick: () -> Unit = {}) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.large,
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+        onClick = onClick
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text(

@@ -17,13 +17,13 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -33,7 +33,6 @@ import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -47,7 +46,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -56,7 +54,9 @@ import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.stats.StatsCalculator
+import com.ssbmedia.twogether.ui.components.DatePickerField
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import com.ssbmedia.twogether.ui.components.TimePickerField
 import com.ssbmedia.twogether.util.DateFormats
 import com.ssbmedia.twogether.util.SessionBoundsValidator
 import kotlinx.coroutines.flow.SharingStarted
@@ -65,10 +65,9 @@ import kotlinx.coroutines.launch
 import java.time.DayOfWeek
 import java.time.Instant
 import java.time.LocalDate
+import java.time.LocalTime
 import java.time.YearMonth
 import java.time.ZoneId
-import java.time.format.DateTimeFormatter
-import java.time.format.DateTimeParseException
 import java.time.format.TextStyle
 import java.util.Locale
 
@@ -107,6 +106,19 @@ class CalendarViewModel : ViewModel() {
             }
         }
     }
+
+    /** UX-FIX-PLAN.md Phase 3 item 19: edits an already-existing manually-backfilled session's start/end -
+     * SessionRepository.updateManualSession itself no-ops for a genuine BLE-detected session, but the edit
+     * affordance below only ever shows for isManual rows anyway. Same "don't make it wait for the next
+     * reconnect" reasoning as [addManualSession]/[deleteManualSession] above. */
+    fun updateManualSession(session: TogetherSession, startedAt: Long, endedAt: Long) {
+        viewModelScope.launch {
+            ServiceLocator.sessionRepository.updateManualSession(session, startedAt, endedAt)
+            if (ServiceLocator.proximityStateStore.current().isTogether) {
+                AppEvents.requestManualSync()
+            }
+        }
+    }
 }
 
 /**
@@ -124,7 +136,11 @@ fun CalendarScreen(
     onBack: () -> Unit,
     jumpToEpochDay: Long? = null,
     highlightStartEpochDay: Long? = null,
-    highlightEndEpochDay: Long? = null
+    highlightEndEpochDay: Long? = null,
+    // UX-FIX-PLAN.md Phase 3 item 20: the reverse of Moments' own day-header -> Calendar link - lets the
+    // day-detail dialog below jump straight to Moments, scrolled to this same date, when that day
+    // actually has photos.
+    onOpenMoments: (jumpToEpochDay: Long) -> Unit = {}
 ) {
     val vm: CalendarViewModel = viewModel(factory = SimpleViewModelFactory { CalendarViewModel() })
     val sessions by vm.sessions.collectAsState()
@@ -150,6 +166,9 @@ fun CalendarScreen(
     // Only ever set for an isManual session (see the delete IconButton below, which is only rendered
     // for those rows) - a genuine BLE-detected session has no way to reach this state at all.
     var sessionPendingDelete by remember { mutableStateOf<TogetherSession?>(null) }
+    // UX-FIX-PLAN.md Phase 3 item 19: same isManual-only reachability as sessionPendingDelete above -
+    // set only by the edit IconButton, which is only ever rendered for isManual rows.
+    var sessionPendingEdit by remember { mutableStateOf<TogetherSession?>(null) }
 
     // lastSeenAt clamps an open session's live duration so a stale/orphaned open session can't inflate
     // day totals - see StatsCalculator.effectiveOpenSessionEnd's doc.
@@ -300,6 +319,13 @@ fun CalendarScreen(
         val daySessions = remember(day, sessions, proximityState.lastSeenAt) {
             sessionsOverlapping(sessions, day, zone, proximityState.lastSeenAt)
         }
+        // UX-FIX-PLAN.md Phase 3 item 20: how many Moments were actually taken on this day - drives the
+        // "View N photos from this day" row below, only shown when there's something to jump to. Reuses
+        // the same day-grouping key (zone-local LocalDate off takenAt) [daysWithPhotos] above already
+        // uses, so this can never disagree with that dot marker about which days "have a photo".
+        val dayMomentsCount = remember(day, moments) {
+            moments.count { Instant.ofEpochMilli(it.takenAt).atZone(zone).toLocalDate() == day }
+        }
         AlertDialog(
             onDismissRequest = { selectedDay = null },
             confirmButton = { TextButton(onClick = { selectedDay = null }) { Text("Close") } },
@@ -326,10 +352,20 @@ fun CalendarScreen(
                                     style = MaterialTheme.typography.bodySmall,
                                     modifier = Modifier.weight(1f)
                                 )
-                                // Delete is only ever offered for a manually-backfilled entry - a genuine
-                                // BLE-detected session is the app's real historical record and must stay
-                                // untouchable, so no delete icon is even rendered for it.
+                                // Edit/delete are only ever offered for a manually-backfilled entry - a
+                                // genuine BLE-detected session is the app's real historical record and
+                                // must stay untouchable, so neither icon is even rendered for it.
                                 if (s.isManual) {
+                                    IconButton(
+                                        onClick = { sessionPendingEdit = s },
+                                        modifier = Modifier.size(32.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Edit,
+                                            contentDescription = "Edit this entry",
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
                                     IconButton(
                                         onClick = { sessionPendingDelete = s },
                                         modifier = Modifier.size(32.dp)
@@ -344,6 +380,26 @@ fun CalendarScreen(
                             }
                         }
                     }
+                    // UX-FIX-PLAN.md Phase 3 item 20: Calendar day -> that day's Moments. Only shown when
+                    // this day genuinely has photos, matching the day-cell's own HAS_PHOTO marker.
+                    if (dayMomentsCount > 0) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 12.dp)
+                                .clip(MaterialTheme.shapes.medium)
+                                .clickable(onClick = { onOpenMoments(day.toEpochDay()) })
+                                .padding(vertical = 8.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                if (dayMomentsCount == 1) "View 1 photo from this day" else "View $dayMomentsCount photos from this day",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Icon(Icons.Filled.ChevronRight, contentDescription = null)
+                        }
+                    }
                 }
             }
         )
@@ -352,10 +408,26 @@ fun CalendarScreen(
     if (showAddDialog) {
         AddManualSessionDialog(
             zone = zone,
+            existing = null,
             onDismiss = { showAddDialog = false },
-            onAdd = { startedAt, endedAt ->
+            onSave = { startedAt, endedAt ->
                 vm.addManualSession(startedAt, endedAt)
                 showAddDialog = false
+            }
+        )
+    }
+
+    // UX-FIX-PLAN.md Phase 3 item 19: same AddManualSessionDialog, reopened pre-filled with the existing
+    // session's start/end - see the dialog's own doc for how [existing] drives both the pre-fill and the
+    // Add-vs-Save copy.
+    sessionPendingEdit?.let { session ->
+        AddManualSessionDialog(
+            zone = zone,
+            existing = session,
+            onDismiss = { sessionPendingEdit = null },
+            onSave = { startedAt, endedAt ->
+                vm.updateManualSession(session, startedAt, endedAt)
+                sessionPendingEdit = null
             }
         )
     }
@@ -472,36 +544,40 @@ private fun sessionsOverlapping(sessions: List<TogetherSession>, day: LocalDate,
     }
 }
 
-/** "Add past time together": backfills a TogetherSession for a chosen date the couple was together
- * before installing the app (or a day BLE detection missed). Anchors the session at that date's
- * midnight so it lands entirely within the chosen calendar day - duration is capped at 24h so it can
- * never spill into the next day. */
+/**
+ * "Add past time together" (or, per [existing], edit an already-existing one): backfills/edits a
+ * TogetherSession for a chosen date the couple was together before installing the app (or a day BLE
+ * detection missed).
+ *
+ * UX-FIX-PLAN.md Phase 3 items 18+19 (done together deliberately, per the plan's own note that both touch
+ * this same dialog): redesigned from a date-text-field + duration(hours/minutes) shape to a native
+ * date/start-time/end-time picker shape - both so the free-text YYYY-MM-DD field can be replaced with
+ * [DatePickerField]/[TimePickerField] (item 18), AND because representing the session as real start/end
+ * times (rather than "midnight + a duration") is what makes pre-filling this same dialog with an EXISTING
+ * session's actual bounds for editing (item 19) meaningful - a manual session created via
+ * GalleryImportFlow's own "we were together" companion entry already has real start/end times, not a
+ * midnight anchor, so editing it here must preserve that shape rather than silently shifting its start to
+ * midnight the moment someone edits an unrelated field. [existing] null means "add"; non-null means "edit",
+ * pre-filling date/start/end from its startedAt/endedAt and switching the title/confirm-button copy.
+ *
+ * Still capped at one calendar day (end time must be on the same date, after the start time) - same
+ * invariant the old midnight+duration shape enforced structurally, now enforced by validation instead
+ * since a picker can't express "spans past midnight" here in the first place.
+ */
 @Composable
-private fun AddManualSessionDialog(zone: ZoneId, onDismiss: () -> Unit, onAdd: (startedAt: Long, endedAt: Long) -> Unit) {
+private fun AddManualSessionDialog(
+    zone: ZoneId,
+    existing: TogetherSession? = null,
+    onDismiss: () -> Unit,
+    onSave: (startedAt: Long, endedAt: Long) -> Unit
+) {
     val today = remember { LocalDate.now(zone) }
-    var dateText by remember { mutableStateOf(today.format(DateTimeFormatter.ISO_LOCAL_DATE)) }
-    var hoursText by remember { mutableStateOf("") }
-    var minutesText by remember { mutableStateOf("") }
+    val existingStart = remember(existing) { existing?.let { Instant.ofEpochMilli(it.startedAt).atZone(zone) } }
+    val existingEnd = remember(existing) { existing?.endedAt?.let { Instant.ofEpochMilli(it).atZone(zone) } }
 
-    val parsedDate = remember(dateText) {
-        try { LocalDate.parse(dateText, DateTimeFormatter.ISO_LOCAL_DATE) } catch (e: DateTimeParseException) { null }
-    }
-    val hours = hoursText.toIntOrNull() ?: 0
-    val minutes = minutesText.toIntOrNull() ?: 0
-    val totalMinutes = hours * 60 + minutes
-
-    // For a same-day (today) entry, a duration longer than what's actually elapsed since local
-    // midnight used to get silently clipped down to whatever fit (see onAdd's endedAt clamp below) -
-    // no warning, and duration is degenerate the "day" a same-day entry lands right on the elapsed
-    // minute (e.g. rounds down to 0), the repository's require(endedAt > startedAt) would throw
-    // uncaught inside a viewModelScope.launch, crashing the app. Validate up front instead so the user
-    // sees a clear error and the dialog can't submit a value that would need clipping at all.
-    val elapsedMinutesToday = remember(parsedDate, today) {
-        if (parsedDate == today) {
-            ((System.currentTimeMillis() - today.atStartOfDay(zone).toInstant().toEpochMilli()) / 60_000L)
-                .coerceAtLeast(0L)
-        } else null
-    }
+    var date by remember { mutableStateOf(existingStart?.toLocalDate() ?: today) }
+    var startTime by remember { mutableStateOf(existingStart?.toLocalTime() ?: LocalTime.of(9, 0)) }
+    var endTime by remember { mutableStateOf(existingEnd?.toLocalTime() ?: LocalTime.of(10, 0)) }
 
     // MINOR fix (test-code-allmodels final clean-room pass, Opus): this dialog previously had no lower
     // date bound - a pre-2020 entry inserted with no error, but SessionBoundsValidator.
@@ -510,24 +586,28 @@ private fun AddManualSessionDialog(zone: ZoneId, onDismiss: () -> Unit, onAdd: (
     // every stat, deserializeSessions drops it from the sync payload, and a restored backup drops it too
     // (SessionBoundsValidator.isPlausible). The row would sit in the local DB forever contributing to
     // nothing while the Calendar day-detail view showed a self-contradictory "manual entry, but no time
-    // together that day." Validated up front here instead, using the exact same floor.
+    // together that day." Now enforced structurally too (item 18): [DatePickerField]'s own minDate/maxDate
+    // make an out-of-range day un-tappable in the first place, with the error text kept as a backstop.
     val minPlausibleDate = remember {
-        java.time.Instant.ofEpochMilli(SessionBoundsValidator.MIN_PLAUSIBLE_TIMESTAMP_MILLIS).atZone(zone).toLocalDate()
+        Instant.ofEpochMilli(SessionBoundsValidator.MIN_PLAUSIBLE_TIMESTAMP_MILLIS).atZone(zone).toLocalDate()
     }
+
+    // For a same-day (today) entry, an end time later than the actual current wall-clock time must be
+    // rejected rather than silently clipped - same reasoning as this dialog always had, just re-expressed
+    // against a real end TIME instead of a duration-from-midnight.
+    val nowTimeToday = remember(date, today) { if (date == today) LocalTime.now(zone) else null }
+
     val error: String? = when {
-        parsedDate == null -> "Enter a valid date as YYYY-MM-DD"
-        parsedDate.isAfter(today) -> "Date can't be in the future"
-        parsedDate.isBefore(minPlausibleDate) -> "Date can't be before $minPlausibleDate"
-        totalMinutes <= 0 -> "Enter a duration greater than zero"
-        totalMinutes > 24 * 60 -> "Can't be more than 24 hours in one day"
-        elapsedMinutesToday != null && totalMinutes > elapsedMinutesToday ->
-            "Only ${elapsedMinutesToday / 60}h ${elapsedMinutesToday % 60}m has passed today - enter a shorter duration"
+        date.isAfter(today) -> "Date can't be in the future"
+        date.isBefore(minPlausibleDate) -> "Date can't be before ${DateFormats.formatDate(minPlausibleDate)}"
+        !endTime.isAfter(startTime) -> "End time must be after start time"
+        nowTimeToday != null && endTime.isAfter(nowTimeToday) -> "End time can't be later than the current time"
         else -> null
     }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Add past time together") },
+        title = { Text(if (existing == null) "Add past time together" else "Edit time together") },
         text = {
             Column {
                 Text(
@@ -535,25 +615,25 @@ private fun AddManualSessionDialog(zone: ZoneId, onDismiss: () -> Unit, onAdd: (
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(bottom = 12.dp)
                 )
-                OutlinedTextField(
-                    value = dateText,
-                    onValueChange = { dateText = it.trim() },
-                    label = { Text("Date (YYYY-MM-DD)") },
+                DatePickerField(
+                    label = "Date",
+                    date = date,
+                    onDateChange = { date = it },
+                    minDate = minPlausibleDate,
+                    maxDate = today,
                     modifier = Modifier.fillMaxWidth()
                 )
                 Row(modifier = Modifier.fillMaxWidth().padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(
-                        value = hoursText,
-                        onValueChange = { hoursText = it.filter { c -> c.isDigit() }.take(2) },
-                        label = { Text("Hours") },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    TimePickerField(
+                        label = "Start",
+                        time = startTime,
+                        onTimeChange = { startTime = it },
                         modifier = Modifier.weight(1f)
                     )
-                    OutlinedTextField(
-                        value = minutesText,
-                        onValueChange = { minutesText = it.filter { c -> c.isDigit() }.take(2) },
-                        label = { Text("Minutes") },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    TimePickerField(
+                        label = "End",
+                        time = endTime,
+                        onTimeChange = { endTime = it },
                         modifier = Modifier.weight(1f)
                     )
                 }
@@ -566,15 +646,11 @@ private fun AddManualSessionDialog(zone: ZoneId, onDismiss: () -> Unit, onAdd: (
             TextButton(
                 enabled = error == null,
                 onClick = {
-                    val date = parsedDate ?: return@TextButton
-                    val startedAt = date.atStartOfDay(zone).toInstant().toEpochMilli()
-                    val rawEndedAt = startedAt + totalMinutes * 60_000L
-                    // Anchored at midnight, not "now" - for today, an entered duration longer than the
-                    // elapsed part of the day would otherwise produce an endedAt in the future. Clip it.
-                    val endedAt = minOf(rawEndedAt, System.currentTimeMillis())
-                    onAdd(startedAt, endedAt)
+                    val startedAt = date.atTime(startTime).atZone(zone).toInstant().toEpochMilli()
+                    val endedAt = date.atTime(endTime).atZone(zone).toInstant().toEpochMilli()
+                    onSave(startedAt, endedAt)
                 }
-            ) { Text("Add") }
+            ) { Text(if (existing == null) "Add" else "Save") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
     )

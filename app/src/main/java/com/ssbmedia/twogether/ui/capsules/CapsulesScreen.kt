@@ -1,5 +1,6 @@
 package com.ssbmedia.twogether.ui.capsules
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -115,7 +116,7 @@ class CapsulesViewModel : ViewModel() {
 }
 
 @Composable
-fun CapsulesScreen(onBack: () -> Unit) {
+fun CapsulesScreen(onBack: () -> Unit, onOpenCalendar: (jumpToEpochDay: Long) -> Unit = {}) {
     val vm: CapsulesViewModel = viewModel(factory = SimpleViewModelFactory { CapsulesViewModel() })
     val capsules by vm.capsules.collectAsState()
     val sessions by vm.sessions.collectAsState()
@@ -224,11 +225,28 @@ fun CapsulesScreen(onBack: () -> Unit) {
                                 modifier = Modifier.padding(top = 10.dp)
                             )
                             timeline.openedLine?.let {
+                                // UX-FIX-PLAN.md Phase 3 item 20: Time Capsule -> the day it unlocked -
+                                // capsule.unlockedAt is only non-null exactly when this line renders (see
+                                // buildCapsuleTimelineText's own doc), so the tap target and its data are
+                                // always in sync.
+                                val unlockedAt = capsule.unlockedAt
                                 Text(
                                     it,
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(top = 2.dp)
+                                    modifier = Modifier
+                                        .padding(top = 2.dp)
+                                        .let { base ->
+                                            if (unlockedAt != null) {
+                                                base.clickable(onClick = {
+                                                    val epochDay = Instant.ofEpochMilli(unlockedAt)
+                                                        .atZone(ZoneId.systemDefault())
+                                                        .toLocalDate()
+                                                        .toEpochDay()
+                                                    onOpenCalendar(epochDay)
+                                                })
+                                            } else base
+                                        }
                                 )
                             }
                         }

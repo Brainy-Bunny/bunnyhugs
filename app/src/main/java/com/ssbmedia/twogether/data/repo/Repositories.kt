@@ -76,6 +76,19 @@ class SessionRepository(private val dao: TogetherSessionDao) {
         dao.update(session.copy(deleted = true, updatedAt = System.currentTimeMillis()))
     }
 
+    /** UX-FIX-PLAN.md Phase 3 item 19: edits an already-existing manually-backfilled session's start/end
+     * (e.g. the date/time was entered wrong, or the native pickers used to create it made a rounding
+     * mistake) - same isManual-only guard as [softDeleteManual], since a genuine BLE-detected session
+     * must remain an untouchable historical record no local UI action can ever alter. No-ops (silently
+     * drops the request rather than writing anything) for a non-manual session or a degenerate/invalid
+     * range, mirroring [addManualSession]'s own defensive validation - CalendarScreen's own dialog
+     * already validates this up front, but this is the last line of defense against a bad value slipping
+     * through into an uncaught exception inside viewModelScope.launch. */
+    suspend fun updateManualSession(session: TogetherSession, startedAt: Long, endedAt: Long) {
+        if (!session.isManual || endedAt <= startedAt) return
+        dao.update(session.copy(startedAt = startedAt, endedAt = endedAt, updatedAt = System.currentTimeMillis()))
+    }
+
     /**
      * Feature A: UNION merge (never last-write-wins-replace) of the partner's session rows into local
      * storage. Only CLOSED sessions (endedAt != null) are ever accepted here, even if a stray open one
@@ -90,25 +103,42 @@ class SessionRepository(private val dao: TogetherSessionDao) {
      * (both phones independently logged the same BLE detection) is left in the DB as-is and correctly
      * de-duplicated at read time by StatsCalculator's existing interval-merge - see its doc.
      *
-     * The ONE exception to "never overwritten": if a remote row we already know locally carries a
-     * tombstone (r.deleted) and our local copy isn't already tombstoned, we apply it - this is how a
-     * manual-entry deletion propagates to the partner's phone. The gate is `local.isManual`, never
-     * `r.isManual` - we trust ONLY our own local record of whether a session is manual, never the
-     * remote's claim about it. A BLE-detected session's deleted flag must never be settable by any
-     * incoming payload, even a buggy or malicious one that lies about isManual for a syncId we already
-     * know locally as a real BLE detection; gating on the remote's claim would let exactly that attack
-     * through. There is no other kind of conflict to resolve for a closed session - startedAt/endedAt/
-     * isManual/syncId are all set once at creation and never mutated again (see endSession), so a
-     * tombstone-apply is the only mutation an already-known syncId can ever receive here.
+     * UX-FIX-PLAN.md Phase 3 item 19: a manual session is NOT immutable after creation anymore - two
+     * exceptions to "never overwritten" now exist for an already-known syncId, both gated the exact same
+     * defensive way: `local.isManual`, never `r.isManual` - we trust ONLY our own local record of
+     * whether a session is manual, never the remote's claim about it, so a BLE-detected session's
+     * deleted/startedAt/endedAt can never be altered by any incoming payload, even a buggy or malicious
+     * one that lies about isManual for a syncId we already know locally as a real BLE detection.
+     *  1. TOMBSTONE: if the remote row carries a tombstone (r.deleted) and our local copy isn't already
+     *     tombstoned, we apply it - this is how a manual-entry deletion propagates to the partner's phone.
+     *  2. EDIT (new): if neither side is deleted and the remote row's `startedAt`/`endedAt` genuinely
+     *     differ from ours with a newer `updatedAt`, we adopt the remote's bounds - this is how
+     *     [SessionRepository.updateManualSession] on the OTHER phone propagates here. Plain LWW by
+     *     `updatedAt`, matching every other per-row edit merge in this file (e.g.
+     *     DateIdeaRepository.mergeRemote); no extra bounds re-validation is needed here specifically
+     *     because [r]'s startedAt/endedAt/updatedAt already passed GattSyncManager.deserializeSessions'
+     *     own SessionBoundsValidator/clock-skew checks before ever reaching this function - a syncId's
+     *     row only gets here once it's already known-plausible.
+     * A closed session's `isManual`/`syncId` are still set once at creation and never mutated again (see
+     * [addManualSession]) - deleted and startedAt/endedAt are the only two things an already-known manual
+     * syncId can ever have changed here, and only ever moving the direction the remote's own newer
+     * `updatedAt` justifies.
      */
     suspend fun mergeRemoteSessions(remote: List<TogetherSession>) {
         val localBySyncId = dao.getAll().filter { it.syncId.isNotBlank() }.associateBy { it.syncId }
         remote.filter { it.endedAt != null && it.syncId.isNotBlank() }.forEach { r ->
+            val rEndedAt = r.endedAt!! // guaranteed non-null by the filter above
             val local = localBySyncId[r.syncId]
             if (local == null) {
                 dao.insert(r.copy(id = 0))
-            } else if (local.isManual && r.deleted && !local.deleted) {
-                dao.update(local.copy(deleted = true, updatedAt = maxOf(local.updatedAt, r.updatedAt)))
+            } else if (local.isManual) {
+                if (r.deleted && !local.deleted) {
+                    dao.update(local.copy(deleted = true, updatedAt = maxOf(local.updatedAt, r.updatedAt)))
+                } else if (!r.deleted && !local.deleted && r.updatedAt > local.updatedAt &&
+                    (r.startedAt != local.startedAt || rEndedAt != local.endedAt)
+                ) {
+                    dao.update(local.copy(startedAt = r.startedAt, endedAt = rEndedAt, updatedAt = r.updatedAt))
+                }
             }
         }
     }
@@ -165,6 +195,17 @@ class DateIdeaRepository(private val dao: DateIdeaDao) {
 
     suspend fun setDone(idea: DateIdea, done: Boolean) {
         dao.upsert(idea.copy(done = done, updatedAt = System.currentTimeMillis()))
+    }
+
+    /** UX-FIX-PLAN.md Phase 3 item 19: renames an idea's text - previously an idea could be added/
+     * checked-off/deleted but never renamed. A plain content edit, same whole-row upsert shape as
+     * [setDone]/[softDelete] - DateIdeaRepository.mergeRemote's existing LWW-by-(id, updatedAt) merge
+     * already handles an arbitrary field change correctly (it was built generically, not photo/done-only),
+     * so no merge-layer change is needed for this to sync. No-ops on blank text rather than letting an
+     * idea's label be cleared out from under it. */
+    suspend fun rename(idea: DateIdea, text: String) {
+        if (text.isBlank()) return
+        dao.upsert(idea.copy(text = text.trim(), updatedAt = System.currentTimeMillis()))
     }
 
     suspend fun softDelete(idea: DateIdea) {
@@ -462,6 +503,16 @@ class MomentRepository(private val dao: MomentDao, private val context: Context)
         dao.updatePhotoDownloaded(syncId, true)
     }
 
+    /** UX-FIX-PLAN.md Phase 3 item 17: lets the user manually correct a Moment's "taken apart"/"taken
+     * together" caption after the fact - previously [Moment.takenWhileTogether] was set once at capture/
+     * import time (see its own doc) and never editable again. A targeted single-column write via
+     * [MomentDao.setTakenWhileTogether], bumping updatedAt so the edit propagates to the partner on the
+     * next sync - same "don't build a stale-read full-row copy" reasoning as [markTakenWhileTogether]'s
+     * own doc. */
+    suspend fun setTakenWhileTogether(moment: Moment, together: Boolean) {
+        dao.setTakenWhileTogether(moment.syncId, together, System.currentTimeMillis())
+    }
+
     /** Soft-deletes a Moment - unlike a manual session, ANY moment can be deleted regardless of isRemote,
      * since every moment is content one of the two people created, not an automatically-collected record
      * (see Moment.deleted's doc). Also deletes the local photo FILE if we actually hold one
@@ -690,6 +741,30 @@ class MilestoneRepository(private val dao: MilestoneDao) {
         dao.upsert(milestone.copy(linkedMomentSyncId = linkedMomentSyncId, updatedAt = System.currentTimeMillis()))
     }
 
+    /** UX-FIX-PLAN.md Phase 3 item 19: a full edit (label + month/day/year, alongside the linked photo)
+     * for an already-existing milestone - previously only the photo was editable (see MilestonesScreen's
+     * former EditMilestonePhotoDialog, which this supersedes) and label/date editing was explicitly
+     * unsupported. Same plain whole-row dao.upsert() shape as [setLinkedMoment]/[delete] - see
+     * [setLinkedMoment]'s own doc for why no extra concurrency guard is needed (nothing else mutates a
+     * Milestone row independently in the background the way e.g. TimeCapsule.unlockedAt does). The caller
+     * (MilestonesViewModel.update) is responsible for re-arming this milestone's yearly alarm afterward
+     * via MilestoneAlarmScheduler - this function only owns the DB write, matching how [add]'s own caller
+     * relationship with the alarm scheduler already works one layer up. mergeRemote's existing LWW-by-
+     * (id, updatedAt) merge already handles label/month/day/year changing together in one write, exactly
+     * like any other field change it already supports - no merge-layer change needed for this to sync. */
+    suspend fun update(milestone: Milestone, label: String, month: Int, day: Int, year: Int?, linkedMomentSyncId: String?) {
+        dao.upsert(
+            milestone.copy(
+                label = label,
+                month = month,
+                day = day,
+                year = year,
+                linkedMomentSyncId = linkedMomentSyncId,
+                updatedAt = System.currentTimeMillis()
+            )
+        )
+    }
+
     /** The columns that make a milestone meaningfully different, for [mergeRemote]'s no-op-write guard -
      * deliberately excludes `updatedAt` (the field that drifts) and `createdAt`. `createdAt` is excluded
      * simply because it is immutable: a milestone is created on ONE device and copied to the other
@@ -771,6 +846,15 @@ class ListCategoryRepository(
         )
         dao.upsert(category)
         return category
+    }
+
+    /** UX-FIX-PLAN.md Phase 3 item 19: renames a list - previously a list could be created/deleted but
+     * never renamed. Allowed even for [DEFAULT_LIST_ID] (only its DELETE tombstone is specially blocked -
+     * see [mergeRemote]'s own doc, "Any NON-delete update to it (e.g. a rename) still applies normally").
+     * No-ops on blank text rather than letting a list's name be cleared out from under it. */
+    suspend fun rename(category: ListCategory, name: String) {
+        if (name.isBlank()) return
+        dao.upsert(category.copy(name = name.trim(), updatedAt = System.currentTimeMillis()))
     }
 
     /** Soft-deletes the list itself AND cascades to every currently-active idea it owns - deleting a list

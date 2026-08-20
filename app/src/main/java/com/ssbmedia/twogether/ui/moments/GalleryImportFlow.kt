@@ -14,7 +14,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -32,6 +31,8 @@ import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.stats.StatsCalculator
+import com.ssbmedia.twogether.ui.components.DatePickerField
+import com.ssbmedia.twogether.ui.components.TimePickerField
 import com.ssbmedia.twogether.util.ImageDownscaler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -43,8 +44,6 @@ import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.ZoneId
-import java.time.format.DateTimeFormatter
-import java.time.format.DateTimeParseException
 import java.util.Locale
 
 /**
@@ -275,8 +274,16 @@ private fun extensionFor(resolver: ContentResolver, uri: Uri): String {
     return MimeTypeMap.getSingleton().getExtensionFromMimeType(mime) ?: "jpg"
 }
 
-/** Date-assignment step of the backfill flow - same YYYY-MM-DD text field + validation style as
- * CalendarScreen's AddManualSessionDialog (future dates rejected, invalid text rejected).
+/**
+ * Date-assignment step of the backfill flow.
+ *
+ * UX-FIX-PLAN.md Phase 3 item 18: the date field was a raw YYYY-MM-DD free-text field, and the from/to
+ * companion-entry fields were raw 24-hour H:MM free text - both replaced here with native
+ * [DatePickerField]/[TimePickerField] (a picker can't produce a typo/unparseable value the way free text
+ * could), matching the same shape CalendarScreen's AddManualSessionDialog now uses. Existing validation
+ * (future dates rejected, a same-day "To" time later than right-now rejected) is kept as a backstop per
+ * the plan's own instruction, even though the pickers themselves can no longer produce most of what it
+ * used to catch.
  *
  * Also offers an OPT-IN "we were together" companion entry (owner-requested addition): checking it
  * reveals a from/to time-of-day range (both implicitly on the photo's own date - a photo is tied to one
@@ -296,23 +303,13 @@ private fun BackfillPhotoDateDialog(
 ) {
     val zone = remember { ZoneId.systemDefault() }
     val today = remember { LocalDate.now(zone) }
-    var dateText by remember(suggestedDate) {
-        mutableStateOf((suggestedDate ?: today).format(DateTimeFormatter.ISO_LOCAL_DATE))
-    }
+    var date by remember(suggestedDate) { mutableStateOf(suggestedDate ?: today) }
     var wasTogether by remember { mutableStateOf(false) }
-    var fromText by remember { mutableStateOf("") }
-    var toText by remember { mutableStateOf("") }
-
-    val parsedDate = remember(dateText) {
-        try { LocalDate.parse(dateText, DateTimeFormatter.ISO_LOCAL_DATE) } catch (e: DateTimeParseException) { null }
-    }
-    val timeFormatter = remember { DateTimeFormatter.ofPattern("H:mm") }
-    val parsedFrom = remember(fromText) { runCatching { LocalTime.parse(fromText, timeFormatter) }.getOrNull() }
-    val parsedTo = remember(toText) { runCatching { LocalTime.parse(toText, timeFormatter) }.getOrNull() }
+    var fromTime by remember { mutableStateOf(LocalTime.of(9, 0)) }
+    var toTime by remember { mutableStateOf(LocalTime.of(10, 0)) }
 
     val dateError: String? = when {
-        parsedDate == null -> "Enter a valid date as YYYY-MM-DD"
-        parsedDate.isAfter(today) -> "Date can't be in the future"
+        date.isAfter(today) -> "Date can't be in the future"
         else -> null
     }
     // BUG fix: for a same-day (today) entry, a "To" time later than the actual current wall-clock time
@@ -322,16 +319,15 @@ private fun BackfillPhotoDateDialog(
     // clamp either (that only clamps sessions with no endedAt - this one has a real, just-wrong, endedAt),
     // so it silently inflated all-time hours/longest-session until that moment in the future actually
     // arrived.
-    val nowTimeToday = remember(parsedDate, today) {
-        if (parsedDate == today) LocalTime.now(zone) else null
+    val nowTimeToday = remember(date, today) {
+        if (date == today) LocalTime.now(zone) else null
     }
 
     // Only evaluated/shown when wasTogether is checked - a blank/invalid time range must never block
     // saving the photo itself, since the together-time part is optional.
     val togetherError: String? = if (!wasTogether) null else when {
-        parsedFrom == null || parsedTo == null -> "Enter both times as H:MM (24-hour)"
-        !parsedTo.isAfter(parsedFrom) -> "\"To\" must be after \"From\""
-        nowTimeToday != null && parsedTo.isAfter(nowTimeToday) -> "\"To\" can't be later than the current time"
+        !toTime.isAfter(fromTime) -> "\"To\" must be after \"From\""
+        nowTimeToday != null && toTime.isAfter(nowTimeToday) -> "\"To\" can't be later than the current time"
         else -> null
     }
     val error = dateError ?: togetherError
@@ -350,10 +346,11 @@ private fun BackfillPhotoDateDialog(
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(bottom = 12.dp)
                 )
-                OutlinedTextField(
-                    value = dateText,
-                    onValueChange = { dateText = it.trim() },
-                    label = { Text("Date (YYYY-MM-DD)") },
+                DatePickerField(
+                    label = "Date",
+                    date = date,
+                    onDateChange = { date = it },
+                    maxDate = today,
                     enabled = !isSaving,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -381,17 +378,17 @@ private fun BackfillPhotoDateDialog(
                         modifier = Modifier.padding(top = 4.dp, bottom = 8.dp)
                     )
                     Row(modifier = Modifier.fillMaxWidth()) {
-                        OutlinedTextField(
-                            value = fromText,
-                            onValueChange = { fromText = it.trim() },
-                            label = { Text("From (H:MM)") },
+                        TimePickerField(
+                            label = "From",
+                            time = fromTime,
+                            onTimeChange = { fromTime = it },
                             enabled = !isSaving,
                             modifier = Modifier.weight(1f)
                         )
-                        OutlinedTextField(
-                            value = toText,
-                            onValueChange = { toText = it.trim() },
-                            label = { Text("To (H:MM)") },
+                        TimePickerField(
+                            label = "To",
+                            time = toTime,
+                            onTimeChange = { toTime = it },
                             enabled = !isSaving,
                             modifier = Modifier.weight(1f).padding(start = 8.dp)
                         )
@@ -419,10 +416,9 @@ private fun BackfillPhotoDateDialog(
             TextButton(
                 enabled = error == null && !isSaving,
                 onClick = {
-                    val date = parsedDate ?: return@TextButton
-                    val togetherRange = if (wasTogether && parsedFrom != null && parsedTo != null) {
-                        val startedAt = date.atTime(parsedFrom).atZone(zone).toInstant().toEpochMilli()
-                        val endedAt = date.atTime(parsedTo).atZone(zone).toInstant().toEpochMilli()
+                    val togetherRange = if (wasTogether) {
+                        val startedAt = date.atTime(fromTime).atZone(zone).toInstant().toEpochMilli()
+                        val endedAt = date.atTime(toTime).atZone(zone).toInstant().toEpochMilli()
                         startedAt to endedAt
                     } else null
                     onConfirm(date, togetherRange)
