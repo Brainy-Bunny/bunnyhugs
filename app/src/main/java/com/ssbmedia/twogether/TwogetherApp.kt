@@ -16,6 +16,10 @@ class TwogetherApp : Application() {
         super.onCreate()
         ServiceLocator.init(this)
         Notifications.ensureChannels(this)
+        // Item 8 fix: wires up AppLockManager's ACTION_SCREEN_OFF receiver (needs a real Context - see
+        // its own doc) before registering it as a ProcessLifecycleOwner observer, so the receiver is live
+        // before the very first ON_STOP could ever fire.
+        AppLockManager.init(this)
         ProcessLifecycleOwner.get().lifecycle.addObserver(AppLockManager)
         // Registered on every app start (not just first pairing) since there's Room/settings data worth
         // backing up even before a couple pairs - enqueueUniquePeriodicWork + KEEP below makes this a
