@@ -567,21 +567,22 @@ class ProximityForegroundService : LifecycleService() {
         lastSeenTieBreak = tieBreak
         lifecycleScope.launch {
             try {
-                // MINOR fix (ultimate-app-review round 1): both partners derive their advertised secret
-                // prefix from the same shared pairing code, so nothing app-level otherwise distinguishes
-                // "this is my partner's phone" from "this is my own advertisement echoing back to my own
-                // scanner." Real Android hardware never delivers a device's own BLE adverts back to its
-                // own scanner - this is theoretically impossible on real separate hardware - but the guard
-                // is free, and it's exactly what let one Round 1 reviewer's paired-emulator sandbox count
-                // 4+ minutes of "together" time with its partner's Bluetooth radio verified off. A sighting
-                // whose reported tie-break byte matches THIS device's own tie-break byte (see
-                // isSelfEchoBeacon below) is never treated as "partner seen" - skip it entirely, before it
-                // can advance the state machine or arm GATT sync.
-                val ownTieBreak = ServiceLocator.settingsStore.getOrCreateTieBreakByte().toByte()
-                if (isSelfEchoBeacon(tieBreak, ownTieBreak)) {
-                    Log.w(TAG, "Ignoring self-echo beacon sighting (sighted tieBreak matches this device's own)")
-                    return@launch
-                }
+                // REVERTED (ultimate-app-review round 2, Opus): the round 1 self-echo guard this used to
+                // be (isSelfEchoBeacon, dropped a sighting whose tie-break byte matched this device's own)
+                // is gone. Live testing proved it was actively harmful: since the existing tie-break-
+                // collision re-roll (startGattSyncIfNeeded, further down this file) only runs once
+                // stateMachine.isTogether is true, a guard that unconditionally drops every matching
+                // sighting BEFORE onBeaconSeen() made a genuine collision (~1/256 by random draw, and
+                // GUARANTEED after restoring a backup made on the partner's own phone, since
+                // BackupManager restores both deviceTieBreakByte and localDeviceId verbatim) permanently
+                // undetectable - two real paired phones would simply never see each other again. Worse,
+                // live-reproducing the exact scenario this guard was built for (partner's Bluetooth fully
+                // disabled) showed the "4+ minutes together with partner's radio off" symptom happening
+                // regardless of the guard, with the phantom sightings carrying the PARTNER's tie-break
+                // byte, not this device's own - so the self-echo diagnosis was wrong to begin with; this
+                // looks like an emulator BLE stack re-delivering a cached advert to an already-registered
+                // scan callback, not a real self-echo, and is very unlikely to occur on real hardware
+                // (which never delivers a device's own adverts back to its own scanner).
                 val now = System.currentTimeMillis()
                 val becameTogether = stateMachine.onBeaconSeen(now)
                 val shouldArmGattSync = becameTogether || (stateMachine.isTogether && !gattReadyForSession)
@@ -1162,16 +1163,6 @@ class ProximityForegroundService : LifecycleService() {
          * pendingApartSince > 0. */
         private fun withinGraceWindow(pendingApartSince: Long, now: Long, graceMillis: Long): Boolean =
             pendingApartSince > 0L && now - pendingApartSince < graceMillis
-
-        /** MINOR fix (ultimate-app-review round 1): pure decision helper - unit-tested directly via
-         * reflection (see SelfEchoGuardAuditTest), mirroring [withinGraceWindow]/[graceWindowExpired]'s
-         * established pattern. True iff [sightedTieBreak] (the tie-break byte parsed off a BLE sighting by
-         * ScannerManager) equals [ownTieBreak] (this install's own SettingsStore.getOrCreateTieBreakByte
-         * value) - i.e. the sighting is this device's own advertisement echoing back, not the partner's
-         * phone. See onPartnerSeen's own comment for why this can't happen on real separate hardware but
-         * is guarded against anyway. */
-        private fun isSelfEchoBeacon(sightedTieBreak: Byte, ownTieBreak: Byte): Boolean =
-            sightedTieBreak == ownTieBreak
 
         /** Pure decision helper (private, unit-tested via reflection) - true iff the grace window of
          * [graceMillis] opened at [pendingApartSince] has now elapsed and a still-open session should

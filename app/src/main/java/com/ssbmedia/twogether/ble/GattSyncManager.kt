@@ -336,6 +336,14 @@ class GattSyncManager(
             dateIdeasParsed = deserializeDateIdeas(dateIdeasArr, peerClockOffsetMillis)
             listCategoryRepository.mergeRemoteWithIdeas(listCategoriesParsed, dateIdeasParsed)
         } catch (e: Exception) {
+            // MINOR fix (ultimate-app-review round 2, Opus): a MERGE-stage throw here used to leave
+            // *Parsed holding the fully-parsed list from the successful deserialize step just above,
+            // even though nothing was actually written to the DB - the tally below (`arr.length() -
+            // parsed.size`) then computed 0 dropped for this whole entity type and the UI reported an
+            // unqualified "Synced!" over real, silent data loss. Reset to empty here so a merge failure
+            // is tallied exactly like a parse failure: the whole array counts as dropped.
+            listCategoriesParsed = emptyList()
+            dateIdeasParsed = emptyList()
             Log.w(TAG, "Sync: listCategories/dateIdeas block failed, skipping just this entity type", e)
         }
         val sessionsArr = root.optJSONArray("sessions")
@@ -351,6 +359,10 @@ class GattSyncManager(
                 sessionRepository.adoptEarlierOpenSessionStart(root.optLong("openSessionStartedAt", 0L) - peerClockOffsetMillis)
             }
         } catch (e: Exception) {
+            // MINOR fix (ultimate-app-review round 2, Opus): see the listCategories/dateIdeas catch
+            // block's matching comment - a merge-stage throw must count the whole array as dropped, not
+            // silently keep the already-parsed (but never actually persisted) list.
+            sessionsParsed = emptyList()
             Log.w(TAG, "Sync: sessions block failed, skipping just this entity type", e)
         }
         val momentsArr = root.optJSONArray("moments")
@@ -359,6 +371,9 @@ class GattSyncManager(
             momentsParsed = deserializeMoments(momentsArr, peerClockOffsetMillis)
             momentRepository.mergeRemoteStubs(momentsParsed)
         } catch (e: Exception) {
+            // MINOR fix (ultimate-app-review round 2, Opus): see the listCategories/dateIdeas catch
+            // block's matching comment.
+            momentsParsed = emptyList()
             Log.w(TAG, "Sync: moments block failed, skipping just this entity type", e)
         }
         val notesArr = root.optJSONArray("notes")
@@ -367,6 +382,9 @@ class GattSyncManager(
             notesParsed = deserializeNotes(notesArr, peerClockOffsetMillis)
             momentNoteRepository.mergeRemote(notesParsed, deviceId)
         } catch (e: Exception) {
+            // MINOR fix (ultimate-app-review round 2, Opus): see the listCategories/dateIdeas catch
+            // block's matching comment.
+            notesParsed = emptyList()
             Log.w(TAG, "Sync: notes block failed, skipping just this entity type", e)
         }
         // UX-FIX-PLAN.md Phase 4 item 25: see DayNoteRepository.mergeRemote's doc for the identical
@@ -377,6 +395,9 @@ class GattSyncManager(
             dayNotesParsed = deserializeDayNotes(dayNotesArr, peerClockOffsetMillis)
             dayNoteRepository.mergeRemote(dayNotesParsed, deviceId)
         } catch (e: Exception) {
+            // MINOR fix (ultimate-app-review round 2, Opus): see the listCategories/dateIdeas catch
+            // block's matching comment.
+            dayNotesParsed = emptyList()
             Log.w(TAG, "Sync: dayNotes block failed, skipping just this entity type", e)
         }
         // BUG fix: an independent audit round found milestones arriving via sync never got their yearly
@@ -392,6 +413,9 @@ class GattSyncManager(
             val upsertedMilestones = milestoneRepository.mergeRemote(milestonesParsed, milestonesMissingLinkedMomentField)
             MilestoneAlarmScheduler.scheduleAll(context, upsertedMilestones.filter { !it.deleted })
         } catch (e: Exception) {
+            // MINOR fix (ultimate-app-review round 2, Opus): see the listCategories/dateIdeas catch
+            // block's matching comment.
+            milestonesParsed = emptyList()
             Log.w(TAG, "Sync: milestones block failed, skipping just this entity type", e)
         }
         // Feature: Time Capsule sync. See TimeCapsuleRepository.mergeRemote's doc for why unlockedAt is
@@ -402,6 +426,9 @@ class GattSyncManager(
             timeCapsulesParsed = deserializeTimeCapsules(timeCapsulesArr, peerClockOffsetMillis)
             timeCapsuleRepository.mergeRemote(timeCapsulesParsed)
         } catch (e: Exception) {
+            // MINOR fix (ultimate-app-review round 2, Opus): see the listCategories/dateIdeas catch
+            // block's matching comment.
+            timeCapsulesParsed = emptyList()
             Log.w(TAG, "Sync: timeCapsules block failed, skipping just this entity type", e)
         }
         // Couple-level settings sync: plain per-field last-write-wins, same shape as every other
