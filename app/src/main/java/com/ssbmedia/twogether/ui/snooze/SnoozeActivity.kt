@@ -12,10 +12,10 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -92,9 +92,15 @@ private fun SnoozeCard(defaultMinutes: Int, onPick: (Int) -> Unit, onCancel: () 
                 style = MaterialTheme.typography.bodyMedium,
                 modifier = Modifier.padding(top = 4.dp, bottom = 16.dp)
             )
+            // Item 6 (deferred UX fix, 4-model advisory audit): this used to be a FilterChip highlighted
+            // via `selected = minutes == defaultMinutes` - but every chip here applies immediately on tap
+            // and finishes the activity (see onPick above and applySnooze), so that highlight read as a
+            // misleading "pre-selection" describing a selection step that never actually happens - tapping
+            // ANY chip, highlighted or not, has the identical one-tap effect. AssistChip carries no
+            // selected/checked semantics at all, matching the real "tap one, done" interaction honestly.
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 presets.forEach { minutes ->
-                    FilterChip(selected = minutes == defaultMinutes, onClick = { onPick(minutes) }, label = { Text("${minutes}m") })
+                    AssistChip(onClick = { onPick(minutes) }, label = { Text("${minutes}m") })
                 }
             }
             Row(

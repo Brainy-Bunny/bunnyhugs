@@ -4,6 +4,8 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -44,6 +46,8 @@ fun ReunionOverlay(onDismiss: () -> Unit) {
                 particle.animateTo(1f, tween(900, easing = LinearOutSlowInEasing))
             }
         }
+        // Item 3 (deferred UX fix, 4-model advisory audit): fixed fallback for anyone who doesn't tap -
+        // see the .clickable below for the real dismiss path most people will actually use.
         delay(2600)
         onDismiss()
     }
@@ -51,7 +55,17 @@ fun ReunionOverlay(onDismiss: () -> Unit) {
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.55f)),
+            .background(Color.Black.copy(alpha = 0.55f))
+            // Item 3: tapping anywhere dismisses immediately instead of forcing the full ~2.6s animation
+            // to play out - the delay(2600)/onDismiss() above stays as a fallback for anyone who doesn't
+            // tap. indication = null: a ripple radiating from the tap point would be a distracting visual
+            // clash against this celebration's own heart-burst animation, not a genuine affordance anyone
+            // needs on a full-screen "tap to skip" gesture.
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onDismiss
+            ),
         contentAlignment = Alignment.Center
     ) {
         particles.forEachIndexed { index, particle ->

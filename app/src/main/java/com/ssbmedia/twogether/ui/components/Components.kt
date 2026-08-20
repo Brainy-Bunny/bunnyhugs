@@ -41,6 +41,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import com.ssbmedia.twogether.util.DateFormats
@@ -94,7 +95,19 @@ fun StatCard(
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(text = emoji, style = MaterialTheme.typography.headlineMedium)
                 androidx.compose.foundation.layout.Spacer(modifier = Modifier.padding(top = 4.dp))
-                Text(text = value, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                // Item 7 (deferred UX fix, 4-model advisory audit): this value slot sits inside a
+                // third-width card and some call sites can produce a genuinely long string (e.g. "Down 12
+                // days" vs "Same" - see StatsScreen's "This month vs last" tile) - maxLines/ellipsis is a
+                // defensive fix applied here, once, for every StatCard rather than special-cased on one
+                // call site, so any future long value string is protected the same way without anyone
+                // having to remember to add it again.
+                Text(
+                    text = value,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
                 Text(text = label, style = MaterialTheme.typography.bodySmall)
             }
             if (onClick != null) {

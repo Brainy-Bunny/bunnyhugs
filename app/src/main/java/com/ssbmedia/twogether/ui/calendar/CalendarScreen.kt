@@ -49,6 +49,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -256,7 +257,6 @@ fun CalendarScreen(
 
             Row(
                 modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 IconButton(onClick = { yearMonth = yearMonth.minusMonths(1) }) {
@@ -265,8 +265,17 @@ fun CalendarScreen(
                 Text(
                     text = yearMonth.month.getDisplayName(TextStyle.FULL, Locale.getDefault()) + " " + yearMonth.year,
                     style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold
+                    fontWeight = FontWeight.SemiBold,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.weight(1f)
                 )
+                // Item 4 (deferred UX fix, 4-model advisory audit): one-tap way back to the current month
+                // once you've paged away from it - only shown when actually needed (see
+                // shouldShowBackToTodayButton's own doc), so it doesn't clutter the header on the common
+                // case of just viewing the current month.
+                if (shouldShowBackToTodayButton(yearMonth, YearMonth.now(zone))) {
+                    TextButton(onClick = { yearMonth = YearMonth.now(zone) }) { Text("Today") }
+                }
                 IconButton(onClick = { yearMonth = yearMonth.plusMonths(1) }) {
                     Icon(Icons.Filled.ChevronRight, contentDescription = "Next month")
                 }
@@ -568,6 +577,14 @@ internal fun photoMarkerState(hasPhoto: Boolean, hasTogetherTime: Boolean): Phot
     hasTogetherTime -> PhotoMarkerState.PROMPT_NO_PHOTO
     else -> PhotoMarkerState.NONE
 }
+
+/** Item 4 (deferred UX fix, 4-model advisory audit): whether the month header's "Today" jump-back button
+ * should be shown - only when the month currently being viewed differs from the real current month, so
+ * paging forward/backward and then wanting to snap straight back doesn't require re-tapping the chevron
+ * one month at a time. Extracted as a plain pure function (same reasoning as [photoMarkerState] above) so
+ * it's unit-testable without any Compose UI test infra - see CalendarScreenTest. */
+internal fun shouldShowBackToTodayButton(viewedMonth: YearMonth, actualCurrentMonth: YearMonth): Boolean =
+    viewedMonth != actualCurrentMonth
 
 /**
  * UX-FIX-PLAN.md Phase 4 item 25: "Your note" (editable, saved locally - not yet synced out to the
