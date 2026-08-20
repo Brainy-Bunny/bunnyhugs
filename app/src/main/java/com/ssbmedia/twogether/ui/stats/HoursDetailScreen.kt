@@ -42,6 +42,7 @@ import com.ssbmedia.twogether.ui.components.EmptyState
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
 import com.ssbmedia.twogether.util.DateFormats
 import kotlinx.coroutines.flow.SharingStarted
+import java.util.Locale
 import kotlinx.coroutines.flow.stateIn
 import java.time.LocalDate
 import java.time.ZoneId
@@ -201,7 +202,10 @@ private fun DailyHoursBarChart(data: List<Pair<LocalDate, Double>>, modifier: Mo
 
     Column(modifier = modifier.fillMaxWidth()) {
         Text(
-            "${"%.1f".format(maxVal)}h",
+            // MINOR fix (ultimate-app-review round 1, item 5): pinned to Locale.US - see GapsDetailScreen's
+            // matching fix for why an unpinned "%.1f".format(...) contradicts DateFormats' own stated
+            // intent of deterministic, locale-independent display text.
+            "${"%.1f".format(Locale.US, maxVal)}h",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -229,7 +233,7 @@ private fun DailyHoursBarChart(data: List<Pair<LocalDate, Double>>, modifier: Mo
                 // same value that placed the bar itself, so alignment can't drift between them.
                 val dayLayout = textMeasurer.measure(date.dayOfMonth.toString(), dayLabelStyle)
                 drawText(dayLayout, topLeft = Offset(centerX - dayLayout.size.width / 2f, barAreaHeight + 2.dp.toPx()))
-                val valueText = if (hours > 0) "%.1fh".format(hours) else "–"
+                val valueText = if (hours > 0) "%.1fh".format(Locale.US, hours) else "–"
                 val valueLayout = textMeasurer.measure(valueText, valueLabelStyle)
                 drawText(
                     valueLayout,

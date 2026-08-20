@@ -101,7 +101,12 @@ fun StatsScreen(
                     StatCard(
                         emoji = "💛",
                         label = "Hours together",
-                        value = "${"%.1f".format(stats.totalHoursAllTime)}h",
+                        // MINOR fix (ultimate-app-review round 1, item 5): pinned to Locale.US throughout
+                        // this screen - see DateFormats' own doc for why display text in this app is
+                        // deliberately locale-independent; an unpinned "%.1f".format(...) would otherwise
+                        // use the JVM default locale's decimal separator (e.g. "1,5" on a comma-decimal
+                        // device locale).
+                        value = "${"%.1f".format(Locale.US, stats.totalHoursAllTime)}h",
                         modifier = Modifier.weight(1f),
                         containerColor = MaterialTheme.colorScheme.primaryContainer,
                         onClick = onOpenHoursDetail
@@ -119,9 +124,9 @@ fun StatsScreen(
             item {
                 SectionHeader("Hours together")
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
-                    StatCard(emoji = "💛", label = "All-time", value = "${"%.1f".format(stats.totalHoursAllTime)}h", modifier = Modifier.weight(1f))
-                    StatCard(emoji = "📆", label = "This week", value = "${"%.1f".format(stats.totalHoursThisWeek)}h", modifier = Modifier.weight(1f))
-                    StatCard(emoji = "🗓️", label = "This month", value = "${"%.1f".format(stats.totalHoursThisMonth)}h", modifier = Modifier.weight(1f))
+                    StatCard(emoji = "💛", label = "All-time", value = "${"%.1f".format(Locale.US, stats.totalHoursAllTime)}h", modifier = Modifier.weight(1f))
+                    StatCard(emoji = "📆", label = "This week", value = "${"%.1f".format(Locale.US, stats.totalHoursThisWeek)}h", modifier = Modifier.weight(1f))
+                    StatCard(emoji = "🗓️", label = "This month", value = "${"%.1f".format(Locale.US, stats.totalHoursThisMonth)}h", modifier = Modifier.weight(1f))
                 }
             }
             item {
@@ -209,7 +214,7 @@ fun StatsScreen(
                     StatCard(
                         emoji = "⏰",
                         label = "Most hours month",
-                        value = stats.mostHoursMonth?.let { "${monthLabel(it.yearMonth)} (${"%.1f".format(it.value)}h)" } ?: "—",
+                        value = stats.mostHoursMonth?.let { "${monthLabel(it.yearMonth)} (${"%.1f".format(Locale.US, it.value)}h)" } ?: "—",
                         modifier = Modifier.weight(1f),
                         onClick = { onOpenMonthlyDetail("hours") }
                     )
@@ -218,7 +223,7 @@ fun StatsScreen(
                     StatCard(
                         emoji = "🌞",
                         label = "Longest single day",
-                        value = stats.longestSingleDay?.let { "${"%.1f".format(it.hours)}h" } ?: "—",
+                        value = stats.longestSingleDay?.let { "${"%.1f".format(Locale.US, it.hours)}h" } ?: "—",
                         modifier = Modifier.weight(1f),
                         onClick = stats.longestSingleDay?.let { day ->
                             { onOpenCalendarWithArgs(day.date.toEpochDay(), null, null) }
@@ -227,7 +232,7 @@ fun StatsScreen(
                     StatCard(
                         emoji = "🔁",
                         label = "Avg. days between meetups",
-                        value = stats.avgDaysBetweenMeetups?.let { "%.1f".format(it) } ?: "—",
+                        value = stats.avgDaysBetweenMeetups?.let { "%.1f".format(Locale.US, it) } ?: "—",
                         modifier = Modifier.weight(1f),
                         onClick = onOpenGapsDetail
                     )
@@ -250,7 +255,7 @@ fun StatsScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "Longest apart: ${"%.1f".format(gap.days)} days (${DateFormats.formatDate(start)} – ${DateFormats.formatDate(end)}).",
+                            text = "Longest apart: ${"%.1f".format(Locale.US, gap.days)} days (${DateFormats.formatDate(start)} – ${DateFormats.formatDate(end)}).",
                             style = MaterialTheme.typography.bodySmall,
                             modifier = Modifier.weight(1f)
                         )

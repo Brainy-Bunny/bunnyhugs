@@ -263,7 +263,15 @@ fun CalendarScreen(
                     Icon(Icons.Filled.ChevronLeft, contentDescription = "Previous month")
                 }
                 Text(
-                    text = yearMonth.month.getDisplayName(TextStyle.FULL, Locale.getDefault()) + " " + yearMonth.year,
+                    // MINOR fix (ultimate-app-review round 1, item 5): pinned to Locale.US, not
+                    // Locale.getDefault() - this screen's OWN weekday header row just below (hardcoded
+                    // "S"/"M"/"T"/"W"/"T"/"F"/"S") and the day-detail dialog's title (DateFormats.
+                    // formatDateWithWeekday, deliberately Locale.US-pinned - see DateFormats' own doc) were
+                    // both already fixed-English; this device-locale month name was the one piece of this
+                    // screen that could disagree with them (e.g. showing a Spanish month name next to
+                    // English weekday letters). Standardized on Locale.US throughout CalendarScreen to match
+                    // the two pieces that couldn't easily change, rather than the reverse.
+                    text = yearMonth.month.getDisplayName(TextStyle.FULL, Locale.US) + " " + yearMonth.year,
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
                     textAlign = TextAlign.Center,

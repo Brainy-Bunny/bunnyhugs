@@ -42,6 +42,7 @@ import com.ssbmedia.twogether.ui.components.EmptyState
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
 import com.ssbmedia.twogether.util.DateFormats
 import kotlinx.coroutines.flow.SharingStarted
+import java.util.Locale
 import kotlinx.coroutines.flow.stateIn
 import java.time.Instant
 import java.time.ZoneId
@@ -104,7 +105,12 @@ fun GapsDetailScreen(onBack: () -> Unit) {
                         Column(Modifier.padding(16.dp)) {
                             Text("Average time apart", style = MaterialTheme.typography.bodySmall)
                             Text(
-                                avgDays?.let { "%.1f days".format(it) } ?: "—",
+                                // MINOR fix (ultimate-app-review round 1, item 5): "%.1f".format(...) with
+                                // no explicit Locale uses the JVM default locale's decimal separator (e.g.
+                                // "1,5" on a device set to a comma-decimal locale) - contradicting
+                                // DateFormats' own stated intent of deterministic, locale-independent
+                                // display text. Locale.US pins the decimal point regardless of device locale.
+                                avgDays?.let { "%.1f days".format(Locale.US, it) } ?: "—",
                                 style = MaterialTheme.typography.titleLarge,
                                 fontWeight = FontWeight.Bold
                             )
@@ -154,7 +160,7 @@ private fun GapRow(gap: GapInfo, zone: ZoneId, isLongest: Boolean) {
                 )
             }
             Text(
-                "${"%.1f".format(gap.days)}d",
+                "${"%.1f".format(Locale.US, gap.days)}d",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold
             )

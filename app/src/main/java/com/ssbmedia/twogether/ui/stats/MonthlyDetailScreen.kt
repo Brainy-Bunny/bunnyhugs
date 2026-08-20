@@ -200,7 +200,11 @@ private fun MonthlyBarChart(data: List<MonthlyBreakdown>, metric: MonthlyMetric,
 
     Column(modifier = modifier.fillMaxWidth()) {
         Text(
-            if (metric == MonthlyMetric.DAYS) "${maxVal.toInt()}d" else "${"%.1f".format(maxVal)}h",
+            // MINOR fix (ultimate-app-review round 1, item 5): pinned to Locale.US - see GapsDetailScreen's
+            // matching fix. Deliberately NOT touching the month-NAME display below (Locale.getDefault() at
+            // getDisplayName) - that's locale-appropriate, intentional display of a proper name, a
+            // different and narrower issue than this numeric decimal-separator formatting.
+            if (metric == MonthlyMetric.DAYS) "${maxVal.toInt()}d" else "${"%.1f".format(Locale.US, maxVal)}h",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -227,7 +231,7 @@ private fun MonthlyBarChart(data: List<MonthlyBreakdown>, metric: MonthlyMetric,
                     monthLabelStyle
                 )
                 drawText(monthLayout, topLeft = Offset(centerX - monthLayout.size.width / 2f, barAreaHeight + 2.dp.toPx()))
-                val valueText = if (metric == MonthlyMetric.DAYS) "${value.toInt()}$unit" else "${"%.1f".format(value)}$unit"
+                val valueText = if (metric == MonthlyMetric.DAYS) "${value.toInt()}$unit" else "${"%.1f".format(Locale.US, value)}$unit"
                 val valueLayout = textMeasurer.measure(valueText, valueLabelStyle)
                 drawText(
                     valueLayout,
