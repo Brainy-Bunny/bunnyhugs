@@ -105,11 +105,17 @@ private val FIXED_WEEK_ANCHOR: LocalDate = LocalDate.of(2000, 1, 3)
 
 object StatsCalculator {
 
-    /** The apart-gap threshold a reunion must clear (on top of the same-calendar-day requirement - see
-     * [isSameCalendarDay]/[countReunions]). Public (not the old file-private constant) so
-     * ProximityForegroundService's live celebration check can read the SAME value instead of keeping its
-     * own independent copy in sync by hand on every future threshold change - the two already had to be
-     * edited together once (30min -> 1hr) with no compiler help catching a mismatch if one were missed. */
+    /** The apart-gap threshold a reunion must clear - see [countReunions]. Public (not the old
+     * file-private constant) so ProximityForegroundService's live celebration check can read the SAME
+     * value instead of keeping its own independent copy in sync by hand on every future threshold
+     * change - the two already had to be edited together once (30min -> 1hr) with no compiler help
+     * catching a mismatch if one were missed.
+     *
+     * Item 10 (UX-FIX-PLAN.md): this used to ALSO require the apart-start and the reunion itself to fall
+     * on the same calendar day (see the now-removed isSameCalendarDay check in [countReunions]), which
+     * meant a couple apart overnight (goodnight -> next morning) or across several days never counted as
+     * a reunion at all, however long the real gap was - clearly wrong. The gap threshold alone is now the
+     * only requirement. */
     const val REUNION_GAP_MILLIS = 60 * 60 * 1000L
 
     /**
@@ -228,7 +234,7 @@ object StatsCalculator {
 
         val longestSessionMinutes = merged.maxOf { it.end - it.start } / 60_000L
 
-        val reunionCount = countReunions(merged, zone)
+        val reunionCount = countReunions(merged)
 
         val favoriteDayOfWeek = minutesPerDay.entries
             .groupBy { it.key.dayOfWeek }
@@ -541,28 +547,24 @@ object StatsCalculator {
         return current to longest
     }
 
-    /** A reunion is an apart-gap of at least [REUNION_GAP_MILLIS] where the apart-start (previous
-     * session's end) and the reunion itself (next session's start) fall on the SAME calendar day -
-     * e.g. apart for a 2-hour lunch break, back together that afternoon. An overnight gap (goodnight ->
-     * next morning), even though it's well over the threshold, spans two different calendar dates and
-     * deliberately does NOT count - see [isSameCalendarDay]. Meeting multiple times in one day (morning
-     * + afternoon + evening, each separated by a real gap) counts a reunion for each such gap. */
-    private fun countReunions(mergedSorted: List<Interval>, zone: ZoneId): Int {
+    /** A reunion is an apart-gap of at least [REUNION_GAP_MILLIS] between the apart-start (previous
+     * session's end) and the reunion itself (next session's start) - e.g. apart for a 2-hour lunch
+     * break, back together that afternoon. Meeting multiple times in one day (morning + afternoon +
+     * evening, each separated by a real gap) counts a reunion for each such gap.
+     *
+     * Item 10 (UX-FIX-PLAN.md) fix: this used to ALSO require the gap to fall within a single calendar
+     * day, which meant an overnight gap (goodnight -> next morning) or a multi-day apart stretch never
+     * counted as a reunion no matter how long the real gap was - clearly wrong, since the whole point of
+     * the gap threshold is to detect a genuine apart-then-back-together event. The same-day check (and
+     * the [zone] it needed) is removed entirely; only the gap threshold remains. */
+    private fun countReunions(mergedSorted: List<Interval>): Int {
         var count = 0
         for (i in 1 until mergedSorted.size) {
             val gap = mergedSorted[i].start - mergedSorted[i - 1].end
-            if (gap >= REUNION_GAP_MILLIS && isSameCalendarDay(mergedSorted[i - 1].end, mergedSorted[i].start, zone)) count++
+            if (gap >= REUNION_GAP_MILLIS) count++
         }
         return count
     }
-
-    /** Whether two instants fall on the same local calendar date in [zone]. Shared with
-     * ProximityForegroundService's live reunion-celebration check so the historical stat
-     * ([TogetherStats.reunionCount]) and the real-time vibration/overlay can never disagree about what
-     * counts as a reunion. */
-    fun isSameCalendarDay(a: Long, b: Long, zone: ZoneId = ZoneId.systemDefault()): Boolean =
-        LocalDateTime.ofInstant(Instant.ofEpochMilli(a), zone).toLocalDate() ==
-            LocalDateTime.ofInstant(Instant.ofEpochMilli(b), zone).toLocalDate()
 
     /** Turns a sorted list of distinct together-days (the same qualifying-day concept used for
      * [totalDaysTogether]/streaks - see [buildDailyMinuteMap]) into the gap list between each
