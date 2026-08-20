@@ -9,11 +9,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.layout.Box
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -33,7 +31,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -48,10 +45,13 @@ import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.EmptyState
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import com.ssbmedia.twogether.util.DateFormats
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import java.time.Instant
+import java.time.ZoneId
 
 class CapsulesViewModel : ViewModel() {
     val capsules = ServiceLocator.timeCapsuleRepository.observeAll()
@@ -107,15 +107,11 @@ class CapsulesViewModel : ViewModel() {
         }
     }
 
-    fun delete(capsule: TimeCapsule) {
-        viewModelScope.launch {
-            ServiceLocator.timeCapsuleRepository.delete(capsule)
-            // Same reasoning as add() above - don't make a capsule deletion wait for the next reconnect.
-            if (ServiceLocator.proximityStateStore.current().isTogether) {
-                AppEvents.requestManualSync()
-            }
-        }
-    }
+    // UX-FIX-PLAN.md Phase 2 item 11 (user's literal ask: "time capsule should not be delete-able" -
+    // full stop, no exception): deliberately no delete() here. TimeCapsuleRepository.delete() and its
+    // tombstone-apply merge branch are kept in the data layer so a partner still on an older app
+    // version that can still send a delete doesn't desync from this one - there is just no UI path in
+    // this app that can trigger one anymore.
 }
 
 @Composable
@@ -134,7 +130,6 @@ fun CapsulesScreen(onBack: () -> Unit) {
         StatsCalculator.manualHoursCredit(sessions, lastSeenAt = proximityState.lastSeenAt)
     }
     var showAddDialog by remember { mutableStateOf(false) }
-    var pendingDelete by remember { mutableStateOf<TimeCapsule?>(null) }
 
     Scaffold(
         topBar = {
@@ -162,20 +157,25 @@ fun CapsulesScreen(onBack: () -> Unit) {
             ) {
                 items(capsules, key = { it.id }) { capsule ->
                     val unlocked = capsule.unlockedAt != null
+                    // UX-FIX-PLAN.md Phase 2 item 11 (user's literal ask: "time capsule should not be
+                    // delete-able" - full stop, no exception): deliberately no delete affordance on this
+                    // card, and CapsulesViewModel has no delete() function - there is nothing here to wire
+                    // one up to. Do not add one back.
                     Card(
                         shape = MaterialTheme.shapes.large,
                         colors = CardDefaults.cardColors(
                             containerColor = if (unlocked) MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.surfaceVariant
                         )
                     ) {
-                        Box {
-                        IconButton(
-                            onClick = { pendingDelete = capsule },
-                            modifier = Modifier.align(Alignment.TopEnd)
-                        ) {
-                            Icon(Icons.Filled.Delete, contentDescription = "Delete capsule")
-                        }
-                        Column(modifier = Modifier.padding(16.dp).padding(end = 40.dp)) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            // Auto-adjusted threshold - see TimeCapsuleRepository.unlockEligible's doc.
+                            // Grows/shrinks by exactly however much manual-hours credit has changed since
+                            // this capsule was created, so it always takes the same amount of genuine
+                            // together-time to unlock regardless of backfill activity. Computed once here
+                            // (not duplicated per-branch) via the same shared TimeCapsuleRepository function
+                            // the actual unlock decision itself uses, so this display can never disagree
+                            // with reality, and so item 11's persistent timeline text below can reuse it too.
+                            val effectiveThreshold = TimeCapsuleRepository.effectiveThreshold(capsule, manualCredit)
                             if (unlocked) {
                                 Text("💌 Unlocked", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
                                 Text(capsule.text, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.padding(top = 4.dp))
@@ -185,9 +185,9 @@ fun CapsulesScreen(onBack: () -> Unit) {
                                 // unclamped - see TimeCapsuleRepository.effectiveThreshold's own doc for why
                                 // that let a forged manualHoursAtCreation render an alarming/nonsensical
                                 // negative "hours to go" here even though the real backend gate correctly
-                                // kept the capsule locked. Now calls the one shared, clamped implementation,
-                                // so this display can never disagree with the actual unlock decision again.
-                                val effectiveThreshold = TimeCapsuleRepository.effectiveThreshold(capsule, manualCredit)
+                                // kept the capsule locked. Now computed once above (shared with item 11's
+                                // timeline text) via the same shared, clamped implementation, so this display
+                                // can never disagree with the actual unlock decision.
                                 val remaining = (effectiveThreshold - stats.totalHoursAllTime.toFloat()).coerceAtLeast(0f)
                                 val delta = effectiveThreshold - capsule.unlockAtHours
                                 Text("🔒 Locked", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
@@ -209,39 +209,33 @@ fun CapsulesScreen(onBack: () -> Unit) {
                                     )
                                 }
                             }
-                        }
+
+                            // UX-FIX-PLAN.md Phase 2 item 11: a persistent creation/unlock timeline, shown
+                            // in BOTH card states - this is the fix for the reported bug that a capsule's
+                            // creation/unlock info used to blank out the moment it unlocked (the Unlocked
+                            // branch above never rendered anything but the note text). Text itself comes
+                            // from a plain top-level function (not inlined here) so it's unit-testable
+                            // without any Compose test infra - see CapsulesScreenTest.
+                            val timeline = buildCapsuleTimelineText(capsule, effectiveThreshold)
+                            Text(
+                                timeline.sealedLine,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 10.dp)
+                            )
+                            timeline.openedLine?.let {
+                                Text(
+                                    it,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(top = 2.dp)
+                                )
+                            }
                         }
                     }
                 }
             }
         }
-    }
-
-    pendingDelete?.let { capsule ->
-        AlertDialog(
-            onDismissRequest = { pendingDelete = null },
-            title = { Text("Delete this time capsule?") },
-            text = {
-                // MINOR fix (ultimate-app-review, deferred-minors D2, fixed per explicit user request):
-                // matches the house delete-confirm pattern every other screen uses (quote the item, state
-                // it propagates on next sync) - this previously omitted the sync-propagation warning for
-                // the still-locked case, and never quoted the item at all. The locked case deliberately
-                // does NOT quote capsule.text, unlike every other screen's pattern: a still-locked capsule
-                // can belong to your partner and hasn't unlocked for you either (its card shows no text at
-                // all, by design), so echoing the real text back here would leak a secret this dialog has
-                // no business revealing early. The unlocked case is safe to quote since that text is
-                // already visible on the card itself.
-                Text(
-                    if (capsule.unlockedAt != null) {
-                        "\"${capsule.text}\" will be removed for both of you once you next sync."
-                    } else {
-                        "This sealed note will be removed for both of you once you next sync — it'll be gone before it ever unlocks."
-                    }
-                )
-            },
-            confirmButton = { TextButton(onClick = { vm.delete(capsule); pendingDelete = null }) { Text("Delete") } },
-            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Cancel") } }
-        )
     }
 
     if (showAddDialog) {
@@ -304,4 +298,25 @@ private fun AddCapsuleDialog(onDismiss: () -> Unit, onAdd: (String, Float) -> Un
 
 private fun Float.trimZeros(): String {
     return if (this == this.toInt().toFloat()) this.toInt().toString() else "%.1f".format(this)
+}
+
+/** UX-FIX-PLAN.md Phase 2 item 11: the two lines of persistent timeline text a capsule card shows -
+ * [sealedLine] always, [openedLine] only once [TimeCapsule.unlockedAt] is set (and, unlike the old
+ * Unlocked-branch UI, this keeps showing forever after - it never blanks back out). Extracted as a plain
+ * function (not inlined into the Composable) purely so it's unit-testable without any Compose test
+ * dependency - see CapsulesScreenTest. */
+internal data class CapsuleTimelineText(val sealedLine: String, val openedLine: String?)
+
+internal fun buildCapsuleTimelineText(
+    capsule: TimeCapsule,
+    effectiveThreshold: Float,
+    zone: ZoneId = ZoneId.systemDefault()
+): CapsuleTimelineText {
+    val createdDate = Instant.ofEpochMilli(capsule.createdAt).atZone(zone).toLocalDate()
+    val sealedLine = "Sealed on ${DateFormats.formatDate(createdDate)} · unlocks after ${effectiveThreshold.trimZeros()}h together"
+    val openedLine = capsule.unlockedAt?.let { unlockedAt ->
+        val unlockedDate = Instant.ofEpochMilli(unlockedAt).atZone(zone).toLocalDate()
+        "Opened on ${DateFormats.formatDate(unlockedDate)}"
+    }
+    return CapsuleTimelineText(sealedLine, openedLine)
 }

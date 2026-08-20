@@ -409,14 +409,27 @@ private fun DayCell(
                         .clip(CircleShape)
                         .background(MaterialTheme.colorScheme.primary)
                 )
-                if (!hasPhoto) {
-                    Icon(
-                        imageVector = Icons.Filled.PhotoCamera,
-                        contentDescription = "No photo yet",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f),
-                        modifier = Modifier.padding(top = 1.dp).size(9.dp)
-                    )
-                }
+            }
+            // UX-FIX-PLAN.md Phase 2 item 13: the photo marker used to be nested inside `hasTogetherTime`
+            // and rendered when `!hasPhoto` - i.e. a "no photo yet" icon on together-days WITHOUT a photo,
+            // and NOTHING AT ALL on days that actually have one (the primary bug), including every
+            // gallery-imported photo on a day with no together-time. photoMarkerState is a plain function
+            // (not inlined) so this logic is unit-testable without Compose test infra - see
+            // CalendarScreenTest.
+            when (photoMarkerState(hasPhoto = hasPhoto, hasTogetherTime = hasTogetherTime)) {
+                PhotoMarkerState.HAS_PHOTO -> Icon(
+                    imageVector = Icons.Filled.PhotoCamera,
+                    contentDescription = "Has a photo",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(top = 1.dp).size(9.dp)
+                )
+                PhotoMarkerState.PROMPT_NO_PHOTO -> Icon(
+                    imageVector = Icons.Filled.PhotoCamera,
+                    contentDescription = "No photo yet",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f),
+                    modifier = Modifier.padding(top = 1.dp).size(9.dp)
+                )
+                PhotoMarkerState.NONE -> {}
             }
         }
         if (hasManualEntry) {
@@ -430,6 +443,20 @@ private fun DayCell(
             )
         }
     }
+}
+
+/** UX-FIX-PLAN.md Phase 2 item 13: which photo-camera marker (if any) a day cell should show, extracted
+ * as a plain pure function purely so the fixed logic is unit-testable without any Compose UI test infra -
+ * see CalendarScreenTest. [HAS_PHOTO] (a solid marker) always wins when the day actually has a photo,
+ * regardless of together/apart status - this is the fix for the primary bug (a photo-day used to render
+ * NOTHING). [PROMPT_NO_PHOTO] (the old faded "no photo yet" prompt) is kept for a together-day that has
+ * no photo yet, since that's still a useful nudge; [NONE] otherwise (an apart-day with no photo). */
+internal enum class PhotoMarkerState { HAS_PHOTO, PROMPT_NO_PHOTO, NONE }
+
+internal fun photoMarkerState(hasPhoto: Boolean, hasTogetherTime: Boolean): PhotoMarkerState = when {
+    hasPhoto -> PhotoMarkerState.HAS_PHOTO
+    hasTogetherTime -> PhotoMarkerState.PROMPT_NO_PHOTO
+    else -> PhotoMarkerState.NONE
 }
 
 private fun sessionsOverlapping(sessions: List<TogetherSession>, day: LocalDate, zone: ZoneId, lastSeenAt: Long): List<TogetherSession> {

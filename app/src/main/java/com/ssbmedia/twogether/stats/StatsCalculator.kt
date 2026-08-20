@@ -424,6 +424,26 @@ object StatsCalculator {
         return map
     }
 
+    /** UX-FIX-PLAN.md Phase 2 item 12: finds a [TogetherSession] whose window contains [at] (inclusive
+     * start, exclusive end - same convention [buildDailyMinuteMap]'s day-splitting already uses), so a
+     * gallery-imported photo can be auto-detected as "taken while together" instead of always defaulting
+     * to apart. An open session's end is clamped via [effectiveOpenSessionEnd], same as every other read
+     * of an open session's duration elsewhere in this file - so a stale/orphaned open row can't claim an
+     * arbitrarily-far-future photo as "together" either. Returns the first match; overlapping sessions
+     * covering the same instant are a real (if rare) possibility this app already tolerates elsewhere
+     * (see [mergedIntervals]'s own doc), and any one of them is an equally correct answer to "was there
+     * together-time at this instant". */
+    fun sessionContaining(
+        sessions: List<TogetherSession>,
+        at: Long,
+        now: Long = System.currentTimeMillis(),
+        lastSeenAt: Long = 0L,
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+    ): TogetherSession? = sessions.firstOrNull { s ->
+        val end = s.endedAt ?: effectiveOpenSessionEnd(s.startedAt, now, lastSeenAt, absenceTimeoutMillis)
+        at >= s.startedAt && at < end
+    }
+
     /** Finds the most recent PAST year in which today's month+day had any together-time, using the same
      * per-day minute map the Calendar screen and [compute] both already use - see [buildDailyMinuteMap].
      * Returns null if there's no matching day in any earlier year (including the common case of a couple
