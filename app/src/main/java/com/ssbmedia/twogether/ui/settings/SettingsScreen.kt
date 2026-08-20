@@ -105,7 +105,21 @@ class SettingsViewModel : ViewModel() {
      * AppSettings.sessionGraceMinutes' own doc: purely a live setting, no retroactive-recomputation
      * concern. */
     fun setSessionGraceMinutes(minutes: Int) {
-        viewModelScope.launch { ServiceLocator.settingsStore.setSessionGraceMinutes(minutes) }
+        viewModelScope.launch {
+            ServiceLocator.settingsStore.setSessionGraceMinutes(minutes)
+            // MAJOR fix (ultimate-app-review round 1, B4): every OTHER local settings/data write in this
+            // app nudges an immediate sync while together (see CalendarScreen.addManualSession/
+            // deleteManualSession/updateManualSession/DayNoteSection, CameraScreen, CapsulesScreen,
+            // OurListsScreen, HomeScreen, MilestonesScreen, GalleryImportFlow - all gated on the exact same
+            // `ServiceLocator.proximityStateStore.current().isTogether` check) so the change reaches the
+            // partner's phone right away instead of waiting for the next natural reconnect or the 15-minute
+            // periodic catch-all. This setter (and setReunionThresholdMinutes below) was the one write path
+            // in the app that didn't - live-measured, a reunion-threshold change took 486s to reach the
+            // partner phone without this nudge.
+            if (ServiceLocator.proximityStateStore.current().isTogether) {
+                AppEvents.requestManualSync()
+            }
+        }
     }
 
     /** Reunion-count non-retroactivity feature: the "Reunion threshold" row's Change dialog calls this -
@@ -114,7 +128,14 @@ class SettingsViewModel : ViewModel() {
      * this setter only ever changes the live value future transitions get evaluated against - it never
      * rescans or rewrites ProximityPersistedState.reunionCount. */
     fun setReunionThresholdMinutes(minutes: Int) {
-        viewModelScope.launch { ServiceLocator.settingsStore.setReunionThresholdMinutes(minutes) }
+        viewModelScope.launch {
+            ServiceLocator.settingsStore.setReunionThresholdMinutes(minutes)
+            // MAJOR fix (ultimate-app-review round 1, B4): see setSessionGraceMinutes' matching fix just
+            // above for the full reasoning - same missing nudge, same fix.
+            if (ServiceLocator.proximityStateStore.current().isTogether) {
+                AppEvents.requestManualSync()
+            }
+        }
     }
 
     fun setNotificationsEnabled(enabled: Boolean) {
