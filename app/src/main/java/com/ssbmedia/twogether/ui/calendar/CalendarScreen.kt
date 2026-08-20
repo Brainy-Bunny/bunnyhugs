@@ -578,9 +578,16 @@ internal fun photoMarkerState(hasPhoto: Boolean, hasTogetherTime: Boolean): Phot
  * already-saved note of yours renders as a read-only card ABOVE the input with an explicit Edit
  * affordance - see that composable's own doc for the Phase 1 item 7 "saved but doesn't appear" bug this
  * shape fixes) rather than inventing a different pattern for this new but structurally identical
- * per-author-note feature. The one deliberate difference: no `AppEvents.requestManualSync()` nudge after
- * saving - DayNote has no wire-protocol support yet (see this feature's own scope note), so there is
- * nothing for a manual sync to actually send for this entity yet.
+ * per-author-note feature.
+ *
+ * BUG fix (live-verified on two paired emulators immediately after GattSyncManager's DayNote wiring
+ * landed): this used to skip the `AppEvents.requestManualSync()` nudge every other write path in this
+ * app already sends (see e.g. CapsulesViewModel.add above), on the reasoning that DayNote had no
+ * wire-protocol support yet at the time this composable was first written - true then, no longer true
+ * now that serializeDayNotes/deserializeDayNotes exist, and leaving the omission in place after that
+ * would have silently degraded a saved note to "wait for the next natural periodic sync" instead of
+ * "reaches your partner right away while you're still together", the same real gap that motivated
+ * every other entity's own nudge.
  */
 @Composable
 private fun DayNoteSection(date: Long) {
@@ -685,6 +692,13 @@ private fun DayNoteSection(date: Long) {
                         val deviceId = myDeviceId ?: return@TextButton
                         coroutineScope.launch {
                             ServiceLocator.dayNoteRepository.saveMyNote(date, deviceId, myText)
+                            // Same "don't make it wait for the next reconnect" reasoning as
+                            // CalendarViewModel.addManualSession/deleteManualSession/updateManualSession
+                            // above - see this composable's own doc for why this nudge wasn't here
+                            // originally and why leaving it out is now a real regression.
+                            if (ServiceLocator.proximityStateStore.current().isTogether) {
+                                AppEvents.requestManualSync()
+                            }
                             saved = true
                             isEditingMine = false
                         }
