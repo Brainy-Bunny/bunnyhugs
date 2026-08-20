@@ -842,10 +842,31 @@ class SettingsStore(private val context: Context) {
     /** Full raw restore used by Feature 4's backup restore flow - overwrites every settings field
      * verbatim from a backup manifest (deliberately preserves whatever lastBackupAt/lastBackupOk already
      * exist on THIS install rather than the backed-up ones, since those describe the backup file itself,
-     * not the couple's data, and get set again right after this call completes anyway). */
+     * not the couple's data, and get set again right after this call completes anyway).
+     *
+     * MINOR fix (ultimate-app-review round 1, item A3): sessionGraceMinutes/reunionThresholdMinutes
+     * (+ their *UpdatedAt companions), photoReminderMinutes, themeMode, quickLinksOrder, and
+     * autoUpdateCheckEnabled were completely absent from this round-trip (confirmed: zero occurrences
+     * anywhere in this function or in BackupManager's manifest before this fix) - restoring a backup
+     * silently reset all six to their AppSettings defaults instead of the values the couple had actually
+     * configured. Added below, all with plain default parameter values matching AppSettings' own defaults
+     * (mirroring defaultSnoozeMinutes/notificationsEnabled's existing non-nullable-with-default shape
+     * above) so a backup made by an OLDER version of this app - one that predates this fix and simply has
+     * no JSON keys for these six fields - restores cleanly via BackupManager's own optInt/optLong/
+     * optBoolean/optStringOrNull defaults at the JSON-read call site, without this function needing any
+     * special-cased null-handling for them. quickLinksOrder is the one deliberately nullable exception
+     * (matching deviceTieBreakByte's/localDeviceId's own optional shape above) - null is a genuinely
+     * meaningful "never reordered" state HomeScreen already falls back on, not just "value absent".
+     * biometricUnlockEnabled is DELIBERATELY excluded from both this function and the backup manifest -
+     * see AppSettings.biometricUnlockEnabled's own doc for why that one field must always require a fresh,
+     * explicit opt-in rather than being silently restored. */
     suspend fun restoreRaw(
         defaultSnoozeMinutes: Int, notificationsEnabled: Boolean, pinHash: String?, pinEnabled: Boolean,
-        lastSyncAt: Long, deviceTieBreakByte: Int?, localDeviceId: String? = null
+        lastSyncAt: Long, deviceTieBreakByte: Int?, localDeviceId: String? = null,
+        sessionGraceMinutes: Int = 10, sessionGraceMinutesUpdatedAt: Long = 0L,
+        reunionThresholdMinutes: Int = 60, reunionThresholdMinutesUpdatedAt: Long = 0L,
+        photoReminderMinutes: Int = 15, themeMode: String = ThemeMode.SYSTEM.name,
+        quickLinksOrder: String? = null, autoUpdateCheckEnabled: Boolean = true
     ) {
         context.settingsDs.edit { p ->
             p[Keys.SNOOZE_MIN] = defaultSnoozeMinutes
@@ -860,6 +881,15 @@ class SettingsStore(private val context: Context) {
             // getOrCreateLocalDeviceId() call right after would mint a new one anyway; either way there's
             // no "restore to blank" case worth supporting here.
             if (localDeviceId != null) p[Keys.LOCAL_DEVICE_ID] = localDeviceId
+            p[Keys.SESSION_GRACE_MINUTES] = sessionGraceMinutes
+            p[Keys.SESSION_GRACE_MINUTES_UPDATED_AT] = sessionGraceMinutesUpdatedAt
+            p[Keys.REUNION_THRESHOLD_MINUTES] = reunionThresholdMinutes
+            p[Keys.REUNION_THRESHOLD_MINUTES_UPDATED_AT] = reunionThresholdMinutesUpdatedAt
+            p[Keys.PHOTO_REMINDER_MINUTES] = photoReminderMinutes
+            p[Keys.THEME_MODE] = themeMode
+            // Nullable, matching localDeviceId's shape above - see this function's own doc for why.
+            if (quickLinksOrder != null) p[Keys.QUICK_LINKS_ORDER] = quickLinksOrder else p.remove(Keys.QUICK_LINKS_ORDER)
+            p[Keys.AUTO_UPDATE_ENABLED] = autoUpdateCheckEnabled
         }
     }
 }

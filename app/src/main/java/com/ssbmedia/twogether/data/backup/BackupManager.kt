@@ -14,6 +14,7 @@ import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.data.datastore.LastConnectionInfo
 import com.ssbmedia.twogether.data.datastore.PairingInfo
+import com.ssbmedia.twogether.data.datastore.ThemeMode
 import com.ssbmedia.twogether.data.db.DEFAULT_LIST_ID
 import com.ssbmedia.twogether.data.db.DateIdea
 import com.ssbmedia.twogether.data.db.DayNote
@@ -323,6 +324,21 @@ object BackupManager {
             put("lastSyncAt", settings.lastSyncAt)
             put("deviceTieBreakByte", settings.deviceTieBreakByte)
             put("localDeviceId", settings.localDeviceId)
+            // MINOR fix (ultimate-app-review round 1, item A3): these six fields were completely absent
+            // from both the write and read paths of this file (confirmed: zero occurrences anywhere in
+            // BackupManager before this fix) - a restore silently reset all six to their AppSettings
+            // defaults instead of the couple's actually-configured values. biometricUnlockEnabled is
+            // DELIBERATELY still excluded here - see AppSettings.biometricUnlockEnabled's own doc for why
+            // that one genuinely-new permission-adjacent surface must always require a fresh, explicit
+            // opt-in rather than being silently restored onto a possibly-different physical device.
+            put("sessionGraceMinutes", settings.sessionGraceMinutes)
+            put("sessionGraceMinutesUpdatedAt", settings.sessionGraceMinutesUpdatedAt)
+            put("reunionThresholdMinutes", settings.reunionThresholdMinutes)
+            put("reunionThresholdMinutesUpdatedAt", settings.reunionThresholdMinutesUpdatedAt)
+            put("photoReminderMinutes", settings.photoReminderMinutes)
+            put("themeMode", settings.themeMode.name)
+            put("quickLinksOrder", settings.quickLinksOrder ?: JSONObject.NULL)
+            put("autoUpdateCheckEnabled", settings.autoUpdateCheckEnabled)
         })
 
         put("badgeUnlocks", JSONObject().apply {
@@ -865,7 +881,24 @@ object BackupManager {
                 pinEnabled = false,
                 lastSyncAt = s.optLong("lastSyncAt", 0L),
                 deviceTieBreakByte = if (s.isNull("deviceTieBreakByte")) null else s.optInt("deviceTieBreakByte"),
-                localDeviceId = s.optStringOrNull("localDeviceId")
+                localDeviceId = s.optStringOrNull("localDeviceId"),
+                // MINOR fix (ultimate-app-review round 1, item A3): see buildManifest's/restoreRaw's own
+                // matching doc for the full backward-compat story. optInt/optLong/optBoolean/optStringOrNull
+                // all default exactly like AppSettings' own defaults for a backup made before this fix -
+                // a pre-fix backup simply has none of these six keys, and restores as if the couple had
+                // never touched any of them, same as a fresh install.
+                sessionGraceMinutes = s.optInt("sessionGraceMinutes", 10),
+                sessionGraceMinutesUpdatedAt = s.optLong("sessionGraceMinutesUpdatedAt", 0L),
+                reunionThresholdMinutes = s.optInt("reunionThresholdMinutes", 60),
+                reunionThresholdMinutesUpdatedAt = s.optLong("reunionThresholdMinutesUpdatedAt", 0L),
+                photoReminderMinutes = s.optInt("photoReminderMinutes", 15),
+                // Defensive against a garbage/future-version theme name the same way SettingsStore.
+                // fromPreferences already is on the READ side (runCatching ThemeMode.valueOf(...) ?: SYSTEM)
+                // - this just needs a plain, always-constructible string to pass through; the actual
+                // validation happens the next time the settings Flow re-emits.
+                themeMode = s.optString("themeMode", ThemeMode.SYSTEM.name),
+                quickLinksOrder = s.optStringOrNull("quickLinksOrder"),
+                autoUpdateCheckEnabled = s.optBoolean("autoUpdateCheckEnabled", true)
             )
 
             ServiceLocator.badgeUnlocksStore.restoreRaw(parsed.badgeUnlocks)
