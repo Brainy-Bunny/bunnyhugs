@@ -34,8 +34,19 @@ object UpdateChecker {
 
     /** Don't let app-start's own check re-hit the network on every reopen - the daily UpdateWorker
      * covers the periodic case regardless; this just bounds the extra app-start check to a few times
-     * a day at most, per the task's "don't re-check more than once every several hours" ask. */
+     * a day at most, per the task's "don't re-check more than once every several hours" ask. Also used
+     * (item 14, update-nag reach fix) as the real rate limiter for ProximityForegroundService's own
+     * periodic check - see that class's tick()'s use of this same constant. */
     val MIN_CHECK_INTERVAL_MS: Long = TimeUnit.HOURS.toMillis(6)
+
+    /** Item 14 (update-nag reach fix): pure predicate shared by every surface that decides whether to
+     * show a "an update is ready" affordance (Settings' own card, and the new Home banner) - a pending
+     * update recorded in AppSettings.pendingUpdateVersionCode is only actually actionable while it's
+     * still genuinely newer than what's currently running; see that field's own doc for why a stale
+     * (already-installed) pending flag must be ignored rather than shown. One function, not two
+     * independent inline comparisons, so Home and Settings can never silently drift apart on this. */
+    fun isPendingUpdateActionable(pendingVersionCode: Int, currentVersionCode: Int): Boolean =
+        pendingVersionCode > currentVersionCode
 
     data class UpdateInfo(
         val versionCode: Int,

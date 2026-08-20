@@ -64,13 +64,16 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
+import com.ssbmedia.twogether.BuildConfig
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.ble.BlePermissions
 import com.ssbmedia.twogether.ble.ProximityStateMachine
+import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.data.datastore.PairingInfo
 import com.ssbmedia.twogether.data.datastore.ProximityPersistedState
 import com.ssbmedia.twogether.data.db.Moment
 import com.ssbmedia.twogether.data.db.TogetherSession
+import com.ssbmedia.twogether.data.update.UpdateChecker
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.service.ProximityForegroundService
 import com.ssbmedia.twogether.stats.OnThisDayInfo
@@ -79,6 +82,7 @@ import com.ssbmedia.twogether.ui.components.PulsingHeart
 import com.ssbmedia.twogether.ui.components.QuickLinkChip
 import com.ssbmedia.twogether.ui.components.SectionHeader
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import com.ssbmedia.twogether.ui.update.UpdateInstallActivity
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -135,6 +139,13 @@ class HomeViewModel : ViewModel() {
     val quickLinksOrder: StateFlow<List<String>> = ServiceLocator.settingsStore.settings
         .map { reconcileQuickLinkOrder(it.quickLinksOrder) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), DEFAULT_QUICK_LINK_ORDER)
+
+    /** Item 14 (update-nag reach fix): the whole AppSettings snapshot, not just the pending-update
+     * fields alone - matches SettingsViewModel's own `val settings` pattern (SettingsScreen.kt) so both
+     * screens read the exact same durable flag UpdateChecker sets, rather than Home growing its own
+     * narrower duplicate of this store's mapping logic. */
+    val settings: StateFlow<AppSettings> = ServiceLocator.settingsStore.settings
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), AppSettings())
 
     fun setQuickLinksOrder(order: List<String>) {
         viewModelScope.launch { ServiceLocator.settingsStore.setQuickLinksOrder(order) }
@@ -199,6 +210,7 @@ fun HomeScreen(
     val moments by vm.moments.collectAsState()
     val randomMoment by vm.randomMoment.collectAsState()
     val quickLinksOrder by vm.quickLinksOrder.collectAsState()
+    val settings by vm.settings.collectAsState()
 
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -391,6 +403,43 @@ fun HomeScreen(
                         onGrantClick = {
                             val perm = BlePermissions.notificationPermission()
                             if (perm != null) notificationPermissionLauncher.launch(perm)
+                        }
+                    )
+                }
+            }
+            // Item 14 (update-nag reach fix): reads the SAME durable pendingUpdateVersionCode flag
+            // Settings' own "Update ready" card already reads (see SettingsScreen.kt) - a real user
+            // shipped v2.7 (a genuine data-loss bug fix) and went days without ever seeing it, because
+            // nothing on Home hinted an update was ready and the flag was previously Settings-only. This
+            // banner has NO permission dependency at all (unlike the three banners above it) - it works
+            // correctly even when POST_NOTIFICATIONS is denied entirely, which is the whole point; the
+            // durable flag is written the moment UpdateChecker finishes downloading, independent of
+            // whether the OS notification itself managed to post. Placed after the permission banners
+            // (a missing BLE/notification permission is the more fundamental blocker to resolve first)
+            // but before the status card, matching this screen's existing "important banners float to
+            // the top" ordering.
+            if (UpdateChecker.isPendingUpdateActionable(settings.pendingUpdateVersionCode, BuildConfig.VERSION_CODE)) {
+                item {
+                    UpdateAvailableWarningCard(
+                        versionName = settings.pendingUpdateVersionName ?: "update",
+                        onInstallClick = {
+                            // Mirrors SettingsScreen's own "Install" onClick exactly (same apk-file-still-
+                            // there check) - but on the rare edge case the cached APK has since gone
+                            // missing (cleared storage, cache eviction), routes to Settings instead of
+                            // silently doing nothing: that screen already owns the "clear the stale flag
+                            // and tell the user to re-check" recovery flow, so there's no reason to
+                            // duplicate it here.
+                            val apkFile = settings.pendingUpdateApkPath?.let { File(it) }
+                            if (apkFile != null && apkFile.isFile) {
+                                context.startActivity(
+                                    Intent(context, UpdateInstallActivity::class.java).apply {
+                                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                                        putExtra(UpdateInstallActivity.EXTRA_APK_PATH, apkFile.absolutePath)
+                                    }
+                                )
+                            } else {
+                                onNavigateSettings()
+                            }
                         }
                     )
                 }
@@ -739,6 +788,38 @@ private fun LocationServicesWarningCard(onOpenSettingsClick: () -> Unit) {
                 modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
             )
             Button(onClick = onOpenSettingsClick) { Text("Open Settings") }
+        }
+    }
+}
+
+/** Item 14 (update-nag reach fix): Home's own copy of Settings' "Update ready" card (see
+ * SettingsScreen.kt's Updates section) - deliberately the SAME primaryContainer color Settings already
+ * uses for this card (a ready update is good news, not a warning - unlike the errorContainer permission
+ * banners above it on this same screen) rather than reusing errorContainer just for visual consistency
+ * with its siblings. [onInstallClick] carries the exact same "launch UpdateInstallActivity, or fall back
+ * to Settings if the cached APK has gone missing" logic as that card's own onClick - see this card's call
+ * site for why the fallback goes to Settings rather than duplicating the stale-flag recovery flow here. */
+@Composable
+private fun UpdateAvailableWarningCard(versionName: String, onInstallClick: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.large,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                "Update $versionName ready",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onPrimaryContainer
+            )
+            Text(
+                "A newer version of Twogether has already been downloaded and is ready to install.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
+            )
+            Button(onClick = onInstallClick) { Text("Install") }
         }
     }
 }
