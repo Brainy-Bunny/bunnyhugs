@@ -376,11 +376,30 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
 
     /** Feature: Time Capsule sync. Soft-delete (tombstone) - same pattern as every other synced entity's
      * delete, so removing a capsule you created by mistake propagates to your partner's phone too.
+     * Unconditional - this is the low-level primitive [mergeRemote]'s tombstone-apply branch and any
+     * future admin/recovery path can still reach for. The actual user-facing "Delete" affordance in
+     * CapsulesScreen calls [deleteIfLocked] below instead, not this.
      *
      * MINOR fix (code-review, Sonnet): used to be a stale-read-shaped `dao.update(capsule.copy(...))`
      * that could clobber a concurrent unlock - see [TimeCapsuleDao.tombstone]'s own doc. */
     suspend fun delete(capsule: TimeCapsule) {
         dao.tombstone(capsule.id, System.currentTimeMillis())
+    }
+
+    /** User-requested (supersedes the earlier "time capsule should not be delete-able, full stop, no
+     * exception" decision - see CapsulesScreen's old comment this replaces): a capsule can be deleted by
+     * either partner ONLY while it's still locked - "we might create a wrong one, or wanted to test it"
+     * - and becomes permanently undeletable the instant it unlocks. Uses [TimeCapsuleDao.tombstoneIfLocked]'s
+     * atomic `unlockedAt IS NULL` condition rather than checking the passed-in [capsule] snapshot's own
+     * unlockedAt in Kotlin, so a concurrent unlockEligible() pass can't race this into deleting an
+     * already-unlocked capsule - see that query's own doc. No creator/originating-device restriction:
+     * this app has no per-user identity model for any other shared entity either (any Moment/DayNote/
+     * list item can already be deleted or edited by either partner), so gating this one entity to
+     * "only whoever created it" would be new, unestablished behavior this app doesn't otherwise have -
+     * and TimeCapsule's own schema has no author/device field to enforce it with. Already propagates to
+     * the partner's phone via the exact same tombstone-apply sync path [delete] above does. */
+    suspend fun deleteIfLocked(capsule: TimeCapsule) {
+        dao.tombstoneIfLocked(capsule.id, System.currentTimeMillis())
     }
 
     /**

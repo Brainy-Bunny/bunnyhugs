@@ -178,8 +178,71 @@ class TimeCapsuleSyncAuditTest {
                 localRows = localRows.map { if (it.id == id) tombstoned else it }
             }
         }
+        override suspend fun tombstoneIfLocked(id: Long, updatedAt: Long) {
+            localRows.firstOrNull { it.id == id && it.unlockedAt == null }?.let { row ->
+                val tombstoned = row.copy(deleted = true, updatedAt = updatedAt)
+                updated.add(tombstoned)
+                localRows = localRows.map { if (it.id == id) tombstoned else it }
+            }
+        }
         override suspend fun getAll(): List<TimeCapsule> = localRows
         override suspend fun clearAll() { localRows = emptyList() }
+    }
+
+    // ---- deleteIfLocked (user-requested: deletable only while still locked) ----
+
+    @Test
+    fun `deleteIfLocked tombstones a still-locked capsule`() = runBlocking {
+        val locked = TimeCapsule(
+            id = 1L, text = "locked", unlockAtHours = 100f, createdAt = 0L,
+            unlockedAt = null, syncId = "a", updatedAt = 0L
+        )
+        val dao = FakeTimeCapsuleDao(listOf(locked))
+        val repo = TimeCapsuleRepository(dao)
+
+        repo.deleteIfLocked(locked)
+
+        assertTrue("a locked capsule must be deletable", dao.localRows.single().deleted)
+    }
+
+    @Test
+    fun `deleteIfLocked does NOT delete an already-unlocked capsule`() = runBlocking {
+        val unlocked = TimeCapsule(
+            id = 2L, text = "unlocked", unlockAtHours = 100f, createdAt = 0L,
+            unlockedAt = 12_345L, syncId = "b", updatedAt = 0L
+        )
+        val dao = FakeTimeCapsuleDao(listOf(unlocked))
+        val repo = TimeCapsuleRepository(dao)
+
+        repo.deleteIfLocked(unlocked)
+
+        assertTrue(
+            "an unlocked capsule must never be deleted, regardless of what the caller passed in",
+            dao.localRows.single().let { !it.deleted && it.unlockedAt == 12_345L }
+        )
+    }
+
+    @Test
+    fun `deleteIfLocked is atomic against a concurrent unlock - the DB row's CURRENT state wins, not the caller's stale snapshot`() = runBlocking {
+        // Simulates the exact race tombstoneIfLocked's own doc describes: the caller's in-memory
+        // `capsule` snapshot still shows unlockedAt = null (locked), but the underlying DB row has
+        // ALREADY been unlocked (e.g. a concurrent unlockEligible() pass) by the time this executes -
+        // the atomic `WHERE unlockedAt IS NULL` condition (faked here via FakeTimeCapsuleDao's own
+        // matching check) must key off the DB's current state, not the stale snapshot passed in.
+        val staleSnapshot = TimeCapsule(
+            id = 3L, text = "raced", unlockAtHours = 100f, createdAt = 0L,
+            unlockedAt = null, syncId = "c", updatedAt = 0L
+        )
+        val nowActuallyUnlocked = staleSnapshot.copy(unlockedAt = 99_999L)
+        val dao = FakeTimeCapsuleDao(listOf(nowActuallyUnlocked)) // DB already has the unlock
+        val repo = TimeCapsuleRepository(dao)
+
+        repo.deleteIfLocked(staleSnapshot) // caller still thinks it's locked
+
+        assertTrue(
+            "the DB's real current state (already unlocked) must win over the caller's stale locked snapshot",
+            dao.localRows.single().let { !it.deleted && it.unlockedAt == 99_999L }
+        )
     }
 
     // NOTE (ultimate-app-review round 2, Opus+Sonnet both independently live-reproduced as S9): the test

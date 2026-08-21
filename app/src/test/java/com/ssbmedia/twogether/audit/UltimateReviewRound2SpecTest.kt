@@ -263,6 +263,7 @@ class UltimateReviewRound2SpecTest {
                 if (row.id == id && !row.deleted) row = row.copy(unlockedAt = unlockedAt, updatedAt = updatedAt)
             }
             override suspend fun tombstone(id: Long, updatedAt: Long) = throw NotImplementedError("not used by this helper")
+            override suspend fun tombstoneIfLocked(id: Long, updatedAt: Long) = throw NotImplementedError("not used by this helper")
             override suspend fun getAll() = listOf(row)
             override suspend fun clearAll() {}
         }

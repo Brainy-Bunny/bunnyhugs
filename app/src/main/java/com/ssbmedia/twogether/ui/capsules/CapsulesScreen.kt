@@ -13,6 +13,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -32,6 +33,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -108,11 +110,18 @@ class CapsulesViewModel : ViewModel() {
         }
     }
 
-    // UX-FIX-PLAN.md Phase 2 item 11 (user's literal ask: "time capsule should not be delete-able" -
-    // full stop, no exception): deliberately no delete() here. TimeCapsuleRepository.delete() and its
-    // tombstone-apply merge branch are kept in the data layer so a partner still on an older app
-    // version that can still send a delete doesn't desync from this one - there is just no UI path in
-    // this app that can trigger one anymore.
+    // User-requested (supersedes the earlier "time capsule should not be delete-able, full stop, no
+    // exception" decision this comment used to describe): a still-locked capsule can now be deleted -
+    // see TimeCapsuleRepository.deleteIfLocked's own doc for why this is safe (only ever fires while
+    // still locked, atomically, no creator restriction since this app has no per-user identity model).
+    fun delete(capsule: TimeCapsule) {
+        viewModelScope.launch {
+            ServiceLocator.timeCapsuleRepository.deleteIfLocked(capsule)
+            if (ServiceLocator.proximityStateStore.current().isTogether) {
+                AppEvents.requestManualSync()
+            }
+        }
+    }
 }
 
 @Composable
@@ -158,14 +167,16 @@ fun CapsulesScreen(onBack: () -> Unit, onOpenCalendar: (jumpToEpochDay: Long) ->
             ) {
                 items(capsules, key = { it.id }) { capsule ->
                     val unlocked = capsule.unlockedAt != null
-                    // UX-FIX-PLAN.md Phase 2 item 11 (user's literal ask: "time capsule should not be
-                    // delete-able" - full stop, no exception): deliberately no delete affordance on this
-                    // card, and CapsulesViewModel has no delete() function - there is nothing here to wire
-                    // one up to. Do not add one back.
+                    var showDeleteConfirm by remember(capsule.id) { mutableStateOf(false) }
+                    // BUG fix (same faded-text root cause as SettingsSection/Badges - see SettingsScreen.kt's
+                    // own doc): containerColor = surfaceVariant with no explicit contentColor defaulted
+                    // every unstyled Text below (the "Locked"/"Unlocks at..." lines) to the muted
+                    // onSurfaceVariant role.
                     Card(
                         shape = MaterialTheme.shapes.large,
                         colors = CardDefaults.cardColors(
-                            containerColor = if (unlocked) MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.surfaceVariant
+                            containerColor = if (unlocked) MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                            contentColor = MaterialTheme.colorScheme.onSurface
                         )
                     ) {
                         Column(modifier = Modifier.padding(16.dp)) {
@@ -191,7 +202,20 @@ fun CapsulesScreen(onBack: () -> Unit, onOpenCalendar: (jumpToEpochDay: Long) ->
                                 // can never disagree with the actual unlock decision.
                                 val remaining = (effectiveThreshold - stats.totalHoursAllTime.toFloat()).coerceAtLeast(0f)
                                 val delta = effectiveThreshold - capsule.unlockAtHours
-                                Text("🔒 Locked", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                                // User-requested: deletable (either partner) only while still locked - see
+                                // TimeCapsuleRepository.deleteIfLocked's own doc. Only rendered in the
+                                // `!unlocked` branch, so this affordance structurally cannot appear once a
+                                // capsule has unlocked - no separate visibility check needed beyond that.
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text("🔒 Locked", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                                    IconButton(onClick = { showDeleteConfirm = true }) {
+                                        Icon(Icons.Filled.Delete, contentDescription = "Delete capsule")
+                                    }
+                                }
                                 Text(
                                     "Unlocks at ${effectiveThreshold.trimZeros()} hours together — ${remaining.trimZeros()} to go",
                                     style = MaterialTheme.typography.bodyMedium,
@@ -250,6 +274,17 @@ fun CapsulesScreen(onBack: () -> Unit, onOpenCalendar: (jumpToEpochDay: Long) ->
                                 )
                             }
                         }
+                    }
+                    if (showDeleteConfirm) {
+                        AlertDialog(
+                            onDismissRequest = { showDeleteConfirm = false },
+                            title = { Text("Delete this time capsule?") },
+                            text = { Text("This can't be undone, and will be removed for both of you once you next sync.") },
+                            confirmButton = {
+                                TextButton(onClick = { showDeleteConfirm = false; vm.delete(capsule) }) { Text("Delete") }
+                            },
+                            dismissButton = { TextButton(onClick = { showDeleteConfirm = false }) { Text("Cancel") } }
+                        )
                     }
                 }
             }

@@ -79,8 +79,10 @@ interface TimeCapsuleDao {
     // query rather than resurrecting this one.
 
     /** Feature: Time Capsule sync. Excludes soft-deleted (tombstoned) rows - what the UI should always
-     * see. */
-    @Query("SELECT * FROM time_capsules WHERE deleted = 0 ORDER BY unlockAtHours ASC")
+     * see. BUG fix (user-reported): was ORDER BY unlockAtHours ASC (soonest-to-unlock first, unrelated
+     * to when each capsule was actually written) - user wants newest-created capsule first, matching
+     * every other list-of-things-you-wrote screen in this app (Moments, Our Lists). */
+    @Query("SELECT * FROM time_capsules WHERE deleted = 0 ORDER BY createdAt DESC")
     fun observeActive(): Flow<List<TimeCapsule>>
 
     @Query("SELECT * FROM time_capsules WHERE unlockedAt IS NULL AND deleted = 0")
@@ -111,6 +113,17 @@ interface TimeCapsuleDao {
      * unlockedAt snapshot forward regardless of timing - no read-before-write needed at all. */
     @Query("UPDATE time_capsules SET deleted = 1, updatedAt = :updatedAt WHERE id = :id")
     suspend fun tombstone(id: Long, updatedAt: Long)
+
+    /** User-requested: a capsule may be deleted only while still locked - "we might create a wrong one,
+     * or wanted to test it" - and must become permanently undeletable the instant it unlocks. Same
+     * atomic-condition-in-the-SQL shape as [unlockIfNotDeleted] above, for the same reason: checking
+     * `unlockedAt IS NULL` in Kotlin before calling a plain [tombstone] would leave a race window where
+     * a concurrent unlockEligible() pass (this app's own background unlock check) could unlock the
+     * capsule between the check and this write, silently deleting an already-unlocked memory the user
+     * no longer has the right to remove. This condition makes that structurally impossible: if the row
+     * has already unlocked by the time this executes, it simply doesn't match and nothing happens. */
+    @Query("UPDATE time_capsules SET deleted = 1, updatedAt = :updatedAt WHERE id = :id AND unlockedAt IS NULL")
+    suspend fun tombstoneIfLocked(id: Long, updatedAt: Long)
 
     /** Raw/unfiltered - includes soft-deleted (tombstoned) rows. Used by BackupManager (so backups
      * round-trip tombstones) and by TimeCapsuleRepository.mergeRemote (needs to see already-tombstoned
