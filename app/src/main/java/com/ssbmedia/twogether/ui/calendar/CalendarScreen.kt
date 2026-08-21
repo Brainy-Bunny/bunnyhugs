@@ -367,7 +367,7 @@ fun CalendarScreen(
             // BUG fix (Phase 1 item 1 of UX-FIX-PLAN.md): was "EEEE, MMM d" with no year at all - a real
             // bug when this dialog is reached via a deep link into a PAST year (e.g. Stats' "Longest
             // single day"/"Together since" cards), where the missing year made the title ambiguous.
-            title = { Text(DateFormats.formatDateWithWeekday(day)) },
+            title = { Text(DateFormats.formatDateWithWeekdayLong(day)) },
             text = {
                 Column {
                     Text(if (minutes > 0) "${minutes / 60}h ${minutes % 60}m together that day" else "No time together that day")
@@ -838,7 +838,7 @@ private fun AddManualSessionDialog(
 
     val error: String? = when {
         date.isAfter(today) -> "Date can't be in the future"
-        date.isBefore(minPlausibleDate) -> "Date can't be before ${DateFormats.formatDate(minPlausibleDate)}"
+        date.isBefore(minPlausibleDate) -> "Date can't be before ${DateFormats.formatDateLong(minPlausibleDate)}"
         !endTime.isAfter(startTime) -> "End time must be after start time"
         nowTimeToday != null && endTime.isAfter(nowTimeToday) -> "End time can't be later than the current time"
         else -> null

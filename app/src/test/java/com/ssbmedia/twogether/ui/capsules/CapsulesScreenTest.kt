@@ -37,7 +37,7 @@ class CapsulesScreenTest {
         val effectiveThreshold = TimeCapsuleRepository.effectiveThreshold(capsule, currentManualHoursCredit = 0f)
         val timeline = buildCapsuleTimelineText(capsule, effectiveThreshold, zone)
 
-        assertEquals("Sealed on 05 01 2026 · unlocks after 50h together", timeline.sealedLine)
+        assertEquals("Sealed on 5th January 2026 · unlocks after 50h together", timeline.sealedLine)
         assertNull("A still-locked capsule must not show an Opened line yet", timeline.openedLine)
     }
 
@@ -55,8 +55,8 @@ class CapsulesScreenTest {
         val timeline = buildCapsuleTimelineText(capsule, effectiveThreshold, zone)
 
         // BUG fix under test: this info must NOT disappear once unlocked.
-        assertEquals("Sealed on 05 01 2026 · unlocks after 50h together", timeline.sealedLine)
-        assertEquals("Opened on 20 03 2026", timeline.openedLine)
+        assertEquals("Sealed on 5th January 2026 · unlocks after 50h together", timeline.sealedLine)
+        assertEquals("Opened on 20th March 2026", timeline.openedLine)
     }
 
     @Test

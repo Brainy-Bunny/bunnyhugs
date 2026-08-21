@@ -366,10 +366,10 @@ internal fun buildCapsuleTimelineText(
     zone: ZoneId = ZoneId.systemDefault()
 ): CapsuleTimelineText {
     val createdDate = Instant.ofEpochMilli(capsule.createdAt).atZone(zone).toLocalDate()
-    val sealedLine = "Sealed on ${DateFormats.formatDate(createdDate)} · unlocks after ${effectiveThreshold.trimZeros()}h together"
+    val sealedLine = "Sealed on ${DateFormats.formatDateLong(createdDate)} · unlocks after ${effectiveThreshold.trimZeros()}h together"
     val openedLine = capsule.unlockedAt?.let { unlockedAt ->
         val unlockedDate = Instant.ofEpochMilli(unlockedAt).atZone(zone).toLocalDate()
-        "Opened on ${DateFormats.formatDate(unlockedDate)}"
+        "Opened on ${DateFormats.formatDateLong(unlockedDate)}"
     }
     return CapsuleTimelineText(sealedLine, openedLine)
 }

@@ -31,14 +31,11 @@ object DateFormats {
      * dialog title) that want "Thursday, 20 08 2026" rather than the bare date. */
     val DATE_WITH_WEEKDAY: DateTimeFormatter = DateTimeFormatter.ofPattern("EEEE, dd MM yyyy", Locale.US)
 
-    /** BUG fix (user-reported): "20th August 2026" - a narrative/storytelling read for the handful of
-     * prominent, spacious contexts (StatsScreen's "Together since" card) where the compact numeric
-     * [DATE] pattern reads as a bare number with no obvious context ("20 08 2026"), unlike every other
-     * (much more compact) place [DATE] is used - badge unlock dates under a small tile, capsule
-     * countdowns, Moments timestamps - where a longer human-language date risks overflowing/wrapping in
-     * a way the numeric pattern doesn't. Deliberately a SEPARATE formatter, not a change to [DATE]
-     * itself: [DATE] is this app's established, deliberate, app-wide convention (see this object's own
-     * doc), used at 13+ call sites this fix does not touch. */
+    /** BUG fix (user-reported): "20th August 2026" - a narrative/storytelling read, originally added
+     * just for StatsScreen's "Together since" card, then (per an explicit follow-up user request to use
+     * this format "everywhere") rolled out to every other display date site in the app too. [DATE]
+     * itself is kept, not deleted, as the underlying day/month/year pattern [formatDateLong] is built
+     * from - see [formatDateLong]. */
     private val MONTH_YEAR: DateTimeFormatter = DateTimeFormatter.ofPattern("MMMM yyyy", Locale.US)
 
     /** The 12-hour clock convention already used by Calendar's day-detail dialog before this fix
@@ -65,10 +62,21 @@ object DateFormats {
 
     fun formatDateWithWeekday(date: LocalDate): String = date.format(DATE_WITH_WEEKDAY)
 
+    /** "Thursday, 20th August 2026" - [formatDateWithWeekday]'s long-form counterpart, for the same
+     * user-requested "everywhere" sweep that added [formatDateLong] itself. */
+    fun formatDateWithWeekdayLong(date: LocalDate): String {
+        val weekday = date.format(DateTimeFormatter.ofPattern("EEEE", Locale.US))
+        return "$weekday, ${formatDateLong(date)}"
+    }
+
     fun formatTime(time: LocalTime): String = time.format(TIME)
 
     /** "20 08 2026, 6:45 PM" - date + time together, for contexts that previously showed a combined
      * localized date-time (e.g. a Moment's full-screen capture timestamp). */
     fun formatDateTime(dateTime: LocalDateTime): String =
         "${dateTime.toLocalDate().format(DATE)}, ${dateTime.toLocalTime().format(TIME)}"
+
+    /** "20th August 2026, 6:45 PM" - [formatDateTime]'s long-form counterpart. */
+    fun formatDateTimeLong(dateTime: LocalDateTime): String =
+        "${formatDateLong(dateTime.toLocalDate())}, ${dateTime.toLocalTime().format(TIME)}"
 }

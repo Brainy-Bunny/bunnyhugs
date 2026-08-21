@@ -154,7 +154,7 @@ private fun GapRow(gap: GapInfo, zone: ZoneId, isLongest: Boolean) {
                     )
                 }
                 Text(
-                    "${DateFormats.formatDate(start)} – ${DateFormats.formatDate(end)}",
+                    "${DateFormats.formatDateLong(start)} – ${DateFormats.formatDateLong(end)}",
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.SemiBold
                 )

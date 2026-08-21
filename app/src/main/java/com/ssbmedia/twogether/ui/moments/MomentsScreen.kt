@@ -38,18 +38,23 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -128,6 +133,10 @@ fun MomentsScreen(
     // indicator below instead of the old static remote-stub placeholder while a transfer is in flight.
     val transferring by AppEvents.momentsTransferring.collectAsState()
     var selected by remember { mutableStateOf<Moment?>(null) }
+    // User-requested Google-Photos-style pinch-to-resize. rememberSaveable so rotating the device (or
+    // coming back from a Moment's fullscreen view) keeps the size the user picked, without the extra
+    // complexity of persisting it past this screen instance.
+    var thumbnailSizeDp by rememberSaveable { mutableFloatStateOf(100f) }
 
     val zone = remember { ZoneId.systemDefault() }
     val grouped = remember(moments) {
@@ -208,7 +217,27 @@ fun MomentsScreen(
         } else {
             LazyColumn(
                 state = listState,
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier
+                    .fillMaxSize()
+                    // Only reacts once a SECOND pointer joins (checked via event.changes.size >= 2)
+                    // rather than androidx.compose.foundation.gestures.detectTransformGestures, which
+                    // treats even a single-finger drag as a pan gesture and would consume it - stealing
+                    // the LazyColumn's own one-finger scroll. This way a normal scroll passes through
+                    // untouched and only an actual two-finger pinch resizes thumbnails.
+                    .pointerInput(Unit) {
+                        awaitEachGesture {
+                            do {
+                                val event = awaitPointerEvent()
+                                if (event.changes.size >= 2) {
+                                    val zoom = event.calculateZoom()
+                                    if (zoom != 1f) {
+                                        thumbnailSizeDp = (thumbnailSizeDp * zoom).coerceIn(64f, 160f)
+                                        event.changes.forEach { it.consume() }
+                                    }
+                                }
+                            } while (event.changes.any { it.pressed })
+                        }
+                    },
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
@@ -218,7 +247,7 @@ fun MomentsScreen(
                             // UX-FIX-PLAN.md Phase 3 item 20: the reverse of Calendar's day -> Moments
                             // link - tapping a day-group header jumps to that same date on Calendar.
                             Text(
-                                text = DateFormats.formatDate(day),
+                                text = DateFormats.formatDateLong(day),
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.SemiBold,
                                 modifier = Modifier
@@ -230,6 +259,7 @@ fun MomentsScreen(
                                     MomentThumbnail(
                                         moment = moment,
                                         isTransferring = moment.syncId in transferring,
+                                        size = thumbnailSizeDp.dp,
                                         onClick = { selected = moment }
                                     )
                                 }
@@ -264,7 +294,7 @@ fun MomentsScreen(
 }
 
 @Composable
-private fun MomentThumbnail(moment: Moment, isTransferring: Boolean, onClick: () -> Unit) {
+private fun MomentThumbnail(moment: Moment, isTransferring: Boolean, size: androidx.compose.ui.unit.Dp, onClick: () -> Unit) {
     // Feature 2: renders off photoDownloaded now (not isRemote) - a remote-stub moment whose photo
     // transfer has since completed correctly shows the real image here, not the placeholder forever. The
     // File(...).isFile check stays as a defensive belt-and-suspenders against the flag and disk disagreeing.
@@ -283,14 +313,14 @@ private fun MomentThumbnail(moment: Moment, isTransferring: Boolean, onClick: ()
             contentDescription = "Moment",
             contentScale = ContentScale.Crop,
             modifier = Modifier
-                .size(100.dp)
+                .size(size)
                 .clip(RoundedCornerShape(14.dp))
                 .clickable(onClick = onClick)
         )
     } else {
         Box(
             modifier = Modifier
-                .size(100.dp)
+                .size(size)
                 .clip(RoundedCornerShape(14.dp))
                 .background(MaterialTheme.colorScheme.surfaceVariant)
                 .clickable(onClick = onClick),
@@ -319,7 +349,7 @@ private fun MomentFullScreen(
 ) {
     val zone = remember { ZoneId.systemDefault() }
     val dateLabel = remember(moment.takenAt) {
-        DateFormats.formatDateTime(Instant.ofEpochMilli(moment.takenAt).atZone(zone).toLocalDateTime())
+        DateFormats.formatDateTimeLong(Instant.ofEpochMilli(moment.takenAt).atZone(zone).toLocalDateTime())
     }
     val hasLocalPhoto = remember(moment.photoUri, moment.photoDownloaded) { moment.photoDownloaded && File(moment.photoUri).isFile }
     var showDeleteConfirm by remember { mutableStateOf(false) }

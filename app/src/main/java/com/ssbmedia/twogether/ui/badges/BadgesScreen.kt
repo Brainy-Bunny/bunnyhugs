@@ -225,7 +225,7 @@ private fun BadgeCardContent(status: BadgeStatus, unlockDates: Map<String, Long>
                     Instant.ofEpochMilli(unlockedAt).atZone(ZoneId.systemDefault()).toLocalDate()
                 }
                 Text(
-                    text = "on ${DateFormats.formatDate(unlockedDate)}",
+                    text = "on ${DateFormats.formatDateLong(unlockedDate)}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 1.dp)

@@ -613,7 +613,7 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                     isBackingUp -> "Backing up…"
                     settings.lastBackupAt <= 0L -> "Never backed up yet — a weekly backup runs automatically"
                     else -> {
-                        val whenText = DateFormats.formatDateTime(
+                        val whenText = DateFormats.formatDateTimeLong(
                             Instant.ofEpochMilli(settings.lastBackupAt).atZone(ZoneId.systemDefault()).toLocalDateTime()
                         )
                         if (settings.lastBackupOk) "Last backup: $whenText" else "Last backup FAILED: $whenText"

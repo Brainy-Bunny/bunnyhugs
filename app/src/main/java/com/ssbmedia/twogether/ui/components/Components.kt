@@ -220,7 +220,7 @@ fun DatePickerField(
     var showPicker by remember { mutableStateOf(false) }
     Box(modifier = modifier) {
         OutlinedTextField(
-            value = DateFormats.formatDate(date),
+            value = DateFormats.formatDateLong(date),
             onValueChange = {},
             readOnly = true,
             enabled = enabled,

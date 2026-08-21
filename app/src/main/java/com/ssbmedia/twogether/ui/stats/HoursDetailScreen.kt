@@ -160,10 +160,10 @@ fun HoursDetailScreen(onBack: () -> Unit) {
                     val windowData = dailyHours.subList(bounds.first, bounds.last + 1)
                     Column {
                         val rangeLabel = if (windowData.size > 1) {
-                            "${DateFormats.formatDate(windowData.first().first)} – " +
-                                DateFormats.formatDate(windowData.last().first)
+                            "${DateFormats.formatDateLong(windowData.first().first)} – " +
+                                DateFormats.formatDateLong(windowData.last().first)
                         } else {
-                            DateFormats.formatDate(windowData.first().first)
+                            DateFormats.formatDateLong(windowData.first().first)
                         }
                         Text(rangeLabel, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
                         DailyHoursBarChart(windowData, modifier = Modifier.padding(top = 12.dp))

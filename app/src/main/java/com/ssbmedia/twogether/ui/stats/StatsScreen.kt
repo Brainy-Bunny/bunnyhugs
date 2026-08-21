@@ -275,7 +275,7 @@ fun StatsScreen(
                 }
                 stats.longestSingleDay?.let {
                     Text(
-                        text = "Longest day together was ${DateFormats.formatDate(it.date)}.",
+                        text = "Longest day together was ${DateFormats.formatDateLong(it.date)}.",
                         style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.padding(top = 8.dp)
                     )
@@ -291,7 +291,7 @@ fun StatsScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "Longest apart: ${"%.1f".format(Locale.US, gap.days)} days (${DateFormats.formatDate(start)} – ${DateFormats.formatDate(end)}).",
+                            text = "Longest apart: ${"%.1f".format(Locale.US, gap.days)} days (${DateFormats.formatDateLong(start)} – ${DateFormats.formatDateLong(end)}).",
                             style = MaterialTheme.typography.bodySmall,
                             modifier = Modifier.weight(1f)
                         )
