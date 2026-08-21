@@ -304,12 +304,23 @@ private fun MomentThumbnail(moment: Moment, isTransferring: Boolean, size: andro
     // (if usually small) jank risk an independent audit round flagged. produceState moves the actual
     // File.isFile check onto Dispatchers.IO, defaulting to `false` (the placeholder) for the one frame
     // before it resolves rather than blocking composition to get the real answer immediately.
-    val hasLocalPhoto by produceState(initialValue = false, moment.photoUri, moment.photoDownloaded) {
-        value = withContext(Dispatchers.IO) { moment.photoDownloaded && File(moment.photoUri).isFile }
+    // BUG fix (user-reported "rotated images are not saved"): also captures the file's mtime here
+    // (see PhotoEditor.cacheBustKey's own doc) so this grid thumbnail picks up an in-place rotate
+    // instead of continuing to show Coil's stale pre-rotate cached bitmap forever.
+    val localPhotoState by produceState(initialValue = false to 0L, moment.photoUri, moment.photoDownloaded) {
+        value = withContext(Dispatchers.IO) {
+            val exists = moment.photoDownloaded && File(moment.photoUri).isFile
+            exists to (if (exists) PhotoEditor.cacheBustKey(moment.photoUri) else 0L)
+        }
     }
+    val (hasLocalPhoto, cacheBustKey) = localPhotoState
     if (hasLocalPhoto) {
         AsyncImage(
-            model = moment.photoUri,
+            model = ImageRequest.Builder(LocalContext.current)
+                .data(moment.photoUri)
+                .memoryCacheKey("${moment.photoUri}:$cacheBustKey")
+                .diskCacheKey("${moment.photoUri}:$cacheBustKey")
+                .build(),
             contentDescription = "Moment",
             contentScale = ContentScale.Crop,
             modifier = Modifier
@@ -358,7 +369,16 @@ private fun MomentFullScreen(
     // User-requested rotate, same cache-busting need as CameraScreen's post-capture review - see
     // PhotoEditor.rotateInPlace's own doc for why this overwrites moment.photoUri's file content in
     // place (same path), and why that's a LOCAL-ONLY edit (doesn't reach an already-synced partner copy).
-    var photoRotateVersion by remember(moment.syncId) { mutableStateOf(0) }
+    //
+    // BUG fix (user-reported "rotated images are not saved"): this used to be a plain `Int` counter
+    // starting at 0 every time this screen recomposes fresh (remember(moment.syncId) resets on close +
+    // reopen) - so a rotate looked correct in THIS same open session (cache key went 0 -> 1), but Coil
+    // had already cached key "...:0" the FIRST time this photo was ever viewed, before any rotation -
+    // reopening the same photo later served that stale pre-rotate "...:0" entry right back. Seeding from
+    // the file's actual current mtime (see PhotoEditor.cacheBustKey's own doc) instead of a fixed 0 means
+    // the very first cache key already reflects whatever rotation state the file is ACTUALLY in, so a
+    // rotate from a prior session is never mistaken for the original orientation again.
+    var photoCacheBustKey by remember(moment.syncId) { mutableStateOf(PhotoEditor.cacheBustKey(moment.photoUri)) }
     var isRotating by remember { mutableStateOf(false) }
 
     // MINOR fix (independent review, live-observed on two devices): making this a sibling of THIS screen's
@@ -397,8 +417,8 @@ private fun MomentFullScreen(
                     AsyncImage(
                         model = ImageRequest.Builder(context)
                             .data(moment.photoUri)
-                            .memoryCacheKey("${moment.photoUri}:$photoRotateVersion")
-                            .diskCacheKey("${moment.photoUri}:$photoRotateVersion")
+                            .memoryCacheKey("${moment.photoUri}:$photoCacheBustKey")
+                            .diskCacheKey("${moment.photoUri}:$photoCacheBustKey")
                             .build(),
                         contentDescription = "Moment",
                         contentScale = ContentScale.Fit,
@@ -416,7 +436,10 @@ private fun MomentFullScreen(
                                     withContext(Dispatchers.IO) {
                                         PhotoEditor.rotateInPlace(File(moment.photoUri), 90f)
                                     }
-                                    photoRotateVersion++
+                                    // Re-read the file's own new mtime rather than just incrementing -
+                                    // see photoCacheBustKey's own doc for why a monotonic local counter
+                                    // isn't durable enough on its own to fix this across close/reopen.
+                                    photoCacheBustKey = PhotoEditor.cacheBustKey(moment.photoUri)
                                     isRotating = false
                                 }
                             },

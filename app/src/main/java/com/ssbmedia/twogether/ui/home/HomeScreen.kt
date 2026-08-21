@@ -81,6 +81,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.ssbmedia.twogether.BuildConfig
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.badges.BadgeCatalog
@@ -109,6 +110,7 @@ import com.ssbmedia.twogether.ui.components.SectionHeader
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
 import com.ssbmedia.twogether.util.BatteryOptimization
 import com.ssbmedia.twogether.util.DndAccess
+import com.ssbmedia.twogether.util.PhotoEditor
 import com.ssbmedia.twogether.util.RelativeTime
 import com.ssbmedia.twogether.ui.update.UpdateInstallActivity
 import java.io.File
@@ -1461,12 +1463,20 @@ private fun MemoryThrowbackCard(
                 val milestoneLabel = remember(moment, milestones) {
                     milestones.firstOrNull { it.linkedMomentSyncId == moment.syncId }?.label
                 }
+                // BUG fix (user-reported "rotated images are not saved"): see PhotoEditor.cacheBustKey's
+                // own doc - without this, a photo rotated from the Moments viewer kept showing its
+                // pre-rotate orientation here since Coil caches by photoUri alone.
+                val cacheBustKey = remember(moment.photoUri) { PhotoEditor.cacheBustKey(moment.photoUri) }
                 Row(
                     modifier = Modifier.fillMaxWidth().clickable(onClick = { onOpenMoments(momentEpochDay) }),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     AsyncImage(
-                        model = moment.photoUri,
+                        model = ImageRequest.Builder(LocalContext.current)
+                            .data(moment.photoUri)
+                            .memoryCacheKey("${moment.photoUri}:$cacheBustKey")
+                            .diskCacheKey("${moment.photoUri}:$cacheBustKey")
+                            .build(),
                         contentDescription = "Memory",
                         contentScale = ContentScale.Crop,
                         modifier = Modifier

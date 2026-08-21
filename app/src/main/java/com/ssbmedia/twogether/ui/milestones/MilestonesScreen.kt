@@ -64,6 +64,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.data.db.Milestone
 import com.ssbmedia.twogether.data.db.Moment
@@ -71,6 +72,7 @@ import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.notif.MilestoneAlarmScheduler
 import com.ssbmedia.twogether.ui.components.EmptyState
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import com.ssbmedia.twogether.util.PhotoEditor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -475,8 +477,15 @@ private fun MomentPhotoPicker(availableMoments: List<Moment>, selectedMomentSync
             // border, so a screen reader announced N indistinguishable buttons with no selected state.
             // `selectable` reports the selected state to accessibility services itself; the index-based
             // description at least distinguishes which photo is which.
+            // BUG fix (user-reported "rotated images are not saved"): see PhotoEditor.cacheBustKey's
+            // own doc - without this, a rotate from the Moments viewer kept showing pre-rotate bytes here.
+            val cacheBustKey = remember(moment.photoUri) { PhotoEditor.cacheBustKey(moment.photoUri) }
             AsyncImage(
-                model = moment.photoUri,
+                model = ImageRequest.Builder(LocalContext.current)
+                    .data(moment.photoUri)
+                    .memoryCacheKey("${moment.photoUri}:$cacheBustKey")
+                    .diskCacheKey("${moment.photoUri}:$cacheBustKey")
+                    .build(),
                 contentDescription = "Photo ${index + 1} of ${availableMoments.size}",
                 contentScale = ContentScale.Crop,
                 modifier = Modifier
@@ -723,9 +732,16 @@ private fun MilestoneRetrospective(
                             // this fix, a successfully-downloaded partner photo showed the placeholder
                             // here while rendering correctly in the Moments gallery.
                             val hasLocalPhoto = remember(moment.photoUri, moment.photoDownloaded) { moment.photoDownloaded && File(moment.photoUri).isFile }
+                            // BUG fix (user-reported "rotated images are not saved"): see
+                            // PhotoEditor.cacheBustKey's own doc.
+                            val cacheBustKey = remember(moment.photoUri) { PhotoEditor.cacheBustKey(moment.photoUri) }
                             if (hasLocalPhoto) {
                                 AsyncImage(
-                                    model = moment.photoUri,
+                                    model = ImageRequest.Builder(LocalContext.current)
+                                        .data(moment.photoUri)
+                                        .memoryCacheKey("${moment.photoUri}:$cacheBustKey")
+                                        .diskCacheKey("${moment.photoUri}:$cacheBustKey")
+                                        .build(),
                                     contentDescription = "Moment from $year",
                                     contentScale = ContentScale.Crop,
                                     modifier = Modifier.size(96.dp).clip(RoundedCornerShape(12.dp))
