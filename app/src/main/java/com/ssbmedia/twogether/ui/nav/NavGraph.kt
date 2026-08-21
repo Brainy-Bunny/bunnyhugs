@@ -56,8 +56,12 @@ fun TwogetherNavHost(
     // Notifications.EXTRA_OPEN_LIST_ID's own doc. Mirrors openMilestoneId exactly, including the
     // latch-then-navigate-then-consume shape below.
     openListId: String? = null,
+    // User-requested (capsule-unlock notification): mirrors cameraTrigger's own Int-counter shape - see
+    // MainActivity's capsulesTrigger doc for why this is a counter, not a string-id, param.
+    capsulesTrigger: Int = 0,
     onCameraTriggerConsumed: () -> Unit = {},
     onMilestoneIdConsumed: () -> Unit = {},
+    onCapsulesTriggerConsumed: () -> Unit = {},
     // Item 16 (camera overhaul), point 5: MainActivity's dispatchKeyEvent is a plain Activity method, not
     // a composable, so it can't read NavController state directly - it needs a plain boolean flag telling
     // it whether volume-key presses should be routed to the camera shutter (see AppEvents.
@@ -105,6 +109,16 @@ fun TwogetherNavHost(
         if (cameraTrigger > 0) {
             navController.navigate(Screen.Camera.route) { launchSingleTop = true }
             onCameraTriggerConsumed()
+        }
+    }
+
+    // User-requested (capsule-unlock notification): same shape as cameraTrigger's own LaunchedEffect
+    // just above - no latch needed (unlike openMilestoneId/openListId below), since Screen.Capsules
+    // takes no id/args to lose in the navigate()-is-async gap those two have to work around.
+    LaunchedEffect(capsulesTrigger) {
+        if (capsulesTrigger > 0) {
+            navController.navigate(Screen.Capsules.route) { launchSingleTop = true }
+            onCapsulesTriggerConsumed()
         }
     }
 

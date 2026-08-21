@@ -452,7 +452,13 @@ class ProximityForegroundService : LifecycleService() {
                 lastSeenAt = stateMachine.lastSeenAt,
                 absenceTimeoutMillis = stateMachine.absenceTimeoutMillis
             )
-            ServiceLocator.timeCapsuleRepository.unlockEligible(stats.totalHoursAllTime.toFloat(), manualCredit)
+            // User-requested: fires a notification per capsule THIS call actually unlocked - see
+            // Notifications.showCapsuleUnlockedNotification's own doc for why this fires here rather
+            // than only when the Capsules screen happens to be open.
+            val newlyUnlockedCapsules = ServiceLocator.timeCapsuleRepository.unlockEligible(stats.totalHoursAllTime.toFloat(), manualCredit)
+            newlyUnlockedCapsules.forEach { capsule ->
+                Notifications.showCapsuleUnlockedNotification(this, capsule.id)
+            }
 
             // Item 15 (UX-FIX-PLAN.md): record each newly-unlocked badge's timestamp right here, in the
             // background tick, rather than only when the user happens to have the Badges screen open (the

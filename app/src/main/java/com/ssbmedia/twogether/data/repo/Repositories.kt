@@ -441,9 +441,18 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
      * unlockAtHours - an honest-case bug (unlock arriving early) with the same root cause, closed by the
      * same clamp.
      */
-    suspend fun unlockEligible(totalHours: Float, currentManualHoursCredit: Float) {
+    /** User-requested: returns whichever of [locked]'s capsules this call actually unlocked, so the
+     * caller (ProximityForegroundService) can fire a "Time Capsule unlocked!" notification per capsule -
+     * see Notifications.showCapsuleUnlockedNotification's own doc. Only ever reports a capsule as
+     * newly-unlocked if THIS call is the one that flips it (dao.unlockIfNotDeleted's own
+     * `unlockedAt IS NULL` condition already guards against double-unlocking; mirroring that guard here
+     * in Kotlin too, rather than trusting the passed-in [locked] snapshot alone, means a capsule that
+     * lost the race against a concurrent delete is never reported as unlocked when it didn't actually
+     * unlock at all). */
+    suspend fun unlockEligible(totalHours: Float, currentManualHoursCredit: Float): List<TimeCapsule> {
         val locked = dao.getLocked()
         val now = System.currentTimeMillis()
+        val newlyUnlocked = mutableListOf<TimeCapsule>()
         locked.forEach { capsule ->
             if (effectiveThreshold(capsule, currentManualHoursCredit) <= totalHours) {
                 // updatedAt bumped too (Feature: Time Capsule sync) - otherwise a local-only unlock would
@@ -454,9 +463,12 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
                 // MINOR fix (test-code-allmodels, Fable): was a plain dao.update(capsule.copy(...)) - a
                 // stale-read full-row overwrite. See unlockIfNotDeleted's own doc for the race this
                 // closes.
-                dao.unlockIfNotDeleted(capsule.id, unlockedAt = now, updatedAt = now)
+                if (dao.unlockIfNotDeleted(capsule.id, unlockedAt = now, updatedAt = now) > 0) {
+                    newlyUnlocked.add(capsule.copy(unlockedAt = now, updatedAt = now))
+                }
             }
         }
+        return newlyUnlocked
     }
 
     /** Feature: Time Capsule sync. Union+STICKY-tombstone merge by [TimeCapsule.syncId], mirroring

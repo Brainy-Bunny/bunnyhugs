@@ -259,8 +259,12 @@ class UltimateReviewRound2SpecTest {
             override suspend fun getLocked() = listOf(row)
             // Mirrors the real WHERE-guarded SQL: only mutates if the id matches AND the row isn't
             // (already) tombstoned - same semantics unlockEligible's own production caller relies on.
-            override suspend fun unlockIfNotDeleted(id: Long, unlockedAt: Long, updatedAt: Long) {
-                if (row.id == id && !row.deleted) row = row.copy(unlockedAt = unlockedAt, updatedAt = updatedAt)
+            override suspend fun unlockIfNotDeleted(id: Long, unlockedAt: Long, updatedAt: Long): Int {
+                if (row.id == id && !row.deleted) {
+                    row = row.copy(unlockedAt = unlockedAt, updatedAt = updatedAt)
+                    return 1
+                }
+                return 0
             }
             override suspend fun tombstone(id: Long, updatedAt: Long) = throw NotImplementedError("not used by this helper")
             override suspend fun tombstoneIfLocked(id: Long, updatedAt: Long) = throw NotImplementedError("not used by this helper")

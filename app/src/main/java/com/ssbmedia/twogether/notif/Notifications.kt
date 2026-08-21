@@ -102,6 +102,12 @@ object Notifications {
      * milestone range, while staying safely inside Int's positive range (~2.1 billion). */
     const val LIST_REMINDER_NOTIFICATION_ID_BASE = 300_000_000
 
+    /** User-requested: "unlocked with a bang" - per-capsule hashed ID (same shape as
+     * MILESTONE_NOTIFICATION_ID_BASE/LIST_REMINDER_NOTIFICATION_ID_BASE above) so multiple capsules
+     * unlocking doesn't have one notification silently overwrite another's. Well clear of
+     * LIST_REMINDER_NOTIFICATION_ID_BASE's own 0x0FFFFFFF-masked range (up to ~568 million). */
+    const val CAPSULE_UNLOCKED_NOTIFICATION_ID_BASE = 700_000_000
+
     const val EXTRA_OPEN_CAMERA = "open_camera"
     /** Feature F: carries which milestone to open the "throughout the years" retrospective for, when the
      * user taps a milestone's yearly notification - mirrors EXTRA_OPEN_CAMERA's pattern. */
@@ -111,6 +117,11 @@ object Notifications {
      * Used for BOTH showListItemReminder (opens the ITEM's owning list) and showListReminder (opens the
      * list itself), since "Our Lists" has no separate per-item destination to deep-link to. */
     const val EXTRA_OPEN_LIST_ID = "open_list_id"
+    /** User-requested: carries no id (unlike EXTRA_OPEN_MILESTONE_ID/EXTRA_OPEN_LIST_ID) - Time Capsules
+     * has no per-capsule detail destination to deep-link to, just the one flat Capsules screen, so a
+     * plain boolean-style "open this screen" extra (mirroring EXTRA_OPEN_CAMERA's own shape, not the
+     * string-id shape) is all that's needed. */
+    const val EXTRA_OPEN_CAPSULES = "open_capsules"
 
     fun ensureChannels(context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -357,6 +368,46 @@ object Notifications {
             .build()
 
         manager.notify(MILESTONE_NOTIFICATION_ID_BASE + (milestoneId.hashCode() and 0x0FFFFFFF), notification)
+        return true
+    }
+
+    /** User-requested ("unlocked with a bang... this is an obvious feature"): fired from
+     * ProximityForegroundService's own periodic tick, right where TimeCapsuleRepository.unlockEligible
+     * already runs continuously in the background - so this fires close to the real unlock moment
+     * regardless of whether anyone has the Capsules screen open, exactly like the milestone/badge
+     * background checks right beside it. CHANNEL_REMINDERS (not the quieter CHANNEL_MILESTONES) - the
+     * "with a bang" ask specifically wants this noticed, and REMINDERS is this app's one
+     * setBypassDnd(true)-capable, IMPORTANCE_HIGH channel (see its own doc).
+     *
+     * PRIVACY: deliberately does NOT include the capsule's own [TimeCapsule.text] anywhere in the
+     * notification - a capsule's whole point is a private message that stays sealed until its own
+     * unlock moment; putting its content into a notification would put it on the lock screen and
+     * notification shade for anyone glancing at the phone, defeating that. Generic content, tap opens
+     * Capsules (see EXTRA_OPEN_CAPSULES's own doc) where the user reads it deliberately. */
+    fun showCapsuleUnlockedNotification(context: Context, capsuleId: Long): Boolean {
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return false
+        if (!BlePermissions.hasNotificationPermission(context)) return false
+
+        val openIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(EXTRA_OPEN_CAPSULES, true)
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            context, capsuleId.hashCode(), openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_REMINDERS)
+            .setSmallIcon(R.drawable.ic_notification_heart)
+            .setContentTitle("A Time Capsule just unlocked! 🎉")
+            .setContentText("Tap to read what you wrote to each other")
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_EVENT)
+            .build()
+
+        manager.notify(CAPSULE_UNLOCKED_NOTIFICATION_ID_BASE + (capsuleId.hashCode() and 0x0FFFFFFF), notification)
         return true
     }
 

@@ -55,6 +55,10 @@ class MainActivity : FragmentActivity() {
     // Item 24 (UX-FIX-PLAN.md): mirrors milestoneTrigger's own pattern exactly - see NavGraph's
     // openListId doc for the full latch-then-consume story.
     private val listIdTrigger = mutableStateOf<String?>(null)
+    // User-requested (capsule-unlock notification): mirrors cameraTrigger's own Int-counter shape, not
+    // milestoneTrigger/listIdTrigger's string-id shape - Time Capsules has no per-item destination to
+    // deep-link to, just the one flat Capsules screen, so there's no id payload to carry.
+    private val capsulesTrigger = mutableIntStateOf(0)
 
     // Item 16 (camera overhaul), point 5: kept as a plain (non-Compose-state) field, not a State<Boolean>
     // - it's only ever read from dispatchKeyEvent below, a regular Activity method that runs completely
@@ -80,6 +84,9 @@ class MainActivity : FragmentActivity() {
         }
         intent?.getStringExtra(Notifications.EXTRA_OPEN_MILESTONE_ID)?.let { milestoneTrigger.value = it }
         intent?.getStringExtra(Notifications.EXTRA_OPEN_LIST_ID)?.let { listIdTrigger.value = it }
+        if (intent?.getBooleanExtra(Notifications.EXTRA_OPEN_CAPSULES, false) == true) {
+            capsulesTrigger.intValue++
+        }
 
         setContent {
             // Hoisted ABOVE TwogetherTheme (rather than loaded inside its content, like pairingInfo
@@ -130,6 +137,7 @@ class MainActivity : FragmentActivity() {
                     val trigger by cameraTrigger
                     val milestoneId by milestoneTrigger
                     val listId by listIdTrigger
+                    val capsulesTriggerValue by capsulesTrigger
 
                     LaunchedEffect(Unit) {
                         ServiceLocator.pairingStore.info.collect { pairingInfo = it }
@@ -183,6 +191,7 @@ class MainActivity : FragmentActivity() {
                             onUnpaired = { stopProximityService() },
                             openMilestoneId = milestoneId,
                             openListId = listId,
+                            capsulesTrigger = capsulesTriggerValue,
                             // BUG fix: an independent review round found this fix (clearing the
                             // in-memory trigger state) was incomplete - onCreate re-reads these same
                             // extras from `intent` on EVERY Activity recreation, including a plain
@@ -206,6 +215,11 @@ class MainActivity : FragmentActivity() {
                             onListIdConsumed = {
                                 listIdTrigger.value = null
                                 intent?.removeExtra(Notifications.EXTRA_OPEN_LIST_ID)
+                            },
+                            // Same removeExtra()-on-consume reasoning as onCameraTriggerConsumed above.
+                            onCapsulesTriggerConsumed = {
+                                capsulesTrigger.intValue = 0
+                                intent?.removeExtra(Notifications.EXTRA_OPEN_CAPSULES)
                             }
                         )
                     }
@@ -244,6 +258,9 @@ class MainActivity : FragmentActivity() {
         }
         intent.getStringExtra(Notifications.EXTRA_OPEN_MILESTONE_ID)?.let { milestoneTrigger.value = it }
         intent.getStringExtra(Notifications.EXTRA_OPEN_LIST_ID)?.let { listIdTrigger.value = it }
+        if (intent.getBooleanExtra(Notifications.EXTRA_OPEN_CAPSULES, false)) {
+            capsulesTrigger.intValue += 1
+        }
     }
 
     private fun startProximityService() {

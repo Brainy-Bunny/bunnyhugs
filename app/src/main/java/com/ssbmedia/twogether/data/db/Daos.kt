@@ -99,8 +99,13 @@ interface TimeCapsuleDao {
      * tombstone that landed after the read but before this executes correctly makes the row not match
      * and the unlock silently (and correctly) doesn't happen - the next `unlockEligible` pass on a
      * still-eligible, still-active capsule would unlock it normally regardless. */
+    // User-requested (capsule-unlock notification): now returns the affected row count (Room supports
+    // this natively for an @Query UPDATE, no query-shape change needed) so TimeCapsuleRepository.
+    // unlockEligible can tell whether THIS call actually won the row - see its own doc for why that
+    // matters (the tiny concurrent-delete race this WHERE clause already guards against was previously
+    // invisible to the caller, which had no way to distinguish "unlocked" from "lost the race").
     @Query("UPDATE time_capsules SET unlockedAt = :unlockedAt, updatedAt = :updatedAt WHERE id = :id AND deleted = 0")
-    suspend fun unlockIfNotDeleted(id: Long, unlockedAt: Long, updatedAt: Long)
+    suspend fun unlockIfNotDeleted(id: Long, unlockedAt: Long, updatedAt: Long): Int
 
     /** MINOR fix (code-review, Sonnet - same race class as [unlockIfNotDeleted], one call site over):
      * TimeCapsuleRepository.delete()/mergeRemote's tombstone-apply branch used to read a capsule then
