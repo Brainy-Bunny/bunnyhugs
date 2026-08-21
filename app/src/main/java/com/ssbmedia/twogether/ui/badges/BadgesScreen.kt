@@ -199,9 +199,21 @@ fun BadgesScreen(
  * instance can't conditionally take an onClick) render identically. */
 @Composable
 private fun BadgeCardContent(status: BadgeStatus, unlockDates: Map<String, Long>) {
+    // BUG fix (user-reported), take 3: the previous fix aligned the progress line's OWN position
+    // consistently regardless of title length (Box.heightIn below), but left this Column - which has
+    // no fillMaxHeight/verticalArrangement, so it just wraps its own content height - top-anchored
+    // inside whatever taller height a row's tallest sibling forces onto this Card (IntrinsicSize.Max on
+    // the parent Row). A card with genuinely shorter content (e.g. "7 Day Streak", 1-line title) than
+    // its row-mate (e.g. "500 Hours Together", 2-line title) ended up with its icon/title/progress
+    // cluster sitting at the top and a dead gap below it, rather than looking vertically centered like
+    // the taller card (whose content happens to already fill its own height). fillMaxHeight +
+    // Arrangement.Center makes every card's content block centered in whatever height the row ends up
+    // at, so a shorter card's extra space splits evenly above/below instead of all collecting at the
+    // bottom.
     Column(
-        modifier = Modifier.padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+        modifier = Modifier.padding(16.dp).fillMaxHeight(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
     ) {
         Text(
             text = status.badge.emoji,
