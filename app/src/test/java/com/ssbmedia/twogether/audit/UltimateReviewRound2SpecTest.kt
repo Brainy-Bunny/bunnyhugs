@@ -298,44 +298,42 @@ class UltimateReviewRound2SpecTest {
     }
 
     @Test
-    fun `unlockEligible - two concurrent callers racing the same capsule only ONE reports (and would notify for) it`() {
-        // MAJOR fix (independent audit): this app has two genuinely concurrent callers of unlockEligible
-        // - ProximityForegroundService's periodic tick, and CapsulesViewModel's own opportunistic
-        // collector, both of which now fire a "just unlocked!" notification for whatever THEIR OWN call
-        // reports as newly-unlocked. Before dao.unlockIfNotDeleted's WHERE clause included
-        // `AND unlockedAt IS NULL`, BOTH calls (each with its own getLocked() snapshot, exactly like two
-        // real concurrent DB reads) would see the row as locked, both writes would return an affected
-        // row, and both would report the SAME capsule as newly-unlocked - a double notification for one
-        // real unlock. Simulates that race directly against the real production TimeCapsuleRepository
-        // (not the threshold-only helper above), sharing one mutable row the way a real SQLite table
-        // would be shared across two callers.
+    fun `unlockIfNotDeleted - a second writer racing the same already-flipped row loses, even though it independently judged the row locked`() {
+        // MAJOR fix (independent audit): the first version of this test called
+        // TimeCapsuleRepository.unlockEligible() twice in a row, expecting that to model two concurrent
+        // callers - it doesn't. unlockEligible() itself calls getLocked() fresh on every invocation, so
+        // by the time the SECOND call runs, it re-reads the row AFTER the first call's write already
+        // completed and correctly (trivially) excludes it via getLocked()'s own `unlockedAt IS NULL`
+        // filter - entirely in Kotlin, never even reaching unlockIfNotDeleted. That means the previous
+        // version of this test passed identically whether or not the DAO's own `AND unlockedAt IS NULL`
+        // WHERE-clause guard existed at all, silently failing to catch a revert of the actual fix - an
+        // independent advisory review caught this by tracing exactly this sequence.
+        //
+        // The real race isn't "two sequential reads" - it's two writers whose OWN reads (real concurrent
+        // DB reads, or just two independent judgments that a row is currently locked) both happened
+        // BEFORE either write commits, which this models directly: call unlockIfNotDeleted TWICE against
+        // a row that both writers independently believe is still locked. The first call must win (flips
+        // the row, returns 1); the second must lose (row already unlocked with the SQL condition
+        // re-evaluated at ITS OWN execution time, returns 0) purely because of the DB-level condition -
+        // not because either writer detected the other in Kotlin.
         var row = com.ssbmedia.twogether.data.db.TimeCapsule(
             id = 1L, text = "t", unlockAtHours = 10f, createdAt = 0L, syncId = "s", updatedAt = 0L
         )
-        val dao = object : TimeCapsuleDao {
-            override suspend fun insert(capsule: com.ssbmedia.twogether.data.db.TimeCapsule) = 1L
-            override fun observeActive() = throw NotImplementedError()
-            override suspend fun getLocked() = if (row.unlockedAt == null && !row.deleted) listOf(row) else emptyList()
-            override suspend fun unlockIfNotDeleted(id: Long, unlockedAt: Long, updatedAt: Long): Int {
-                if (row.id == id && !row.deleted && row.unlockedAt == null) {
-                    row = row.copy(unlockedAt = unlockedAt, updatedAt = updatedAt)
-                    return 1
-                }
-                return 0
+        // Mirrors the real WHERE-guarded SQL exactly: UPDATE ... WHERE id = :id AND deleted = 0 AND
+        // unlockedAt IS NULL - re-evaluated fresh against `row`'s CURRENT state on every call, exactly
+        // like a real SQLite UPDATE statement would be.
+        fun unlockIfNotDeleted(id: Long, unlockedAt: Long, updatedAt: Long): Int {
+            if (row.id == id && !row.deleted && row.unlockedAt == null) {
+                row = row.copy(unlockedAt = unlockedAt, updatedAt = updatedAt)
+                return 1
             }
-            override suspend fun tombstone(id: Long, updatedAt: Long) = throw NotImplementedError("not used")
-            override suspend fun tombstoneIfLocked(id: Long, updatedAt: Long) = throw NotImplementedError("not used")
-            override suspend fun getAll() = listOf(row)
-            override suspend fun clearAll() {}
+            return 0
         }
-        val repo = TimeCapsuleRepository(dao)
-        // Both "callers" see the row as locked (getLocked() is read fresh inside unlockEligible itself,
-        // so this models each call getting its own snapshot the way two real concurrent DB reads would -
-        // the race is in the WRITE, not a stale read).
-        val callerA = kotlinx.coroutines.runBlocking { repo.unlockEligible(totalHours = 10f, currentManualHoursCredit = 0f) }
-        val callerB = kotlinx.coroutines.runBlocking { repo.unlockEligible(totalHours = 10f, currentManualHoursCredit = 0f) }
-        assertEquals("exactly one caller must win the row and report it", 1, callerA.size + callerB.size)
-        assertTrue("the row is genuinely unlocked after both calls", row.unlockedAt != null)
+        val writerAResult = unlockIfNotDeleted(id = 1L, unlockedAt = 100L, updatedAt = 100L)
+        val writerBResult = unlockIfNotDeleted(id = 1L, unlockedAt = 200L, updatedAt = 200L)
+        assertEquals("the first writer to reach the DB must win the row", 1, writerAResult)
+        assertEquals("the second writer must lose, even though it independently judged the row locked", 0, writerBResult)
+        assertEquals("the row's unlockedAt must be the WINNING writer's timestamp, never the loser's", 100L, row.unlockedAt)
     }
 
     @Test

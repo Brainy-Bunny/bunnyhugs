@@ -103,7 +103,18 @@ object PhotoEditor {
                         // there's no path here that can truncate the real file and then throw - a
                         // failed rename just falls through to the catch below with the real file still
                         // fully intact.
-                        tempFile.renameTo(file)
+                        //
+                        // MINOR fix (advisory review): renameTo returning false (fails without
+                        // throwing) used to fall straight through as this branch's whole result with no
+                        // cleanup - unlike the !encodedOk branch right above and the catch block right
+                        // below, this specific path left tempFile orphaned on disk. Explicit cleanup on
+                        // that outcome too.
+                        if (tempFile.renameTo(file)) {
+                            true
+                        } else {
+                            tempFile.delete()
+                            false
+                        }
                     }
                 } catch (e: Exception) {
                     tempFile.delete()

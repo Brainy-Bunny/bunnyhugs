@@ -58,7 +58,9 @@ class MilestoneMatchesDayTest {
     }
 
     @Test
-    fun `a corrupted day-for-month milestone does not throw, and matches nothing`() {
+    // MINOR fix (advisory review): renamed - the assertions correctly check the clamped match (Feb 28),
+    // but the old name claimed "matches nothing", which was never what this test actually asserted.
+    fun `a corrupted day-for-month milestone does not throw, and matches its clamped-to-valid day instead`() {
         // month=2, day=31 - MonthDay.of(2, 31) would throw DateTimeException; safeDateForYear clamps
         // day=31 down to February's real max (28 or 29), so this becomes an ordinary Feb 28/29 milestone
         // rather than crashing the screen.

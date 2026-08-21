@@ -859,11 +859,19 @@ object BackupManager {
             // point forward. lastSeenAt/reunionCount default to their documented safe fallbacks (0L / 0) -
             // there's no live proximity state to read immediately after a restore, and StatsCalculator.
             // compute's own doc says 0L still correctly clamps rather than running unclamped.
-            run {
+            // MINOR fix (advisory review): wrapped in its own try/catch, separate from this whole
+            // function's one outer catch(Exception) (which reports "Restore failed: ..."). Without this,
+            // a throw from this catch-up call - however unlikely - would report a restore whose DB
+            // writes have ALREADY fully committed as a failure, misleading the user into re-attempting a
+            // restore that already succeeded. Worst case now is simply the notification-storm bug this
+            // call exists to prevent, not a false "failed" report on a real success.
+            try {
                 val restoredSessions = db.sessionDao().getAll()
                 val restoredManualCredit = com.ssbmedia.twogether.stats.StatsCalculator.manualHoursCredit(restoredSessions)
                 val restoredTotalHours = com.ssbmedia.twogether.stats.StatsCalculator.compute(restoredSessions).totalHoursAllTime.toFloat()
                 ServiceLocator.timeCapsuleRepository.unlockEligible(restoredTotalHours, restoredManualCredit)
+            } catch (e: Exception) {
+                Log.w(TAG, "Post-restore capsule-unlock catch-up failed - a genuinely new unlock may briefly double-notify next time, not a restore failure", e)
             }
 
             // SECURITY: secretHash/plainCode/lastSecretHash/lastPlainCode/pinHash are deliberately NEVER
