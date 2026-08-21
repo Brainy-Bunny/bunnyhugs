@@ -1,5 +1,6 @@
 package com.ssbmedia.twogether.ui.dateideas
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -29,8 +30,11 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SwipeToDismissBox
+import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -639,6 +643,17 @@ private fun ListCategoryCard(
 }
 
 @Composable
+// User-requested redesign: "Tap to Edit and Slide left to delete (confirm before deleting) - that's
+// more intuitive." Swipe-left reveals a delete background and, on release, triggers the SAME
+// confirmation dialog the old trash icon already used (onDelete -> pendingDelete -> the existing
+// AlertDialog at this screen's own call site - no new confirmation mechanism needed). confirmValueChange
+// always returns false for EndToStart, so the row visually snaps back immediately rather than staying
+// "open" - the confirmation dialog is the real gate, not the swipe gesture itself. Tapping the row's
+// text/label area now opens Edit directly (replacing the old separate pencil icon); the Checkbox keeps
+// its own independent tap-to-toggle-complete behavior, and SwipeToDismissBox's own gesture arbitration
+// already distinguishes a horizontal swipe from a tap on either child, so no custom disambiguation is
+// needed. The reminder bell stays a separate icon - a third action doesn't fit a binary tap/swipe split.
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 private fun DateIdeaRow(
     idea: DateIdea,
     onToggle: () -> Unit,
@@ -647,42 +662,62 @@ private fun DateIdeaRow(
     onReminderClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Card(
+    val dismissState = rememberSwipeToDismissBoxState(
+        confirmValueChange = { value ->
+            if (value == SwipeToDismissBoxValue.EndToStart) onDelete()
+            false
+        }
+    )
+    SwipeToDismissBox(
+        state = dismissState,
         modifier = modifier,
-        shape = MaterialTheme.shapes.large,
-        colors = CardDefaults.cardColors(
-            containerColor = if (idea.done) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.secondaryContainer
-        )
+        enableDismissFromStartToEnd = false,
+        backgroundContent = {
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(MaterialTheme.shapes.large)
+                    .background(MaterialTheme.colorScheme.errorContainer)
+                    .padding(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Filled.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.onErrorContainer)
+            }
+        }
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
+        Card(
+            shape = MaterialTheme.shapes.large,
+            colors = CardDefaults.cardColors(
+                containerColor = if (idea.done) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.secondaryContainer
+            )
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
-                Checkbox(checked = idea.done, onCheckedChange = { onToggle() })
-                Text(
-                    text = idea.text,
-                    textDecoration = if (idea.done) TextDecoration.LineThrough else null,
-                    style = MaterialTheme.typography.bodyLarge
-                )
-            }
-            // UX-FIX-PLAN.md Phase 3 item 19: rename affordance alongside the existing delete one.
-            IconButton(onClick = onRename) {
-                Icon(Icons.Filled.Edit, contentDescription = "Rename idea")
-            }
-            // Item 24 (UX-FIX-PLAN.md): "remind me about this specific idea X minutes after we're
-            // together" - tinted primary when set, same visual convention as the list-level reminder
-            // icon in ListCategoryCard's header.
-            IconButton(onClick = onReminderClick) {
-                Icon(
-                    Icons.Filled.Notifications,
-                    contentDescription = if (idea.remindAfterTogetherMinutes != null) "Reminder set - tap to change" else "Set a reminder for this idea",
-                    tint = if (idea.remindAfterTogetherMinutes != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            IconButton(onClick = onDelete) {
-                Icon(Icons.Filled.Delete, contentDescription = "Delete")
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f).clickable(onClick = onRename)
+                ) {
+                    Checkbox(checked = idea.done, onCheckedChange = { onToggle() })
+                    Text(
+                        text = idea.text,
+                        textDecoration = if (idea.done) TextDecoration.LineThrough else null,
+                        style = MaterialTheme.typography.bodyLarge
+                    )
+                }
+                // Item 24 (UX-FIX-PLAN.md): "remind me about this specific idea X minutes after we're
+                // together" - tinted primary when set, same visual convention as the list-level reminder
+                // icon in ListCategoryCard's header.
+                IconButton(onClick = onReminderClick) {
+                    Icon(
+                        Icons.Filled.Notifications,
+                        contentDescription = if (idea.remindAfterTogetherMinutes != null) "Reminder set - tap to change" else "Set a reminder for this idea",
+                        tint = if (idea.remindAfterTogetherMinutes != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
         }
     }
