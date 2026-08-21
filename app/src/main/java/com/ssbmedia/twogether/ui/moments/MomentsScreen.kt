@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -22,6 +23,7 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -49,6 +51,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -57,12 +60,14 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.data.db.Moment
 import com.ssbmedia.twogether.data.db.MomentNote
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.ui.components.EmptyState
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
+import com.ssbmedia.twogether.util.PhotoEditor
 import com.ssbmedia.twogether.util.DateFormats
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.SharingStarted
@@ -318,6 +323,13 @@ private fun MomentFullScreen(
     }
     val hasLocalPhoto = remember(moment.photoUri, moment.photoDownloaded) { moment.photoDownloaded && File(moment.photoUri).isFile }
     var showDeleteConfirm by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    // User-requested rotate, same cache-busting need as CameraScreen's post-capture review - see
+    // PhotoEditor.rotateInPlace's own doc for why this overwrites moment.photoUri's file content in
+    // place (same path), and why that's a LOCAL-ONLY edit (doesn't reach an already-synced partner copy).
+    var photoRotateVersion by remember(moment.syncId) { mutableStateOf(0) }
+    var isRotating by remember { mutableStateOf(false) }
 
     // MINOR fix (independent review, live-observed on two devices): making this a sibling of THIS screen's
     // Scaffold (the previous fix, see the comment at the call site) correctly covered this screen's own top
@@ -351,12 +363,47 @@ private fun MomentFullScreen(
         ) {
             androidx.compose.foundation.layout.Spacer(modifier = Modifier.padding(top = 32.dp))
             if (hasLocalPhoto) {
-                AsyncImage(
-                    model = moment.photoUri,
-                    contentDescription = "Moment",
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxWidth().aspectRatio(1f)
-                )
+                Box(modifier = Modifier.fillMaxWidth().aspectRatio(1f)) {
+                    AsyncImage(
+                        model = ImageRequest.Builder(context)
+                            .data(moment.photoUri)
+                            .memoryCacheKey("${moment.photoUri}:$photoRotateVersion")
+                            .diskCacheKey("${moment.photoUri}:$photoRotateVersion")
+                            .build(),
+                        contentDescription = "Moment",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                    if (isRotating) {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator(color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.85f))
+                        }
+                    } else {
+                        IconButton(
+                            onClick = {
+                                isRotating = true
+                                coroutineScope.launch {
+                                    withContext(Dispatchers.IO) {
+                                        PhotoEditor.rotateInPlace(File(moment.photoUri), 90f)
+                                    }
+                                    photoRotateVersion++
+                                    isRotating = false
+                                }
+                            },
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(8.dp)
+                                // Same scrim CameraScreen's rotate button uses (see its own doc) - the
+                                // icon can sit over a light region of the photo itself, not just a
+                                // guaranteed-dark backdrop, so a plain white icon alone risks being
+                                // unreadable depending on what's directly behind it.
+                                .size(40.dp)
+                                .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.4f), CircleShape)
+                        ) {
+                            Icon(Icons.Filled.RotateRight, contentDescription = "Rotate photo", tint = androidx.compose.ui.graphics.Color.White)
+                        }
+                    }
+                }
             } else {
                 Box(
                     modifier = Modifier.fillMaxWidth().aspectRatio(1f).background(androidx.compose.ui.graphics.Color.DarkGray.copy(alpha = 0.4f)),

@@ -35,6 +35,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.FlipCameraAndroid
+import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -68,10 +69,12 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.ui.moments.GalleryImportHost
 import com.ssbmedia.twogether.util.ImageDownscaler
+import com.ssbmedia.twogether.util.PhotoEditor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -141,6 +144,12 @@ fun CameraScreen(onSaved: () -> Unit, onCancel: () -> Unit) {
     // Item 7: the just-taken photo, held here for the Retake/Keep review step instead of being written
     // straight to the DB. Null means "no pending capture to review" (normal live-preview state).
     var pendingReview by remember { mutableStateOf<File?>(null) }
+    // User-requested rotate: PhotoEditor.rotateInPlace overwrites the SAME file path, so Coil's own
+    // cache (keyed by that path) would otherwise keep showing the pre-rotate bytes - bumped on every
+    // rotate and folded into the AsyncImage request below as an explicit cache key, forcing Coil to
+    // treat each rotation as a genuinely new image to (re-)decode rather than serving a stale cache hit.
+    var pendingReviewRotateVersion by remember { mutableStateOf(0) }
+    var isRotating by remember { mutableStateOf(false) }
     // Item 3: brief tap-to-focus indicator position, cleared automatically a moment later.
     var focusIndicatorAt by remember { mutableStateOf<Offset?>(null) }
     // Tracked so the DisposableEffect below can release the camera when this screen leaves
@@ -401,16 +410,49 @@ fun CameraScreen(onSaved: () -> Unit, onCancel: () -> Unit) {
         pendingReview?.let { file ->
             Box(modifier = Modifier.fillMaxSize()) {
                 AsyncImage(
-                    model = file,
+                    model = ImageRequest.Builder(context)
+                        .data(file)
+                        // See pendingReviewRotateVersion's own doc - forces Coil to re-decode after an
+                        // in-place rotate instead of serving the pre-rotate bytes from its own cache.
+                        .memoryCacheKey("${file.absolutePath}:$pendingReviewRotateVersion")
+                        .diskCacheKey("${file.absolutePath}:$pendingReviewRotateVersion")
+                        .build(),
                     contentDescription = "Photo preview",
                     contentScale = ContentScale.Fit,
                     modifier = Modifier.fillMaxSize()
                 )
-                if (isSaving) {
+                if (isSaving || isRotating) {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         CircularProgressIndicator()
                     }
                 } else {
+                    // User-requested: a quick rotate right after capture, before deciding to Keep - the
+                    // common "phone was sideways" case shouldn't need a Retake+redo. Local-only edit, see
+                    // PhotoEditor's own doc for why this can't yet propagate to an already-synced photo
+                    // (not relevant here - Keep hasn't even run yet, so there's no synced copy to go
+                    // stale in the first place).
+                    IconButton(
+                        onClick = {
+                            isRotating = true
+                            scope.launch {
+                                withContext(Dispatchers.IO) { PhotoEditor.rotateInPlace(file, 90f) }
+                                pendingReviewRotateVersion++
+                                isRotating = false
+                            }
+                        },
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(16.dp)
+                            // BUG fix (live-verified): this review Box has no fixed dark background (unlike
+                            // the live camera preview it replaces) - a white icon alone was invisible against
+                            // a light-content photo/light theme background. Same Color.Black.copy(alpha=0.4f)
+                            // circular scrim this screen's own flash/flip buttons already use, so the icon
+                            // stays legible regardless of what's behind it.
+                            .size(44.dp)
+                            .background(Color.Black.copy(alpha = 0.4f), CircleShape)
+                    ) {
+                        Icon(Icons.Filled.RotateRight, contentDescription = "Rotate photo", tint = androidx.compose.ui.graphics.Color.White)
+                    }
                     Row(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
