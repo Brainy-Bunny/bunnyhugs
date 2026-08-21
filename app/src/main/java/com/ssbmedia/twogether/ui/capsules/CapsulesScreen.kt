@@ -330,7 +330,11 @@ fun CapsulesScreen(onBack: () -> Unit, onOpenCalendar: (jumpToEpochDay: Long) ->
     }
 
     if (showAddDialog) {
-        AddCapsuleDialog(onDismiss = { showAddDialog = false }, onAdd = { text, hours -> vm.add(text, hours); showAddDialog = false })
+        AddCapsuleDialog(
+            currentTotalHours = stats.totalHoursAllTime.toFloat(),
+            onDismiss = { showAddDialog = false },
+            onAdd = { text, hours -> vm.add(text, hours); showAddDialog = false }
+        )
     }
 }
 
@@ -344,9 +348,21 @@ fun CapsulesScreen(onBack: () -> Unit, onOpenCalendar: (jumpToEpochDay: Long) ->
 private val MAX_CAPSULE_UNLOCK_HOURS = TimeCapsuleRepository.MAX_UNLOCK_AT_HOURS
 
 @Composable
-private fun AddCapsuleDialog(onDismiss: () -> Unit, onAdd: (String, Float) -> Unit) {
+private fun AddCapsuleDialog(currentTotalHours: Float, onDismiss: () -> Unit, onAdd: (String, Float) -> Unit) {
     var text by remember { mutableStateOf("") }
-    var hoursText by remember { mutableStateOf("50") }
+    // BUG fix (user-reported): this used to always suggest a flat "50", regardless of the couple's real
+    // progress - a couple already well past 50 hours together would see a threshold that (if they didn't
+    // notice and change it) created a capsule that unlocks the moment they tap Save, defeating the whole
+    // point of a capsule they write now and read back later. Suggests instead 50 hours PAST wherever they
+    // currently are, rounded to a clean multiple of 50: round currentTotalHours to the nearest 50 first
+    // (a clean, recognizable base number close to their real progress), then add 50 - this guarantees the
+    // suggestion is always meaningfully ahead of currentTotalHours (round-to-nearest-50 lands at most 25h
+    // below it, and the +50 covers that gap several times over), never behind it the way a flat "50" could
+    // be. Still just a suggestion, not a floor - the field stays freely editable either direction.
+    val suggestedHours = remember(currentTotalHours) {
+        (Math.round(currentTotalHours / 50f) * 50) + 50
+    }
+    var hoursText by remember { mutableStateOf(suggestedHours.toString()) }
 
     // Previously Save silently no-op'd on blank/zero/unparseable input with no explanation at all - the
     // user would tap Save and nothing would visibly happen. Validate up front instead so the dialog
