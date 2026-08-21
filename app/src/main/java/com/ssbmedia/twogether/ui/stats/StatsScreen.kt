@@ -2,10 +2,12 @@ package com.ssbmedia.twogether.ui.stats
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
@@ -97,7 +99,7 @@ fun StatsScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             item {
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Max)) {
                     StatCard(
                         emoji = "💛",
                         label = "Hours together",
@@ -123,7 +125,7 @@ fun StatsScreen(
             }
             item {
                 SectionHeader("Hours together")
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Max)) {
                     StatCard(emoji = "💛", label = "All-time", value = "${"%.1f".format(Locale.US, stats.totalHoursAllTime)}h", modifier = Modifier.weight(1f))
                     StatCard(emoji = "📆", label = "This week", value = "${"%.1f".format(Locale.US, stats.totalHoursThisWeek)}h", modifier = Modifier.weight(1f))
                     StatCard(emoji = "🗓️", label = "This month", value = "${"%.1f".format(Locale.US, stats.totalHoursThisMonth)}h", modifier = Modifier.weight(1f))
@@ -131,7 +133,7 @@ fun StatsScreen(
             }
             item {
                 SectionHeader("Streaks")
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Max)) {
                     StatCard(emoji = "🔥", label = "Daily streak (current)", value = "${stats.currentDailyStreak}d", modifier = Modifier.weight(1f))
                     StatCard(
                         emoji = "🏆",
@@ -143,7 +145,7 @@ fun StatsScreen(
                         }
                     )
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Max).padding(top = 12.dp)) {
                     StatCard(emoji = "🌟", label = "Weekly streak (current)", value = "${stats.currentWeeklyStreak}w", modifier = Modifier.weight(1f))
                     StatCard(
                         emoji = "✨",
@@ -163,11 +165,11 @@ fun StatsScreen(
             }
             item {
                 SectionHeader("More about you two")
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Max)) {
                     StatCard(emoji = "⏱️", label = "Longest session", value = formatMinutes(stats.longestSessionMinutes), modifier = Modifier.weight(1f))
                     StatCard(emoji = "🤗", label = "Reunions", value = "${stats.reunionCount}", modifier = Modifier.weight(1f))
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Max).padding(top = 12.dp)) {
                     StatCard(
                         emoji = "❤️",
                         label = "Favorite day",
@@ -182,11 +184,15 @@ fun StatsScreen(
                 // Feature E: more stats, all read off the same merged/deduped session timeline above -
                 // see StatsCalculator's doc for exactly how each one is derived.
                 SectionHeader("Your story so far")
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Max)) {
                     StatCard(
                         emoji = "💞",
                         label = "Together since",
-                        value = stats.togetherSince?.let { DateFormats.formatDate(it) } ?: "—",
+                        // BUG fix (user-reported): this narrative card read as a bare number ("20 08
+                        // 2026") - see DateFormats.formatDateLong's own doc for why this one call site
+                        // gets the human-language date while every other (much more compact) DATE call
+                        // site app-wide is deliberately left on the numeric convention.
+                        value = stats.togetherSince?.let { DateFormats.formatDateLong(it) } ?: "—",
                         modifier = Modifier.weight(1f),
                         onClick = stats.togetherSince?.let { date ->
                             { onOpenCalendarWithArgs(date.toEpochDay(), null, null) }
@@ -203,7 +209,7 @@ fun StatsScreen(
                         onClick = { onOpenMonthlyDetail("days") }
                     )
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Max).padding(top = 12.dp)) {
                     StatCard(
                         emoji = "📈",
                         label = "Most met month",
@@ -219,7 +225,7 @@ fun StatsScreen(
                         onClick = { onOpenMonthlyDetail("hours") }
                     )
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Max).padding(top = 12.dp)) {
                     StatCard(
                         emoji = "🌞",
                         label = "Longest single day",

@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -85,8 +86,19 @@ fun StatCard(
     val clickModifier = if (onClick != null) {
         modifier.clickable(onClick = onClick)
     } else modifier
+    // BUG fix (user-reported "so much space/gap"): minLines = 2 below used to unconditionally reserve
+    // 2 lines of height for BOTH the value and label text in every single StatCard everywhere, even
+    // when every card in that row only ever needed 1 line - e.g. Stats' plain "0.6h"/"Hours together"
+    // tiles, which never wrap, still paid for a permanently empty second line each. That was working
+    // around a real problem (two StatCards in the same Row ending up different heights when one of
+    // them DOES wrap) with a blunt fix that cost every OTHER row genuinely wasted space it never
+    // needed. Real fix: each StatCard now fills whatever height its own Row allocates
+    // (Modifier.fillMaxHeight() below, paired with that Row needing
+    // Modifier.height(IntrinsicSize.Max) at its own call site - see StatsScreen.kt/HomeScreen.kt) -
+    // this equalizes cards ONLY within their own specific row, matching whatever that row's own
+    // tallest actual content happens to be, rather than a global worst-case reservation everywhere.
     Card(
-        modifier = clickModifier,
+        modifier = clickModifier.fillMaxHeight(),
         shape = MaterialTheme.shapes.large,
         colors = CardDefaults.cardColors(containerColor = containerColor),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
@@ -100,32 +112,19 @@ fun StatCard(
                 // days" vs "Same" - see StatsScreen's "This month vs last" tile) - maxLines/ellipsis is a
                 // defensive fix applied here, once, for every StatCard rather than special-cased on one
                 // call site, so any future long value string is protected the same way without anyone
-                // having to remember to add it again.
-                //
-                // MINOR fix (ultimate-app-review round 1, item 6): maxLines = 1 was truncating the exact
-                // longer values this same UX pass introduced ("Down 12 days", "Aug 2026 (123.4h)", "Aug
-                // 2026 (31d)") - these are short, meaningful strings that just don't fit ONE line at this
-                // width, not long enough to genuinely need truncation. Now allowed to wrap to 2 lines
-                // instead (overflow/ellipsis kept as a defensive fallback for anything that's still too long
-                // even across 2 lines). minLines = 2 (not just maxLines) is what actually keeps two StatCards
-                // side by side in a Row the SAME height regardless of whether either one's value happens to
-                // wrap - reserving the same 2-line height unconditionally rather than only capping it.
+                // having to remember to add it again. maxLines = 2 (not 1) so it wraps instead of
+                // truncating short-but-not-one-line values ("Down 12 days") - see the fillMaxHeight doc
+                // above for why this no longer also needs minLines = 2 to keep a row's cards aligned.
                 Text(
                     text = value,
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
-                    minLines = 2,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )
-                // MINOR fix (ultimate-app-review round 1, item 6): this label Text had no maxLines at all -
-                // a longer label (or the value above wrapping to 2 lines and pushing layout around it) could
-                // make two StatCards in the same Row end up different heights. Same minLines/maxLines = 2
-                // treatment as the value Text above, for the same reason.
                 Text(
                     text = label,
                     style = MaterialTheme.typography.bodySmall,
-                    minLines = 2,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )

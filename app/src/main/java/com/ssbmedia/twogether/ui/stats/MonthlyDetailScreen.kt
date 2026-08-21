@@ -234,12 +234,20 @@ private fun MonthlyBarChart(data: List<MonthlyBreakdown>, metric: MonthlyMetric,
                     data[i].yearMonth.month.getDisplayName(TextStyle.SHORT, Locale.US),
                     monthLabelStyle
                 )
-                drawText(monthLayout, topLeft = Offset(centerX - monthLayout.size.width / 2f, barAreaHeight + 2.dp.toPx()))
+                val monthLeft = (centerX - monthLayout.size.width / 2f)
+                    .coerceIn(0f, (size.width - monthLayout.size.width).coerceAtLeast(0f))
+                drawText(monthLayout, topLeft = Offset(monthLeft, barAreaHeight + 2.dp.toPx()))
+                // BUG fix (user-reported "bar chart should show the value of each bar"): same edge-
+                // clamping HoursDetailScreen's matching value label already needed (see its own doc) -
+                // an un-clamped centerX-based position let the first/last bar's label paint partly
+                // outside the Canvas, which reads as "the value isn't shown" for exactly those bars.
                 val valueText = if (metric == MonthlyMetric.DAYS) "${value.toInt()}$unit" else "${"%.1f".format(Locale.US, value)}$unit"
                 val valueLayout = textMeasurer.measure(valueText, valueLabelStyle)
+                val valueLeft = (centerX - valueLayout.size.width / 2f)
+                    .coerceIn(0f, (size.width - valueLayout.size.width).coerceAtLeast(0f))
                 drawText(
                     valueLayout,
-                    topLeft = Offset(centerX - valueLayout.size.width / 2f, barAreaHeight + 2.dp.toPx() + monthLayout.size.height)
+                    topLeft = Offset(valueLeft, barAreaHeight + 2.dp.toPx() + monthLayout.size.height)
                 )
             }
             drawLine(

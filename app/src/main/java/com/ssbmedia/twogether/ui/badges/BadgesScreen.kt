@@ -2,17 +2,17 @@ package com.ssbmedia.twogether.ui.badges
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.GridItemSpan
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material3.Card
@@ -121,47 +121,69 @@ fun BadgesScreen(
             )
         }
     ) { padding ->
-        LazyVerticalGrid(
-            columns = GridCells.Fixed(2),
-            modifier = Modifier.fillMaxSize().padding(padding),
-            contentPadding = PaddingValues(16.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        // BUG fix (user-reported): was a LazyVerticalGrid(columns = GridCells.Fixed(2)) - a grid line's
+        // overall height is set by its tallest item (e.g. a 2-line-wrapping title like "500 Hours
+        // Together"), but Compose does NOT stretch the grid's OTHER items in that same line to fill
+        // that height - a shorter card (e.g. "7 Day Streak", one line) just sits top-aligned inside the
+        // taller allocated row band, leaving a visible gap of bare background below its own card
+        // boundary before the next row starts. Restructured to plain chunked Rows, each with
+        // Modifier.height(IntrinsicSize.Max) + each card Modifier.fillMaxHeight() - the same proven
+        // per-row equalization technique StatCard/HomeScreen's quick-facts row now use (see StatCard's
+        // own doc in Components.kt) - which DOES reliably stretch a Row's children to match its tallest
+        // one. Loses LazyVerticalGrid's virtualization, but the badge list is bounded to a few dozen
+        // entries at most (SEEDS + 2-ahead auto-extension per category, see BadgeCatalog), not a
+        // performance concern at this scale - and dropping the grid entirely also fully resolves the
+        // original "avoid nesting two lazy-scrolling containers" reason this screen used a grid instead
+        // of a LazyColumn in the first place (see the removed comment this replaces): there's now only
+        // ONE scrollable container here, not two.
+        Column(
+            modifier = Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // Full-width header, spanning both grid columns - inserted as a grid item (rather than
-            // wrapping the grid in an outer LazyColumn) to avoid nesting two lazy-scrolling containers.
-            item(span = { GridItemSpan(maxLineSpan) }) {
-                BadgeProgressBarsSection(stats)
-            }
-            items(statuses, key = { it.badge.id }) { status ->
-                // UX-FIX-PLAN.md Phase 3 item 20: Badge -> the stat that earned it. HOURS and REUNIONS
-                // route to their own dedicated detail screens; DAILY_STREAK routes to Calendar
-                // highlighting the actual streak range (same DateRange lookup StatsScreen's own "Longest
-                // streak" card uses) - null (no qualifying streak yet) means no destination, so the card
-                // simply isn't clickable rather than navigating somewhere with nothing to show.
-                // WEEKLY_STREAK (now cumulative weeks together, see BadgeCatalog.currentValueFor's doc)
-                // and PERFECT_WEEKS both have no single date range to highlight, so both stay
-                // non-clickable - grid-only by design, same as BadgeProgressBarsSection's own doc already
-                // established for PERFECT_WEEKS.
-                val onClick: (() -> Unit)? = when (status.badge.type) {
-                    BadgeType.HOURS -> onOpenHoursDetail
-                    BadgeType.REUNIONS -> onOpenGapsDetail
-                    BadgeType.DAILY_STREAK -> longestDailyStreakRange?.let { range ->
-                        { onOpenCalendarWithArgs(null, range.start.toEpochDay(), range.end.toEpochDay()) }
+            BadgeProgressBarsSection(stats)
+            statuses.chunked(2).forEach { rowStatuses ->
+                Row(
+                    modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Max),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    rowStatuses.forEach { status ->
+                        // UX-FIX-PLAN.md Phase 3 item 20: Badge -> the stat that earned it. HOURS and
+                        // REUNIONS route to their own dedicated detail screens; DAILY_STREAK routes to
+                        // Calendar highlighting the actual streak range (same DateRange lookup
+                        // StatsScreen's own "Longest streak" card uses) - null (no qualifying streak yet)
+                        // means no destination, so the card simply isn't clickable rather than navigating
+                        // somewhere with nothing to show. WEEKLY_STREAK (now cumulative weeks together,
+                        // see BadgeCatalog.currentValueFor's doc) and PERFECT_WEEKS both have no single
+                        // date range to highlight, so both stay non-clickable - grid-only by design, same
+                        // as BadgeProgressBarsSection's own doc already established for PERFECT_WEEKS.
+                        val onClick: (() -> Unit)? = when (status.badge.type) {
+                            BadgeType.HOURS -> onOpenHoursDetail
+                            BadgeType.REUNIONS -> onOpenGapsDetail
+                            BadgeType.DAILY_STREAK -> longestDailyStreakRange?.let { range ->
+                                { onOpenCalendarWithArgs(null, range.start.toEpochDay(), range.end.toEpochDay()) }
+                            }
+                            BadgeType.WEEKLY_STREAK -> null
+                            BadgeType.PERFECT_WEEKS -> null
+                        }
+                        val cardColors = CardDefaults.cardColors(
+                            containerColor = if (status.unlocked) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
+                        )
+                        val cardModifier = Modifier.weight(1f).fillMaxHeight()
+                        if (onClick != null) {
+                            Card(modifier = cardModifier, shape = MaterialTheme.shapes.large, colors = cardColors, onClick = onClick) {
+                                BadgeCardContent(status, unlockDates)
+                            }
+                        } else {
+                            Card(modifier = cardModifier, shape = MaterialTheme.shapes.large, colors = cardColors) {
+                                BadgeCardContent(status, unlockDates)
+                            }
+                        }
                     }
-                    BadgeType.WEEKLY_STREAK -> null
-                    BadgeType.PERFECT_WEEKS -> null
-                }
-                val cardColors = CardDefaults.cardColors(
-                    containerColor = if (status.unlocked) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
-                )
-                if (onClick != null) {
-                    Card(shape = MaterialTheme.shapes.large, colors = cardColors, onClick = onClick) {
-                        BadgeCardContent(status, unlockDates)
-                    }
-                } else {
-                    Card(shape = MaterialTheme.shapes.large, colors = cardColors) {
-                        BadgeCardContent(status, unlockDates)
+                    // Odd badge count on the final row: fill the second column with an empty weighted
+                    // Box instead of letting the lone card stretch to double width, matching a 2-column
+                    // grid's own natural behavior for a trailing incomplete row.
+                    if (rowStatuses.size == 1) {
+                        androidx.compose.foundation.layout.Box(modifier = Modifier.weight(1f))
                     }
                 }
             }

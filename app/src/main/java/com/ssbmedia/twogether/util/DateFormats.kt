@@ -31,12 +31,37 @@ object DateFormats {
      * dialog title) that want "Thursday, 20 08 2026" rather than the bare date. */
     val DATE_WITH_WEEKDAY: DateTimeFormatter = DateTimeFormatter.ofPattern("EEEE, dd MM yyyy", Locale.US)
 
+    /** BUG fix (user-reported): "20th August 2026" - a narrative/storytelling read for the handful of
+     * prominent, spacious contexts (StatsScreen's "Together since" card) where the compact numeric
+     * [DATE] pattern reads as a bare number with no obvious context ("20 08 2026"), unlike every other
+     * (much more compact) place [DATE] is used - badge unlock dates under a small tile, capsule
+     * countdowns, Moments timestamps - where a longer human-language date risks overflowing/wrapping in
+     * a way the numeric pattern doesn't. Deliberately a SEPARATE formatter, not a change to [DATE]
+     * itself: [DATE] is this app's established, deliberate, app-wide convention (see this object's own
+     * doc), used at 13+ call sites this fix does not touch. */
+    private val MONTH_YEAR: DateTimeFormatter = DateTimeFormatter.ofPattern("MMMM yyyy", Locale.US)
+
     /** The 12-hour clock convention already used by Calendar's day-detail dialog before this fix
      * (`"h:mm a"`) - kept as the one shared time format rather than switching the app to 24-hour, since
      * that was the existing user-facing convention. */
     val TIME: DateTimeFormatter = DateTimeFormatter.ofPattern("h:mm a", Locale.US)
 
     fun formatDate(date: LocalDate): String = date.format(DATE)
+
+    /** "20th August 2026" - see [MONTH_YEAR]'s own doc for where/why this exists alongside [DATE]
+     * rather than replacing it. Ordinal suffix computed by hand ("st"/"nd"/"rd"/"th") since
+     * DateTimeFormatter has no built-in ordinal-day pattern letter; the 11th/12th/13th exception (all
+     * "th", not "st"/"nd"/"rd") is the one irregular case in the otherwise mod-10 rule. */
+    fun formatDateLong(date: LocalDate): String {
+        val day = date.dayOfMonth
+        val suffix = if (day in 11..13) "th" else when (day % 10) {
+            1 -> "st"
+            2 -> "nd"
+            3 -> "rd"
+            else -> "th"
+        }
+        return "$day$suffix ${date.format(MONTH_YEAR)}"
+    }
 
     fun formatDateWithWeekday(date: LocalDate): String = date.format(DATE_WITH_WEEKDAY)
 
