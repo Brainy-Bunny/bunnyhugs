@@ -233,11 +233,27 @@ private fun DailyHoursBarChart(data: List<Pair<LocalDate, Double>>, modifier: Mo
                 // same value that placed the bar itself, so alignment can't drift between them.
                 val dayLayout = textMeasurer.measure(date.dayOfMonth.toString(), dayLabelStyle)
                 drawText(dayLayout, topLeft = Offset(centerX - dayLayout.size.width / 2f, barAreaHeight + 2.dp.toPx()))
-                val valueText = if (hours > 0) "%.1fh".format(Locale.US, hours) else "–"
+                // BUG fix (ultimate-app-review Round 2, Opus, live-confirmed): a 2-digit-hour value like
+                // "12.4h" measured wider than this bar's own slot at typical widths (14 bars/chart), so
+                // neighboring value labels visibly collided/merged, worse at larger accessibility font
+                // scales. Dropping the decimal at 10h+ ("12h" instead of "12.4h") shortens the string
+                // enough to fit the same slot single-digit-hour values already fit in - single decimal
+                // precision was never meaningful at that magnitude anyway (see DAYS metric elsewhere in
+                // this app's charts, which never shows sub-unit precision at all).
+                val valueText = when {
+                    hours <= 0 -> "–"
+                    hours >= 10 -> "${hours.toInt()}h"
+                    else -> "%.1fh".format(Locale.US, hours)
+                }
                 val valueLayout = textMeasurer.measure(valueText, valueLabelStyle)
+                // BUG fix (same round/finding): even a fitting label could paint outside the Canvas
+                // entirely for the first/last bar, since centering purely on centerX never checked the
+                // canvas bounds. Clamped so no label's left/right edge can extend past [0, size.width].
+                val valueLeft = (centerX - valueLayout.size.width / 2f)
+                    .coerceIn(0f, (size.width - valueLayout.size.width).coerceAtLeast(0f))
                 drawText(
                     valueLayout,
-                    topLeft = Offset(centerX - valueLayout.size.width / 2f, barAreaHeight + 2.dp.toPx() + dayLayout.size.height)
+                    topLeft = Offset(valueLeft, barAreaHeight + 2.dp.toPx() + dayLayout.size.height)
                 )
             }
             drawLine(

@@ -10,8 +10,18 @@ import androidx.compose.ui.unit.sp
 val TwogetherTypography = Typography(
     displayLarge = TextStyle(fontFamily = FontFamily.Default, fontWeight = FontWeight.Bold, fontSize = 40.sp, lineHeight = 46.sp),
     displayMedium = TextStyle(fontFamily = FontFamily.Default, fontWeight = FontWeight.Bold, fontSize = 32.sp, lineHeight = 38.sp),
+    // BUG fix (ultimate-app-review Round 2, Opus): displaySmall/headlineSmall were left undefined,
+    // same class of gap titleSmall's own fix above already closed once - silently falling back to M3's
+    // baseline (Normal weight) default, unlike every other style in this scale, at real call sites
+    // (BadgesScreen, MainActivity, MilestonesScreen, SettingsScreen). Sized/weighted to interpolate
+    // between their neighbors, same approach titleSmall's own fix used: displaySmall Bold (matching
+    // both displayMedium above and headlineLarge below) at 36sp, between their 32sp/28sp; headlineSmall
+    // SemiBold (matching both headlineMedium above and titleLarge below) at 22sp, between their
+    // 24sp/20sp.
+    displaySmall = TextStyle(fontFamily = FontFamily.Default, fontWeight = FontWeight.Bold, fontSize = 36.sp, lineHeight = 42.sp),
     headlineLarge = TextStyle(fontFamily = FontFamily.Default, fontWeight = FontWeight.Bold, fontSize = 28.sp, lineHeight = 34.sp),
     headlineMedium = TextStyle(fontFamily = FontFamily.Default, fontWeight = FontWeight.SemiBold, fontSize = 24.sp, lineHeight = 30.sp),
+    headlineSmall = TextStyle(fontFamily = FontFamily.Default, fontWeight = FontWeight.SemiBold, fontSize = 22.sp, lineHeight = 28.sp),
     titleLarge = TextStyle(fontFamily = FontFamily.Default, fontWeight = FontWeight.SemiBold, fontSize = 20.sp, lineHeight = 26.sp),
     titleMedium = TextStyle(fontFamily = FontFamily.Default, fontWeight = FontWeight.SemiBold, fontSize = 17.sp, lineHeight = 22.sp, letterSpacing = 0.1.sp),
     // MINOR fix (ultimate-app-review round 1, item 4): titleSmall was left undefined, silently falling

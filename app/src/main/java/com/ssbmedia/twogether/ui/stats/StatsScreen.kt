@@ -280,8 +280,17 @@ fun StatsScreen(
 private fun formatMinutes(totalMinutes: Long): String =
     com.ssbmedia.twogether.util.RelativeTime.formatDuration(totalMinutes * 60_000L)
 
+// BUG fix (ultimate-app-review Round 2, Opus, live-confirmed): pinned to Locale.US, matching this
+// app's established standard (CalendarScreen.kt's own month-name display, and this file's own
+// favourite-day value below, which already uses locale-invariant English via lowercase()/
+// uppercase()) - a stray Locale.getDefault() here produced a real, live-observed inconsistency on a
+// non-English device: this screen's favourite-day summary card read "Monday" while
+// FavoriteDayDetailScreen's chart for the same data read "lun." (MonthlyDetailScreen.kt's own doc
+// comment argued a getDisplayName call like this one was "locale-appropriate, intentional display of
+// a proper name" and should stay device-locale - that reasoning didn't hold once this exact
+// cross-screen mismatch was found; consistency with the rest of the app wins.)
 private fun monthLabel(yearMonth: java.time.YearMonth): String =
-    "${yearMonth.month.getDisplayName(TextStyle.SHORT, Locale.getDefault())} ${yearMonth.year}"
+    "${yearMonth.month.getDisplayName(TextStyle.SHORT, Locale.US)} ${yearMonth.year}"
 
 /** Phase 1 item 5: the actual day-count delta for "This month vs last" (user explicitly wants DAYS, not
  * hours) - e.g. "Down 3 days" / "Up 2 days" / "Same", replacing the old 3-way Trend enum label that

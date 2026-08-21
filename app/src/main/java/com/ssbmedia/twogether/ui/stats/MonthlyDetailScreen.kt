@@ -201,9 +201,13 @@ private fun MonthlyBarChart(data: List<MonthlyBreakdown>, metric: MonthlyMetric,
     Column(modifier = modifier.fillMaxWidth()) {
         Text(
             // MINOR fix (ultimate-app-review round 1, item 5): pinned to Locale.US - see GapsDetailScreen's
-            // matching fix. Deliberately NOT touching the month-NAME display below (Locale.getDefault() at
-            // getDisplayName) - that's locale-appropriate, intentional display of a proper name, a
-            // different and narrower issue than this numeric decimal-separator formatting.
+            // matching fix. UPDATE (round 2, Opus, live-confirmed): the month-NAME display below is now
+            // ALSO pinned to Locale.US - it used to be deliberately left on Locale.getDefault() here as
+            // "locale-appropriate, intentional display of a proper name," but that reasoning didn't survive
+            // a live-observed cross-screen inconsistency (this exact getDisplayName pattern producing
+            // "Monday" on one screen and "lun." on another for the same data, on a non-English device) -
+            // see StatsScreen.kt's monthLabel doc for the full story. Consistency with the rest of the app
+            // wins over per-call "this one's a proper name" exceptions.
             if (metric == MonthlyMetric.DAYS) "${maxVal.toInt()}d" else "${"%.1f".format(Locale.US, maxVal)}h",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -227,7 +231,7 @@ private fun MonthlyBarChart(data: List<MonthlyBreakdown>, metric: MonthlyMetric,
                     cornerRadius = CornerRadius(6.dp.toPx(), 6.dp.toPx())
                 )
                 val monthLayout = textMeasurer.measure(
-                    data[i].yearMonth.month.getDisplayName(TextStyle.SHORT, Locale.getDefault()),
+                    data[i].yearMonth.month.getDisplayName(TextStyle.SHORT, Locale.US),
                     monthLabelStyle
                 )
                 drawText(monthLayout, topLeft = Offset(centerX - monthLayout.size.width / 2f, barAreaHeight + 2.dp.toPx()))
@@ -248,5 +252,7 @@ private fun MonthlyBarChart(data: List<MonthlyBreakdown>, metric: MonthlyMetric,
     }
 }
 
+// BUG fix (ultimate-app-review Round 2, Opus, live-confirmed): pinned to Locale.US - see the doc
+// comment above this file's other getDisplayName call site.
 private fun monthLabel(yearMonth: YearMonth): String =
-    "${yearMonth.month.getDisplayName(TextStyle.SHORT, Locale.getDefault())} ${yearMonth.year}"
+    "${yearMonth.month.getDisplayName(TextStyle.SHORT, Locale.US)} ${yearMonth.year}"
