@@ -246,6 +246,17 @@ class HomeViewModel : ViewModel() {
     // size 1, so it silently fell into the generic "A memory from Xh ago" framing - even though the app
     // genuinely knows it's an on-this-day match. Explicit flag instead of inferring from list size.
     val memoryMomentsIsAnniversary: MutableStateFlow<Boolean> = MutableStateFlow(false)
+    // MAJOR fix (final Opus re-audit, live-reproducible): pickRandomMomentIfNeeded's old guard was
+    // `if (memoryMoments.value.isNotEmpty()) return` - a pure "have we ever picked" check, with no
+    // awareness of which DAY it picked for. This ViewModel realistically survives across midnight (Home
+    // is the app's start destination and is never popped, and a persistent foreground service keeps the
+    // process alive overnight), so a pool built yesterday just sat there unchanged: an anniversary match
+    // from yesterday kept showing as "today"'s memory, AND - the worse direction - if yesterday's pool
+    // was a plain random pick, the guard blocked ANY recompute on the actual anniversary today, silently
+    // failing to ever show the slideshow this feature exists for. Tracks the date the current pool was
+    // built for so a day rollover forces a real recompute, same as OnThisDayCard's own now-keyed refresh
+    // just below it on this same screen already does.
+    val memoryMomentsDate: MutableStateFlow<LocalDate?> = MutableStateFlow(null)
 
     /** Only ever picks from moments this device actually HOLDS the photo bytes for - a remote-stub
      * moment (partner's photo metadata synced, but the bytes haven't transferred yet - see
@@ -265,16 +276,16 @@ class HomeViewModel : ViewModel() {
     // MAX_MEMORY_SLIDESHOW_PHOTOS so a couple with many years of photos still gets a short slideshow,
     // not an unbounded one. Falls back to a single random photo only when there's no anniversary match
     // at all.
-    suspend fun pickRandomMomentIfNeeded(all: List<Moment>) {
-        if (memoryMoments.value.isNotEmpty()) return
+    suspend fun pickRandomMomentIfNeeded(all: List<Moment>, now: Long) {
+        val zone = ZoneId.systemDefault()
+        val today = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
+        if (memoryMoments.value.isNotEmpty() && memoryMomentsDate.value == today) return
         // MINOR fix: File.isFile is blocking disk I/O, and this used to run directly on whatever
         // dispatcher the caller's LaunchedEffect is on (Main) - moved off Main here so a large moment
         // list (or repeated re-runs while nothing is downloaded yet, e.g. right after a restore) can't
         // ever cause a stutter.
         val withPhoto = withContext(Dispatchers.IO) { all.filter { it.photoDownloaded && File(it.photoUri).isFile } }
         if (withPhoto.isEmpty()) return
-        val zone = ZoneId.systemDefault()
-        val today = LocalDate.now(zone)
         val anniversaryPool = withPhoto.filter { moment ->
             val takenDate = Instant.ofEpochMilli(moment.takenAt).atZone(zone).toLocalDate()
             takenDate.monthValue == today.monthValue && takenDate.dayOfMonth == today.dayOfMonth && takenDate.year != today.year
@@ -286,6 +297,7 @@ class HomeViewModel : ViewModel() {
             memoryMoments.value = listOf(withPhoto.random())
             memoryMomentsIsAnniversary.value = false
         }
+        memoryMomentsDate.value = today
     }
 
     companion object {
@@ -413,8 +425,6 @@ fun HomeScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    LaunchedEffect(moments) { vm.pickRandomMomentIfNeeded(moments) }
-
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) {
         while (true) {
@@ -422,6 +432,13 @@ fun HomeScreen(
             now = System.currentTimeMillis()
         }
     }
+
+    // MAJOR fix (final Opus re-audit): re-keyed on `now` (the same 30s ticker OnThisDayCard's own
+    // refresh already relies on) in addition to `moments`, so a day rollover is actually noticed - see
+    // HomeViewModel.pickRandomMomentIfNeeded's own doc. The relaunch itself is cheap: the vast majority
+    // of these calls (every 30s until the date changes) exit on pickRandomMomentIfNeeded's very first
+    // date-comparison line, well before its IO-dispatched filter.
+    LaunchedEffect(moments, now) { vm.pickRandomMomentIfNeeded(moments, now) }
 
     // Item 22 (UX-FIX-PLAN.md Phase 3): whether the notification-bell panel is currently open.
     var showInboxPanel by remember { mutableStateOf(false) }
@@ -1580,11 +1597,17 @@ private fun OnThisDayCard(info: OnThisDayInfo, onClick: () -> Unit = {}) {
 
 private fun timeAgo(pastMillis: Long, now: Long): String {
     val diffDays = (now - pastMillis) / (24 * 3600 * 1000L)
+    // MINOR fix (final Opus re-audit): no singular case for months/years - "1 years ago" / "1 months
+    // ago" read as a typo for the single most common case a multi-year anniversary card can hit
+    // (exactly 12/24/36... months in) - this diff already fixed this exact class of bug twice elsewhere
+    // (DateFormats, StatsCalculator), so it should be consistent here too.
+    val months = diffDays / 30
+    val years = diffDays / 365
     return when {
         diffDays <= 0 -> "today"
         diffDays == 1L -> "yesterday"
         diffDays < 30 -> "$diffDays days ago"
-        diffDays < 365 -> "${diffDays / 30} months ago"
-        else -> "${diffDays / 365} years ago"
+        diffDays < 365 -> if (months == 1L) "1 month ago" else "$months months ago"
+        else -> if (years == 1L) "1 year ago" else "$years years ago"
     }
 }
