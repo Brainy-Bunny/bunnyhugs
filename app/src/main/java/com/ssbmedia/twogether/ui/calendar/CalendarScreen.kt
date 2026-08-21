@@ -51,6 +51,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -72,6 +73,7 @@ import java.time.DayOfWeek
 import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalTime
+import java.time.MonthDay
 import java.time.YearMonth
 import java.time.ZoneId
 import java.time.format.TextStyle
@@ -86,6 +88,13 @@ class CalendarViewModel : ViewModel() {
     // feeds the month-grid "has a note" marker on DayCell, same "all days at once" role
     // MomentRepository.observeAll plays for the photo marker above.
     val dayNotes = ServiceLocator.dayNoteRepository.observeActive()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    // BUG fix (user-reported): CalendarScreen had ZERO milestone awareness at all - a milestone set for,
+    // say, Dec 20th showed nothing whatsoever on that date, in any year, no matter how many years this
+    // screen was paged through. Feeds the month-grid milestone marker and the day-detail dialog's own
+    // milestone line below, same "all days at once" role dayNotes/moments already play for their own
+    // markers.
+    val milestones = ServiceLocator.milestoneRepository.observeActive()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val proximityState = ServiceLocator.proximityStateStore.state
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), com.ssbmedia.twogether.data.datastore.ProximityPersistedState())
@@ -157,6 +166,7 @@ fun CalendarScreen(
     val sessions by vm.sessions.collectAsState()
     val moments by vm.moments.collectAsState()
     val dayNotes by vm.dayNotes.collectAsState()
+    val milestones by vm.milestones.collectAsState()
     val proximityState by vm.proximityState.collectAsState()
     val zone = remember { ZoneId.systemDefault() }
 
@@ -197,6 +207,14 @@ fun CalendarScreen(
     // wrap rather than a zone-derived conversion like the maps above.
     val daysWithNotes = remember(dayNotes) {
         dayNotes.map { LocalDate.ofEpochDay(it.date) }.toSet()
+    }
+    // BUG fix (user-reported): a Milestone recurs by month+day in EVERY year (see Milestone.month/day's
+    // own doc - year is purely informational, never part of the actual recurrence rule, same as the
+    // yearly notification's own firing logic), so this is keyed by MonthDay, not LocalDate - a single
+    // "First Date" milestone set for Dec 20th must mark Dec 20th on every year this screen pages through,
+    // not just one specific year.
+    val monthDaysWithMilestones = remember(milestones) {
+        milestones.map { MonthDay.of(it.month, it.day) }.toSet()
     }
 
     // Reuses StatsCalculator's qualifying-day count (same buildDailyMinuteMap() call above feeds it)
@@ -310,6 +328,7 @@ fun CalendarScreen(
                     val hasPhoto = day in daysWithPhotos
                     val hasManualEntry = day in daysWithManualEntry
                     val hasNote = day in daysWithNotes
+                    val hasMilestone = MonthDay.from(day) in monthDaysWithMilestones
                     val isStreakHighlight = highlightRange != null &&
                         !day.isBefore(highlightRange.first) && !day.isAfter(highlightRange.second)
                     DayCell(
@@ -318,6 +337,7 @@ fun CalendarScreen(
                         hasPhoto = hasPhoto,
                         hasManualEntry = hasManualEntry,
                         hasNote = hasNote,
+                        hasMilestone = hasMilestone,
                         isToday = day == LocalDate.now(zone),
                         isStreakHighlight = isStreakHighlight,
                         onClick = { selectedDay = day }
@@ -361,6 +381,14 @@ fun CalendarScreen(
         val dayMomentsCount = remember(day, moments) {
             moments.count { Instant.ofEpochMilli(it.takenAt).atZone(zone).toLocalDate() == day }
         }
+        // BUG fix (user-reported): matches by month+day only (see monthDaysWithMilestones' own doc for
+        // why this screen's whole milestone awareness is keyed that way, not by exact LocalDate) - a
+        // milestone recurs every year, so this must find it regardless of which year is being viewed.
+        // firstOrNull, not a list: two milestones sharing the same month+day is an edge case this dialog
+        // doesn't need to handle specially, same as MilestonesScreen's own matchingMomentsByYear callers.
+        val milestoneForDay = remember(day, milestones) {
+            milestones.firstOrNull { it.month == day.monthValue && it.day == day.dayOfMonth }
+        }
         AlertDialog(
             onDismissRequest = { selectedDay = null },
             confirmButton = { TextButton(onClick = { selectedDay = null }) { Text("Close") } },
@@ -370,6 +398,16 @@ fun CalendarScreen(
             title = { Text(DateFormats.formatDateWithWeekdayLong(day)) },
             text = {
                 Column {
+                    // BUG fix (user-reported): shown first - a milestone is the more notable fact about
+                    // this day than the plain hours/minutes line below it.
+                    milestoneForDay?.let { milestone ->
+                        Text(
+                            "🎉 ${milestone.label}",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                    }
                     Text(if (minutes > 0) "${minutes / 60}h ${minutes % 60}m together that day" else "No time together that day")
                     if (daySessions.isEmpty()) {
                         Text("No sessions", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
@@ -494,7 +532,11 @@ private fun DayCell(
     isStreakHighlight: Boolean = false,
     // UX-FIX-PLAN.md Phase 4 item 25: whether this day has a (mine or partner's) day note - rendered as
     // its own small marker, distinct from both the photo-camera icon above and hasManualEntry's dot.
-    hasNote: Boolean = false
+    hasNote: Boolean = false,
+    // BUG fix (user-reported): whether a Milestone's month+day recurs on THIS day (see
+    // monthDaysWithMilestones' own doc for the every-year recurrence). BottomStart - the one remaining
+    // unused corner, since TopEnd/BottomEnd are already hasManualEntry's/hasNote's own dots.
+    hasMilestone: Boolean = false
 ) {
     // isStreakHighlight (Feature 1: "this is the streak Stats sent you to look at") is deliberately a
     // DIFFERENT visual channel than isToday's fill - a tertiary border, so a highlighted streak day that
@@ -568,6 +610,17 @@ private fun DayCell(
                     .size(5.dp)
                     .clip(CircleShape)
                     .background(MaterialTheme.colorScheme.secondary)
+            )
+        }
+        // BUG fix (user-reported): the app-wide milestone emoji (see Home's Quick Links/Milestones'
+        // own empty state) rather than another plain dot - a milestone is a bigger deal than a day
+        // note/manual entry, worth being recognizable at a glance rather than blending into the same
+        // dot convention.
+        if (hasMilestone) {
+            Text(
+                "🎉",
+                fontSize = 8.sp,
+                modifier = Modifier.align(Alignment.BottomStart).padding(bottom = 1.dp, start = 1.dp)
             )
         }
     }
