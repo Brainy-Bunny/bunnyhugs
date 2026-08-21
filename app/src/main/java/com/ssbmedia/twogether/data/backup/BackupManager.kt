@@ -843,6 +843,29 @@ object BackupManager {
                 }
             }
 
+            // MAJOR fix (independent audit): every restored TimeCapsule above lands with unlockedAt = null
+            // (parseTimeCapsules' own SECURITY fix - never trusts a backup's claimed unlock status), by
+            // design relying on the NEXT unlockEligible() call to re-derive which ones are genuinely still
+            // locked vs. already passed. Before this fix, that "next call" was whichever of
+            // ProximityForegroundService's tick or CapsulesViewModel's own opportunistic collector happened
+            // to run first after this restore completes - and it had no way to tell "genuinely new unlock"
+            // apart from "restore catch-up re-deriving a capsule that unlocked months ago", so it fired one
+            // loud, DND-bypassing "just unlocked!" notification for EVERY capsule the restored history had
+            // already earned. A couple restoring onto a new phone with 6 already-opened capsules got 6
+            // simultaneous false alerts. Running ONE silent catch-up pass here, immediately after the
+            // restored sessions/capsules are both in the DB, means every genuinely-already-passed capsule
+            // is already unlocked by the time either of those real callers next runs - so THEIR calls only
+            // ever report (and correctly notify for) a capsule that's actually newly unlocked from this
+            // point forward. lastSeenAt/reunionCount default to their documented safe fallbacks (0L / 0) -
+            // there's no live proximity state to read immediately after a restore, and StatsCalculator.
+            // compute's own doc says 0L still correctly clamps rather than running unclamped.
+            run {
+                val restoredSessions = db.sessionDao().getAll()
+                val restoredManualCredit = com.ssbmedia.twogether.stats.StatsCalculator.manualHoursCredit(restoredSessions)
+                val restoredTotalHours = com.ssbmedia.twogether.stats.StatsCalculator.compute(restoredSessions).totalHoursAllTime.toFloat()
+                ServiceLocator.timeCapsuleRepository.unlockEligible(restoredTotalHours, restoredManualCredit)
+            }
+
             // SECURITY: secretHash/plainCode/lastSecretHash/lastPlainCode/pinHash are deliberately NEVER
             // read from the backup JSON, even if present (an OLD backup made before this fix still has
             // them) - restoring them would reintroduce a secret this app now refuses to ever let leave
