@@ -238,6 +238,13 @@ class HomeViewModel : ViewModel() {
     // own doc), this holds all of them (capped) so MemoryThrowbackCard can page through them; a plain
     // random pick (no anniversary match) is always a single-element list.
     val memoryMoments: MutableStateFlow<List<Moment>> = MutableStateFlow(emptyList())
+    // MINOR fix (independent audit): MemoryThrowbackCard used to infer "is this an anniversary match"
+    // from `moments.size > 1` - correct in the direction it reasoned (more than one photo can ONLY
+    // happen for an anniversary match), but the reverse wasn't handled: an anniversary pool of EXACTLY
+    // one photo (there's only ever been one other year with a photo on this exact date so far) is also
+    // size 1, so it silently fell into the generic "A memory from Xh ago" framing - even though the app
+    // genuinely knows it's an on-this-day match. Explicit flag instead of inferring from list size.
+    val memoryMomentsIsAnniversary: MutableStateFlow<Boolean> = MutableStateFlow(false)
 
     /** Only ever picks from moments this device actually HOLDS the photo bytes for - a remote-stub
      * moment (partner's photo metadata synced, but the bytes haven't transferred yet - see
@@ -271,10 +278,12 @@ class HomeViewModel : ViewModel() {
             val takenDate = Instant.ofEpochMilli(moment.takenAt).atZone(zone).toLocalDate()
             takenDate.monthValue == today.monthValue && takenDate.dayOfMonth == today.dayOfMonth && takenDate.year != today.year
         }.sortedByDescending { it.takenAt }
-        memoryMoments.value = if (anniversaryPool.isNotEmpty()) {
-            anniversaryPool.take(MAX_MEMORY_SLIDESHOW_PHOTOS)
+        if (anniversaryPool.isNotEmpty()) {
+            memoryMoments.value = anniversaryPool.take(MAX_MEMORY_SLIDESHOW_PHOTOS)
+            memoryMomentsIsAnniversary.value = true
         } else {
-            listOf(withPhoto.random())
+            memoryMoments.value = listOf(withPhoto.random())
+            memoryMomentsIsAnniversary.value = false
         }
     }
 
@@ -310,6 +319,7 @@ fun HomeScreen(
     val proximityState by vm.proximityState.collectAsState()
     val moments by vm.moments.collectAsState()
     val memoryMoments by vm.memoryMoments.collectAsState()
+    val memoryMomentsIsAnniversary by vm.memoryMomentsIsAnniversary.collectAsState()
     val milestones by vm.milestones.collectAsState()
     val quickLinksOrder by vm.quickLinksOrder.collectAsState()
     val settings by vm.settings.collectAsState()
@@ -815,6 +825,7 @@ fun HomeScreen(
                     // match) - see HomeViewModel.pickRandomMomentIfNeeded's own doc.
                     MemoryThrowbackCard(
                         moments = memoryMoments,
+                        isAnniversary = memoryMomentsIsAnniversary,
                         milestones = milestones,
                         now = now,
                         onOpenMoments = onOpenMoments
@@ -1437,6 +1448,11 @@ private fun NotificationInboxSheet(
 @Composable
 private fun MemoryThrowbackCard(
     moments: List<Moment>,
+    // MINOR fix (independent audit): was inferred from `moments.size > 1`, which only catches an
+    // anniversary match with MULTIPLE qualifying years - a match with exactly one other year (list
+    // size 1, identical to a plain random pick) silently fell into the generic "A memory from…"
+    // framing even though the app genuinely knows it's an on-this-day photo. Explicit flag instead.
+    isAnniversary: Boolean,
     milestones: List<Milestone>,
     now: Long,
     onOpenMoments: (jumpToEpochDay: Long) -> Unit = {}
@@ -1492,12 +1508,15 @@ private fun MemoryThrowbackCard(
                         if (milestoneLabel != null) {
                             Text("📸 $milestoneLabel", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                             Text("From ${timeAgo(moment.takenAt, now)} 💛", style = MaterialTheme.typography.bodySmall)
-                        } else if (moments.size > 1) {
-                            // More than one qualifying photo only ever happens for an anniversary-day
-                            // match (see pickRandomMomentIfNeeded) - a plain random pick is always a
-                            // single-element list, so reaching this branch already implies "on this day".
+                        } else if (isAnniversary) {
                             Text("📸 On this day, ${timeAgo(moment.takenAt, now)}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                            Text("Swipe for more from this day 💛", style = MaterialTheme.typography.bodySmall)
+                            // "Swipe for more" only makes sense when there's actually a second page to
+                            // swipe to - an anniversary match with exactly one qualifying year is still
+                            // "on this day" framing, just without that line.
+                            Text(
+                                if (moments.size > 1) "Swipe for more from this day 💛" else "A memory from this day, years ago 💛",
+                                style = MaterialTheme.typography.bodySmall
+                            )
                         } else {
                             Text("📸 A memory from ${timeAgo(moment.takenAt, now)}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                             Text("A little throwback for you two 💛", style = MaterialTheme.typography.bodySmall)

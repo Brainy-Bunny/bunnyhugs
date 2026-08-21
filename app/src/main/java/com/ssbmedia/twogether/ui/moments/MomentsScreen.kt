@@ -55,6 +55,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -236,10 +237,22 @@ fun MomentsScreen(
                     // treats even a single-finger drag as a pan gesture and would consume it - stealing
                     // the LazyColumn's own one-finger scroll. This way a normal scroll passes through
                     // untouched and only an actual two-finger pinch resizes thumbnails.
+                    //
+                    // MAJOR fix (independent audit, verified against Compose's own pass-dispatch order):
+                    // this modifier sits OUTSIDE (earlier in the chain than) LazyColumn's own internal
+                    // `.scrollable()` node, and awaitPointerEvent() defaults to PointerEventPass.Main,
+                    // which dispatches child-before-parent - so the scrollable (the child here) already
+                    // saw and started acting on the drag BEFORE this block's own `event.consume()` ever
+                    // ran, since that only runs on ITS turn, afterward. In practice that meant a real
+                    // pinch (which always has some vertical component across two fingers) resized
+                    // thumbnails AND scrolled the list at the same time. PointerEventPass.Initial
+                    // dispatches parent-before-child instead, so THIS node sees (and can consume) the
+                    // event before the inner scrollable ever gets a turn - the only pass where consuming
+                    // here can actually deny it.
                     .pointerInput(Unit) {
                         awaitEachGesture {
                             do {
-                                val event = awaitPointerEvent()
+                                val event = awaitPointerEvent(PointerEventPass.Initial)
                                 if (event.changes.size >= 2) {
                                     val zoom = event.calculateZoom()
                                     if (zoom != 1f) {
@@ -332,8 +345,14 @@ private fun MomentThumbnail(moment: Moment, isTransferring: Boolean, size: andro
         AsyncImage(
             model = ImageRequest.Builder(LocalContext.current)
                 .data(moment.photoUri)
-                .memoryCacheKey("${moment.photoUri}:$cacheBustKey")
-                .diskCacheKey("${moment.photoUri}:$cacheBustKey")
+                // MINOR fix (independent audit): a bare "$photoUri:$key" was shared with the
+                // full-screen viewer's own cache key below despite the two rendering at very different
+                // sizes/ContentScale - explicitly setting memoryCacheKey/diskCacheKey REPLACES Coil's
+                // own size-aware default key, so the grid and viewer requests collided on one cache
+                // entry and evicted each other's bitmap (open a photo, back out, the grid re-decoded
+                // from disk every time). "grid" discriminates this site from the viewer's "full".
+                .memoryCacheKey("${moment.photoUri}:$cacheBustKey:grid")
+                .diskCacheKey("${moment.photoUri}:$cacheBustKey:grid")
                 .build(),
             contentDescription = "Moment",
             contentScale = ContentScale.Crop,
@@ -435,8 +454,11 @@ private fun MomentFullScreen(
                     AsyncImage(
                         model = ImageRequest.Builder(context)
                             .data(moment.photoUri)
-                            .memoryCacheKey("${moment.photoUri}:$photoCacheBustKey")
-                            .diskCacheKey("${moment.photoUri}:$photoCacheBustKey")
+                            // See the grid thumbnail's own matching comment - "full" discriminates this
+                            // viewer's cache entry from the grid's "grid" one so the two sizes stop
+                            // evicting each other.
+                            .memoryCacheKey("${moment.photoUri}:$photoCacheBustKey:full")
+                            .diskCacheKey("${moment.photoUri}:$photoCacheBustKey:full")
                             .build(),
                         contentDescription = "Moment",
                         contentScale = ContentScale.Fit,
