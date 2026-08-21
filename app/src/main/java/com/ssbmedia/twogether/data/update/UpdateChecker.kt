@@ -33,6 +33,13 @@ object UpdateChecker {
         "https://api.github.com/repos/Brainy-Bunny/bunnyhugs/releases/latest"
     private const val APK_FILE_NAME = "twogether-update.apk"
 
+    /** Human-facing GitHub releases page (as opposed to [RELEASES_LATEST_URL]'s API endpoint) - the
+     * manual-download fallback SettingsScreen offers when the automatic check/download fails, so the
+     * user isn't stuck if their network blocks/throttles this app's own HttpURLConnection call but a
+     * normal browser can still reach github.com fine. Public, unlike the rest of this object's
+     * constants, since SettingsScreen needs it directly. */
+    const val RELEASES_PAGE_URL = "https://github.com/Brainy-Bunny/bunnyhugs/releases/latest"
+
     /** Don't let app-start's own check re-hit the network on every reopen - the daily UpdateWorker
      * covers the periodic case regardless; this just bounds the extra app-start check to a few times
      * a day at most, per the task's "don't re-check more than once every several hours" ask. Also used

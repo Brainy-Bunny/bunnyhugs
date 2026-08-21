@@ -2,6 +2,7 @@ package com.ssbmedia.twogether.ui.settings
 
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.util.Log
 import androidx.biometric.BiometricManager
 import androidx.compose.foundation.layout.Arrangement
@@ -336,6 +337,10 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
     var backupMessage by remember { mutableStateOf<String?>(null) }
     var isCheckingForUpdate by remember { mutableStateOf(false) }
     var updateCheckMessage by remember { mutableStateOf<String?>(null) }
+    // Manual-download fallback: only offered for the two outcomes where the automatic path genuinely
+    // couldn't reach/finish talking to GitHub (DownloadFailed, CheckFailed) - not shown for
+    // UpdateAvailable/UpToDate, where there's nothing to fall back to.
+    var updateCheckOfferManualDownload by remember { mutableStateOf(false) }
 
     // "Sync now" - same mechanism OurListsScreen's own button uses (AppEvents.requestManualSync), just
     // surfaced here too since a full sync is convenient to trigger without having to go into Our Lists
@@ -693,14 +698,16 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                             isCheckingForUpdate = true
                             vm.checkForUpdatesNow(context) { outcome ->
                                 isCheckingForUpdate = false
+                                updateCheckOfferManualDownload = outcome is UpdateChecker.CheckOutcome.DownloadFailed ||
+                                    outcome is UpdateChecker.CheckOutcome.CheckFailed
                                 updateCheckMessage = when (outcome) {
                                     is UpdateChecker.CheckOutcome.UpdateAvailable ->
                                         "Update ${outcome.info.versionName} downloaded — check your notifications to install it."
                                     UpdateChecker.CheckOutcome.UpToDate -> "You're up to date."
                                     UpdateChecker.CheckOutcome.DownloadFailed ->
-                                        "Found a newer version, but the download failed. Check your connection and try again."
+                                        "Found a newer version, but the download failed. Check your connection and try again, or download it manually below."
                                     UpdateChecker.CheckOutcome.CheckFailed ->
-                                        "Couldn't check for updates. Check your connection and try again."
+                                        "Couldn't check for updates. Check your connection and try again, or download it manually below."
                                 }
                             }
                         }) { Text("Check now") }
@@ -822,7 +829,29 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
             onDismissRequest = { updateCheckMessage = null },
             title = { Text("Check for updates") },
             text = { Text(updateCheckMessage.orEmpty()) },
-            confirmButton = { TextButton(onClick = { updateCheckMessage = null }) { Text("OK") } }
+            confirmButton = { TextButton(onClick = { updateCheckMessage = null }) { Text("OK") } },
+            dismissButton = if (updateCheckOfferManualDownload) {
+                {
+                    TextButton(onClick = {
+                        updateCheckMessage = null
+                        // Manual fallback for the exact case the automatic path can't recover from on
+                        // its own: this app's own HttpURLConnection call to the GitHub API/CDN failed,
+                        // but a normal browser reaching github.com is a genuinely different network path
+                        // (different DNS/TLS stack, different host in some blocked/throttled-app
+                        // scenarios) and may well succeed where the in-app request didn't.
+                        try {
+                            context.startActivity(
+                                Intent(Intent.ACTION_VIEW, Uri.parse(UpdateChecker.RELEASES_PAGE_URL)).apply {
+                                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                                }
+                            )
+                        } catch (e: Exception) {
+                            // No browser available to handle ACTION_VIEW - vanishingly rare on a real
+                            // Android device, but this button must never crash Settings if it happens.
+                        }
+                    }) { Text("Download manually") }
+                }
+            } else null
         )
     }
 
