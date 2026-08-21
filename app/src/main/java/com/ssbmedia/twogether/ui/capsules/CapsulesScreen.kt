@@ -75,6 +75,18 @@ class CapsulesViewModel : ViewModel() {
         // if it wasn't running). Run it opportunistically here too, any time this screen's session or
         // proximity data loads or changes. See TimeCapsuleRepository.unlockEligible's doc for the
         // auto-adjusting-threshold anti-cheat this feeds into.
+        //
+        // MAJOR fix (independent audit): this collector used to discard unlockEligible's returned list.
+        // It fires far more often than ProximityForegroundService's own 60s-gated tick (every single
+        // proximity/session emission), so whenever this ViewModel was alive - which includes staying on
+        // the back stack after the user backgrounds the app without pressing back - it almost always won
+        // the race to actually flip a capsule's row, silently swallowing the "just unlocked!" notification
+        // the service's own tick would otherwise have fired, directly contradicting
+        // showCapsuleUnlockedNotification's own doc ("fires close to the real unlock moment regardless of
+        // whether anyone has the Capsules screen open"). Now this collector fires the SAME notification
+        // for whatever it actually unlocks, mirroring the service's own loop - between this fix and the
+        // DAO's own `AND unlockedAt IS NULL` guard (see unlockIfNotDeleted's doc), whichever of the two
+        // callers actually wins a given capsule's row is now also the one that correctly notifies for it.
         viewModelScope.launch {
             combine(sessions, proximityState) { list, state -> list to state }.collect { (list, state) ->
                 // state.lastSeenAt <= 0L means proximityState's cold DataStore-backed flow hasn't
@@ -87,7 +99,10 @@ class CapsulesViewModel : ViewModel() {
                 if (list.isEmpty() || state.lastSeenAt <= 0L) return@collect
                 val hours = StatsCalculator.compute(list, lastSeenAt = state.lastSeenAt, reunionCount = state.reunionCount).totalHoursAllTime.toFloat()
                 val manualCredit = StatsCalculator.manualHoursCredit(list, lastSeenAt = state.lastSeenAt)
-                ServiceLocator.timeCapsuleRepository.unlockEligible(hours, manualCredit)
+                val newlyUnlocked = ServiceLocator.timeCapsuleRepository.unlockEligible(hours, manualCredit)
+                newlyUnlocked.forEach { capsule ->
+                    com.ssbmedia.twogether.notif.Notifications.showCapsuleUnlockedNotification(ServiceLocator.appContext, capsule.id)
+                }
             }
         }
     }

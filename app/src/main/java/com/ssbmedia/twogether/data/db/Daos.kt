@@ -101,10 +101,19 @@ interface TimeCapsuleDao {
      * still-eligible, still-active capsule would unlock it normally regardless. */
     // User-requested (capsule-unlock notification): now returns the affected row count (Room supports
     // this natively for an @Query UPDATE, no query-shape change needed) so TimeCapsuleRepository.
-    // unlockEligible can tell whether THIS call actually won the row - see its own doc for why that
-    // matters (the tiny concurrent-delete race this WHERE clause already guards against was previously
-    // invisible to the caller, which had no way to distinguish "unlocked" from "lost the race").
-    @Query("UPDATE time_capsules SET unlockedAt = :unlockedAt, updatedAt = :updatedAt WHERE id = :id AND deleted = 0")
+    // unlockEligible can tell whether THIS call actually won the row.
+    //
+    // MAJOR fix (independent audit): added `AND unlockedAt IS NULL` - without it, the doc above (and
+    // unlockEligible's own doc) INCORRECTLY claimed this WHERE clause already prevented double-counting
+    // a capsule as newly-unlocked, but a row-count > 0 only ever meant "the row exists and isn't
+    // tombstoned", not "this call is the one that flipped it". There are genuinely two concurrent callers
+    // of unlockEligible in this app (ProximityForegroundService's periodic tick, and
+    // CapsulesViewModel's own opportunistic collector) - both could see a capsule as locked via
+    // getLocked(), both UPDATEs would return 1, and both would report it as newly-unlocked, each firing
+    // its own "just unlocked!" notification for the same capsule. This condition makes the SQL itself
+    // decide the race: only whichever caller's UPDATE actually runs first flips unlockedAt from NULL and
+    // gets rowCount=1; the other's WHERE no longer matches and it correctly gets rowCount=0.
+    @Query("UPDATE time_capsules SET unlockedAt = :unlockedAt, updatedAt = :updatedAt WHERE id = :id AND deleted = 0 AND unlockedAt IS NULL")
     suspend fun unlockIfNotDeleted(id: Long, unlockedAt: Long, updatedAt: Long): Int
 
     /** MINOR fix (code-review, Sonnet - same race class as [unlockIfNotDeleted], one call site over):

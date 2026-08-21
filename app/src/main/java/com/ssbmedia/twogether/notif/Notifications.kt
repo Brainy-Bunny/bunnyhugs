@@ -388,12 +388,24 @@ object Notifications {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return false
         if (!BlePermissions.hasNotificationPermission(context)) return false
 
+        // BLOCKER fix (independent audit, live-reproducible): was `capsuleId.hashCode()` as the
+        // PendingIntent requestCode directly - `Long.hashCode()` of the very first capsule (id=1) IS 1,
+        // which collides with showPhotoReminder's own hardcoded requestCode 1 (Notifications.kt, same
+        // MainActivity-with-no-distinguishing-extras Intent shape - PendingIntent identity is (package,
+        // requestCode, Intent.filterEquals), and filterEquals ignores extras). Both notifications end up
+        // sharing ONE PendingIntent object; FLAG_UPDATE_CURRENT means whichever fires SECOND silently
+        // overwrites the first's extras in place - the still-showing capsule notification then opens
+        // whatever the other one's extra says (Camera instead of Capsules, or vice versa). Using the
+        // actual notificationId (same pattern showListItemReminder/showListReminder already establish -
+        // they compute their own notificationId first and pass THAT as the requestCode) keeps every
+        // notification's tap-intent identity as unique as its own notification slot already is.
+        val notificationId = CAPSULE_UNLOCKED_NOTIFICATION_ID_BASE + (capsuleId.hashCode() and 0x0FFFFFFF)
         val openIntent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra(EXTRA_OPEN_CAPSULES, true)
         }
         val pendingIntent = PendingIntent.getActivity(
-            context, capsuleId.hashCode(), openIntent,
+            context, notificationId, openIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
@@ -407,7 +419,7 @@ object Notifications {
             .setCategory(NotificationCompat.CATEGORY_EVENT)
             .build()
 
-        manager.notify(CAPSULE_UNLOCKED_NOTIFICATION_ID_BASE + (capsuleId.hashCode() and 0x0FFFFFFF), notification)
+        manager.notify(notificationId, notification)
         return true
     }
 

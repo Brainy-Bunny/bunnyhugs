@@ -22,7 +22,11 @@ import kotlinx.coroutines.SupervisorJob
 
 /** Simple hand-rolled service locator: no DI framework needed for an app this size. */
 object ServiceLocator {
-    private lateinit var appContext: Context
+    // MAJOR fix (independent audit): was private - CapsulesViewModel needs the (Application-scoped, so
+    // no leak risk) context to fire a capsule-unlock notification from its own init{} collector, which
+    // runs off viewModelScope with no Compose LocalContext available to thread in.
+    lateinit var appContext: Context
+        private set
 
     fun init(context: Context) {
         appContext = context.applicationContext

@@ -440,15 +440,24 @@ class TimeCapsuleRepository(private val dao: TimeCapsuleDao) {
      * manualHoursAtCreation, silently pulling effectiveThreshold BELOW the capsule's own stated
      * unlockAtHours - an honest-case bug (unlock arriving early) with the same root cause, closed by the
      * same clamp.
-     */
-    /** User-requested: returns whichever of [locked]'s capsules this call actually unlocked, so the
-     * caller (ProximityForegroundService) can fire a "Time Capsule unlocked!" notification per capsule -
-     * see Notifications.showCapsuleUnlockedNotification's own doc. Only ever reports a capsule as
-     * newly-unlocked if THIS call is the one that flips it (dao.unlockIfNotDeleted's own
-     * `unlockedAt IS NULL` condition already guards against double-unlocking; mirroring that guard here
-     * in Kotlin too, rather than trusting the passed-in [locked] snapshot alone, means a capsule that
-     * lost the race against a concurrent delete is never reported as unlocked when it didn't actually
-     * unlock at all). */
+     *
+     * MINOR fix (independent audit): this doc used to be immediately followed by a SECOND, separate
+     * `/** */` block - only the nearer one binds as this function's actual KDoc in Kotlin/Dokka, so this
+     * entire ANTI-CHEAT/BLOCKER-fix derivation was silently orphaned (undocumented) the moment that
+     * second block was added. Merged back into one.
+     *
+     * User-requested (capsule-unlock notification): also returns whichever capsules THIS call actually
+     * unlocked, so callers (ProximityForegroundService's tick, CapsulesViewModel's own opportunistic
+     * collector) can fire a "Time Capsule unlocked!" notification per capsule - see
+     * Notifications.showCapsuleUnlockedNotification's own doc. Only ever reports a capsule as
+     * newly-unlocked if THIS call is the one that flips it: `dao.unlockIfNotDeleted`'s WHERE clause
+     * includes `AND unlockedAt IS NULL` (MAJOR fix, independent audit - this doc previously claimed that
+     * guard already existed when it didn't, which mattered in practice: with two genuinely concurrent
+     * callers of this function, both could see a capsule as locked, both writes could return an affected
+     * row, and both would report + notify for the same capsule). With the guard actually in place, the
+     * affected-row check below is trustworthy on its own - only whichever caller's write physically wins
+     * the race gets a nonzero count, so there's no need to separately re-check `deleted`/`unlockedAt` in
+     * Kotlin against the (possibly now-stale) [locked] snapshot. */
     suspend fun unlockEligible(totalHours: Float, currentManualHoursCredit: Float): List<TimeCapsule> {
         val locked = dao.getLocked()
         val now = System.currentTimeMillis()
