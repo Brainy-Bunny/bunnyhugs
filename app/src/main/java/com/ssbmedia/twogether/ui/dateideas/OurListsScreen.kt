@@ -38,9 +38,11 @@ import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -588,15 +590,29 @@ private fun ListCategoryCard(
                             modifier = Modifier.padding(vertical = 8.dp)
                         )
                     } else {
+                        // BLOCKER fix (independent audit, live-reproducible): rememberSwipeToDismissBoxState
+                        // (material3 1.3.0) creates its SwipeToDismissBoxState via a plain rememberSaveable
+                        // with NO inputs, so it's created once per COMPOSITION SLOT and permanently captures
+                        // whichever confirmValueChange lambda (and the onDelete it closes over) was live the
+                        // first time that slot composed. A bare forEach matches slots by POSITION, not by
+                        // idea identity - so checking off (or deleting) any idea before the LAST one in this
+                        // list shifts every idea after it into a slot that still holds a PREVIOUS idea's
+                        // captured delete closure. Swiping the row now showing "Picnic" could silently
+                        // delete "Movie night" instead - the single most common action on this screen.
+                        // key(idea.id) ties each row's slot to that specific idea's stable id, so a
+                        // reshuffle moves the SLOT (and its captured state) along with its idea, rather than
+                        // reusing a stale slot for a new one.
                         activeIdeas.forEach { idea ->
-                            DateIdeaRow(
-                                idea = idea,
-                                onToggle = { onToggleIdea(idea) },
-                                onDelete = { onDeleteIdea(idea) },
-                                onRename = { onRenameIdea(idea) },
-                                onReminderClick = { onReminderIdeaClick(idea) },
-                                modifier = Modifier.padding(vertical = 4.dp)
-                            )
+                            key(idea.id) {
+                                DateIdeaRow(
+                                    idea = idea,
+                                    onToggle = { onToggleIdea(idea) },
+                                    onDelete = { onDeleteIdea(idea) },
+                                    onRename = { onRenameIdea(idea) },
+                                    onReminderClick = { onReminderIdeaClick(idea) },
+                                    modifier = Modifier.padding(vertical = 4.dp)
+                                )
+                            }
                         }
                     }
 
@@ -624,15 +640,18 @@ private fun ListCategoryCard(
                             )
                         }
                         if (showCompleted) {
+                            // See the activeIdeas forEach's own doc just above for why key() is required here.
                             completedIdeas.forEach { idea ->
-                                DateIdeaRow(
-                                    idea = idea,
-                                    onToggle = { onToggleIdea(idea) },
-                                    onDelete = { onDeleteIdea(idea) },
-                                    onRename = { onRenameIdea(idea) },
-                                    onReminderClick = { onReminderIdeaClick(idea) },
-                                    modifier = Modifier.padding(vertical = 4.dp)
-                                )
+                                key(idea.id) {
+                                    DateIdeaRow(
+                                        idea = idea,
+                                        onToggle = { onToggleIdea(idea) },
+                                        onDelete = { onDeleteIdea(idea) },
+                                        onRename = { onRenameIdea(idea) },
+                                        onReminderClick = { onReminderIdeaClick(idea) },
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+                                }
                             }
                         }
                     }
@@ -662,9 +681,17 @@ private fun DateIdeaRow(
     onReminderClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    // MINOR-but-defense-in-depth (independent audit): rememberSwipeToDismissBoxState's own rememberSaveable
+    // has no inputs, so it (and whatever confirmValueChange closure was passed the FIRST time this
+    // composition slot ran) never gets recreated on a later recomposition of the SAME slot - the key(idea.id)
+    // wrapper at both call sites is what stops a DIFFERENT idea from ever reusing this slot, but reading
+    // onDelete through rememberUpdatedState here too means even a same-idea recomposition (e.g. its text
+    // was renamed, same id, same slot) always calls the CURRENT onDelete, not whatever was captured on
+    // first composition.
+    val currentOnDelete by rememberUpdatedState(onDelete)
     val dismissState = rememberSwipeToDismissBoxState(
         confirmValueChange = { value ->
-            if (value == SwipeToDismissBoxValue.EndToStart) onDelete()
+            if (value == SwipeToDismissBoxValue.EndToStart) currentOnDelete()
             false
         }
     )

@@ -262,12 +262,26 @@ fun MilestonesScreen(
                     // exact-dated milestones (milestone.year != null) - a recurring milestone with no
                     // year still has a real "this specific day" per occurrence, and showing whichever
                     // year's photo exists is strictly more informative than showing nothing.
+                    // MAJOR fix (independent audit): the fallback used to pick the newest year's newest
+                    // photo with no regard for whether THIS device actually holds its bytes yet
+                    // (Moment.photoDownloaded / File(photoUri).isFile - a partner's photo can sync its
+                    // ROW before its BYTES finish transferring, see Moment.photoDownloaded's own doc).
+                    // If that one candidate wasn't locally available, the card silently showed NO photo
+                    // at all - even when an older year's (or an earlier-that-same-day) photo WAS already
+                    // on disk. Unlike the explicit-link path (where "unresolvable -> no photo" is the
+                    // documented intent), the whole point of this auto-fallback is "show a sensible
+                    // photo" - so it now filters to locally-displayable candidates within each year
+                    // first, and falls through to an EARLIER year if the newest year's photos aren't
+                    // downloaded yet, rather than giving up after the single newest candidate.
                     val linkedMoment = remember(moments, milestone.linkedMomentSyncId, milestone.month, milestone.day) {
                         val explicit = milestone.linkedMomentSyncId?.let { syncId -> moments.firstOrNull { it.syncId == syncId } }
                         explicit ?: if (milestone.linkedMomentSyncId == null) {
                             matchingMomentsByYear(moments, milestone.month, milestone.day, zone)
-                                .values.firstOrNull()
-                                ?.maxByOrNull { it.takenAt }
+                                .values.asSequence()
+                                .mapNotNull { yearMoments ->
+                                    yearMoments.filter { it.photoDownloaded && File(it.photoUri).isFile }.maxByOrNull { it.takenAt }
+                                }
+                                .firstOrNull()
                         } else null
                     }
                     val hasLinkedPhoto = linkedMoment != null && linkedMoment.photoDownloaded && File(linkedMoment.photoUri).isFile
@@ -283,8 +297,19 @@ fun MilestonesScreen(
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 if (hasLinkedPhoto) {
+                                    // MINOR fix (independent audit): this was a bare `model = photoUri`
+                                    // with no cache-bust key at all - PhotoEditor.cacheBustKey's own doc
+                                    // claims every photo-rendering site folds this in, which wasn't true
+                                    // here. Without it, rotating this exact photo left this 48dp preview
+                                    // showing the pre-rotate orientation forever (it never self-heals,
+                                    // unlike a site that DOES key by mtime).
+                                    val cacheBustKey = remember(linkedMoment!!.photoUri) { PhotoEditor.cacheBustKey(linkedMoment.photoUri) }
                                     AsyncImage(
-                                        model = linkedMoment!!.photoUri,
+                                        model = ImageRequest.Builder(LocalContext.current)
+                                            .data(linkedMoment.photoUri)
+                                            .memoryCacheKey("${linkedMoment.photoUri}:$cacheBustKey")
+                                            .diskCacheKey("${linkedMoment.photoUri}:$cacheBustKey")
+                                            .build(),
                                         contentDescription = "${milestone.label} photo",
                                         contentScale = ContentScale.Crop,
                                         modifier = Modifier.size(48.dp).clip(RoundedCornerShape(10.dp))
@@ -762,16 +787,12 @@ private fun MilestoneRetrospective(
     }
 }
 
-/** BLOCKER fix, defense-in-depth: month/day here come straight from a stored [Milestone] row - as of
- * v2.3, both known ingestion points (BackupManager.parseMilestones, GattSyncManager.deserializeMilestones)
- * clamp these before they ever reach the DB, so a NEWLY-arriving bad value can no longer get in. But a row
- * that was already corrupted BEFORE that fix shipped (e.g. synced from a partner still on v2.2, or
- * restored from a backup taken back then) is still sitting in some phone's local DB right now, unclamped
- * - and Month.of(month) throws for anything outside 1-12, which would crash this screen (and the
- * retrospective view, which shares this same formatter) every time it tried to render that one row.
- * Clamped here too, at the single shared formatter both call sites go through, so a pre-existing bad row
- * displays a nearest-valid label instead of crashing - matching MilestoneAlarmScheduler.safeDate's own
- * defensive clamp for the exact same reason. */
+// MINOR fix (independent audit): the "BLOCKER fix, defense-in-depth" doc below used to be stacked
+// directly above matchingMomentsByYear as a SECOND KDoc block preceding monthDayLabel - Kotlin/Dokka
+// only bind the NEAREST KDoc to a declaration, so that doc was silently orphaned (documenting
+// matchingMomentsByYear, which does no clamping, while monthDayLabel's actual coerceIn crash-fix went
+// undocumented). Moved back down to sit directly above the function it actually describes.
+
 /** User-requested (milestone photo auto-sync): every Moment whose takenAt falls on the given month+day,
  * in ANY year, grouped by year and sorted most-recent-year-first - extracted from
  * [MilestoneRetrospective]'s own "throughout the years" gallery (unchanged behavior there) so the
@@ -787,6 +808,16 @@ private fun matchingMomentsByYear(moments: List<Moment>, month: Int, day: Int, z
         .groupBy { Instant.ofEpochMilli(it.takenAt).atZone(zone).toLocalDate().year }
         .toSortedMap(compareByDescending { it })
 
+/** BLOCKER fix, defense-in-depth: month/day here come straight from a stored [Milestone] row - as of
+ * v2.3, both known ingestion points (BackupManager.parseMilestones, GattSyncManager.deserializeMilestones)
+ * clamp these before they ever reach the DB, so a NEWLY-arriving bad value can no longer get in. But a row
+ * that was already corrupted BEFORE that fix shipped (e.g. synced from a partner still on v2.2, or
+ * restored from a backup taken back then) is still sitting in some phone's local DB right now, unclamped
+ * - and Month.of(month) throws for anything outside 1-12, which would crash this screen (and the
+ * retrospective view, which shares this same formatter) every time it tried to render that one row.
+ * Clamped here too, at the single shared formatter both call sites go through, so a pre-existing bad row
+ * displays a nearest-valid label instead of crashing - matching MilestoneAlarmScheduler.safeDate's own
+ * defensive clamp for the exact same reason. */
 private fun monthDayLabel(month: Int, day: Int): String =
     "${Month.of(month.coerceIn(1, 12)).getDisplayName(TextStyle.FULL, Locale.getDefault())} ${day.coerceIn(1, 31)}"
 
