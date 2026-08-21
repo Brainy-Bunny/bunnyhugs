@@ -462,6 +462,14 @@ fun CameraScreen(onSaved: () -> Unit, onCancel: () -> Unit) {
                     ) {
                         OutlinedButton(onClick = {
                             file.delete()
+                            // MINOR fix (independent audit): a rotate that failed partway (e.g. this
+                            // exact photo hit PhotoEditor.rotateInPlace's own encode-failure/OOM path)
+                            // can leave a "<name>.rotate.part" temp file sitting next to it - only
+                            // rotateInPlace's OWN success path ever cleans that file up (by renaming it
+                            // onto `file`), so a failed rotate followed by Retake orphaned it in the same
+                            // moments/ directory real photos live in permanently, for anything that later
+                            // enumerates that directory (e.g. a backup) to pick up.
+                            File(file.parentFile, file.name + ".rotate.part").delete()
                             pendingReview = null
                         }) { Text("Retake") }
                         Button(onClick = {

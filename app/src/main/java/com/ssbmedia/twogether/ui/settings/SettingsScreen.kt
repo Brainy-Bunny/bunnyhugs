@@ -699,6 +699,17 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                                     // clear the stale flag rather than leaving a permanently-broken
                                     // "Install" button; the user can re-check to re-download it.
                                     vm.clearPendingUpdate()
+                                    // MINOR fix (independent audit): updateCheckOfferManualDownload is
+                                    // only ever written from the "Check now" callback below, never reset
+                                    // here - a PRIOR "Check now" tap that ended in DownloadFailed/
+                                    // CheckFailed left it true, which then leaked into THIS unrelated
+                                    // "cached APK missing" dialog, showing a manual-download button that
+                                    // makes no sense for this specific message (or the reverse: a prior
+                                    // successful check left it false, hiding the button here even though
+                                    // it's exactly what this message's own advice - "tap Check now" -
+                                    // could use as a shortcut). Explicit false: this outcome isn't one of
+                                    // the two DownloadFailed/CheckFailed cases the button exists for.
+                                    updateCheckOfferManualDownload = false
                                     updateCheckMessage = "That update file is no longer available - tap \"Check now\" to re-download it."
                                 }
                             }) { Text("Install") }
@@ -857,7 +868,6 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
             dismissButton = if (updateCheckOfferManualDownload) {
                 {
                     TextButton(onClick = {
-                        updateCheckMessage = null
                         // Manual fallback for the exact case the automatic path can't recover from on
                         // its own: this app's own HttpURLConnection call to the GitHub API/CDN failed,
                         // but a normal browser reaching github.com is a genuinely different network path
@@ -869,9 +879,18 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                                     flags = Intent.FLAG_ACTIVITY_NEW_TASK
                                 }
                             )
+                            // MINOR fix (independent audit): only clear the dialog once startActivity
+                            // actually succeeds - it used to close FIRST, so a thrown exception (no
+                            // browser installed to handle ACTION_VIEW) left the empty catch below with
+                            // no dialog left to show anything in, silently doing nothing on the one
+                            // screen whose entire purpose is telling the user what went wrong.
+                            updateCheckMessage = null
                         } catch (e: Exception) {
                             // No browser available to handle ACTION_VIEW - vanishingly rare on a real
                             // Android device, but this button must never crash Settings if it happens.
+                            // Leaves the dialog open with the direct URL instead of silently doing nothing.
+                            updateCheckOfferManualDownload = false
+                            updateCheckMessage = "Couldn't open a browser. Visit ${UpdateChecker.RELEASES_PAGE_URL} to download it."
                         }
                     }) { Text("Download manually") }
                 }
