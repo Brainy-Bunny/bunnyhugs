@@ -58,7 +58,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.data.db.DayNote
+import com.ssbmedia.twogether.data.db.Milestone
 import com.ssbmedia.twogether.data.db.TogetherSession
+import com.ssbmedia.twogether.ui.milestones.safeDateForYear
 import com.ssbmedia.twogether.ble.ProximityStateMachine
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.DatePickerField
@@ -73,7 +75,6 @@ import java.time.DayOfWeek
 import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalTime
-import java.time.MonthDay
 import java.time.YearMonth
 import java.time.ZoneId
 import java.time.format.TextStyle
@@ -208,14 +209,12 @@ fun CalendarScreen(
     val daysWithNotes = remember(dayNotes) {
         dayNotes.map { LocalDate.ofEpochDay(it.date) }.toSet()
     }
-    // BUG fix (user-reported): a Milestone recurs by month+day in EVERY year (see Milestone.month/day's
-    // own doc - year is purely informational, never part of the actual recurrence rule, same as the
-    // yearly notification's own firing logic), so this is keyed by MonthDay, not LocalDate - a single
-    // "First Date" milestone set for Dec 20th must mark Dec 20th on every year this screen pages through,
-    // not just one specific year.
-    val monthDaysWithMilestones = remember(milestones) {
-        milestones.map { MonthDay.of(it.month, it.day) }.toSet()
-    }
+    // BUG fix (user-reported): a Milestone recurs by month+day in EVERY year - a day cell has to match
+    // on month+day regardless of which year is displayed. BLOCKER fix (independent audit): matching used
+    // to build a `Set<MonthDay>` via `MonthDay.of(it.month, it.day)` directly, which THROWS
+    // DateTimeException for a day invalid for that month (e.g. month=2, day=31) - reachable via a
+    // partner sync or backup restore, both of which clamp month/day independently rather than jointly -
+    // crashing this screen on every open. See [milestoneMatchesDay]'s own doc for the fix.
 
     // Reuses StatsCalculator's qualifying-day count (same buildDailyMinuteMap() call above feeds it)
     // rather than re-deriving "day with any together-time" locally, so this can never drift from the
@@ -328,7 +327,7 @@ fun CalendarScreen(
                     val hasPhoto = day in daysWithPhotos
                     val hasManualEntry = day in daysWithManualEntry
                     val hasNote = day in daysWithNotes
-                    val hasMilestone = MonthDay.from(day) in monthDaysWithMilestones
+                    val hasMilestone = milestones.any { milestoneMatchesDay(it, day) }
                     val isStreakHighlight = highlightRange != null &&
                         !day.isBefore(highlightRange.first) && !day.isAfter(highlightRange.second)
                     DayCell(
@@ -381,13 +380,16 @@ fun CalendarScreen(
         val dayMomentsCount = remember(day, moments) {
             moments.count { Instant.ofEpochMilli(it.takenAt).atZone(zone).toLocalDate() == day }
         }
-        // BUG fix (user-reported): matches by month+day only (see monthDaysWithMilestones' own doc for
-        // why this screen's whole milestone awareness is keyed that way, not by exact LocalDate) - a
-        // milestone recurs every year, so this must find it regardless of which year is being viewed.
-        // firstOrNull, not a list: two milestones sharing the same month+day is an edge case this dialog
-        // doesn't need to handle specially, same as MilestonesScreen's own matchingMomentsByYear callers.
-        val milestoneForDay = remember(day, milestones) {
-            milestones.firstOrNull { it.month == day.monthValue && it.day == day.dayOfMonth }
+        // BUG fix (user-reported): matches via the same milestoneMatchesDay the grid marker itself uses
+        // (see its own doc) - a milestone recurs every year, so this must find it regardless of which
+        // year is being viewed, and must use the identical crash-safe/leap-year-aware logic the grid
+        // does so the two can never disagree about which days have a milestone.
+        //
+        // MINOR fix (independent audit): was firstOrNull, silently hiding every milestone but one on a
+        // day two happen to share (an ordinary thing for a couple - anniversaries cluster on meaningful
+        // dates) with no indication there was a second. Now a list, rendered one line each.
+        val milestonesForDay = remember(day, milestones) {
+            milestones.filter { milestoneMatchesDay(it, day) }
         }
         AlertDialog(
             onDismissRequest = { selectedDay = null },
@@ -400,7 +402,7 @@ fun CalendarScreen(
                 Column {
                     // BUG fix (user-reported): shown first - a milestone is the more notable fact about
                     // this day than the plain hours/minutes line below it.
-                    milestoneForDay?.let { milestone ->
+                    milestonesForDay.forEach { milestone ->
                         Text(
                             "🎉 ${milestone.label}",
                             style = MaterialTheme.typography.titleSmall,
@@ -617,9 +619,17 @@ private fun DayCell(
         // note/manual entry, worth being recognizable at a glance rather than blending into the same
         // dot convention.
         if (hasMilestone) {
+            // MINOR fix (independent audit): fontSize alone doesn't shrink the Text node's own
+            // lineHeight - MaterialTheme's ProvideTextStyle(typography.bodyLarge) leaves that at 24.sp
+            // regardless, so the layout node was ~24dp tall in a ~47dp cell (a 7-column aspectRatio(1f)
+            // grid on a 360dp phone) even though only an 8sp glyph was drawn inside it - at larger
+            // system font scales this collided with the centered day-number/dot column above it rather
+            // than sitting in the bottom-left corner this comment describes. Setting lineHeight
+            // explicitly keeps the node's actual size matched to the glyph it draws.
             Text(
                 "🎉",
                 fontSize = 8.sp,
+                lineHeight = 8.sp,
                 modifier = Modifier.align(Alignment.BottomStart).padding(bottom = 1.dp, start = 1.dp)
             )
         }
@@ -638,6 +648,34 @@ internal fun photoMarkerState(hasPhoto: Boolean, hasTogetherTime: Boolean): Phot
     hasPhoto -> PhotoMarkerState.HAS_PHOTO
     hasTogetherTime -> PhotoMarkerState.PROMPT_NO_PHOTO
     else -> PhotoMarkerState.NONE
+}
+
+/** Whether [milestone] (a recurring month+day, year purely informational - see [Milestone.month]/
+ * [Milestone.day]'s own doc) falls on [day], for the specific real year [day] happens to be in.
+ *
+ * BLOCKER fix (independent audit, live-reproducible crash): the previous approach built a plain
+ * `MonthDay.of(milestone.month, milestone.day)` - which THROWS `DateTimeException` for a day invalid
+ * for that month (e.g. month=2, day=31). Both untrusted ingestion paths
+ * (`GattSyncManager.deserializeMilestones`, `BackupManager.parseMilestones`) clamp `month` and `day`
+ * INDEPENDENTLY of each other (never checking the pair is jointly valid), so a row like that can
+ * genuinely reach the database via a partner sync or a backup restore - crashing this screen on every
+ * open, forever, until that specific row is deleted. Three OTHER milestone-consuming call sites already
+ * defend against exactly this ("BLOCKER fix, defense-in-depth" - `MilestoneAlarmScheduler.safeDate`,
+ * `MilestonesScreen.safeDateForYear`/`monthDayLabel`) by clamping the day against the REAL length of
+ * that month in a REAL year rather than constructing a year-independent `MonthDay` at all; this reuses
+ * `MilestonesScreen.safeDateForYear` (same module, `internal`) for the identical reason.
+ *
+ * Side effect of clamping per-real-year rather than building a fixed `MonthDay`: a Feb 29th milestone
+ * now correctly falls back to matching Feb 28th in a non-leap year, the same way the yearly notification
+ * already does (`safeDate`'s own per-year clamp) - a genuine `MonthDay.of(2, 29)` doesn't throw, but it
+ * also never equals `MonthDay.from(anyNonLeapYearDate)`, so before this fix the marker simply never
+ * appeared on a Feb-29 milestone outside a leap year.
+ *
+ * Top-level, not private, matching [photoMarkerState]'s own convention above - purely so this is
+ * unit-testable without any Compose UI test infra. */
+internal fun milestoneMatchesDay(milestone: Milestone, day: LocalDate): Boolean {
+    val safeDate = safeDateForYear(day.year, milestone.month, milestone.day)
+    return safeDate.monthValue == day.monthValue && safeDate.dayOfMonth == day.dayOfMonth
 }
 
 /** Item 4 (deferred UX fix, 4-model advisory audit): whether the month header's "Today" jump-back button

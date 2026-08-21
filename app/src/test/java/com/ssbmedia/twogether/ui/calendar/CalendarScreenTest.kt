@@ -1,9 +1,11 @@
 package com.ssbmedia.twogether.ui.calendar
 
+import com.ssbmedia.twogether.data.db.Milestone
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.time.LocalDate
 import java.time.YearMonth
 
 /**
@@ -30,6 +32,55 @@ class CalendarScreenTest {
     @Test
     fun `apart-day with no photo shows nothing`() {
         assertEquals(PhotoMarkerState.NONE, photoMarkerState(hasPhoto = false, hasTogetherTime = false))
+    }
+}
+
+/**
+ * BLOCKER fix (independent audit, live-reproducible crash): [milestoneMatchesDay] replaced a
+ * `MonthDay.of(month, day)` approach that THREW `DateTimeException` for a day invalid for that month
+ * (e.g. month=2, day=31) - reachable via a partner sync or backup restore, both of which clamp month/day
+ * independently rather than jointly. These tests prove the crash-prone inputs no longer throw, AND that
+ * the Feb-29-falls-back-to-Feb-28-in-a-non-leap-year behavior (matching the yearly notification's own
+ * established clamp) actually holds.
+ */
+class MilestoneMatchesDayTest {
+
+    private fun milestone(month: Int, day: Int) = Milestone(
+        id = "m1", label = "Test", month = month, day = day, createdAt = 0L, updatedAt = 0L
+    )
+
+    @Test
+    fun `matches the same month and day in any year`() {
+        val m = milestone(month = 12, day = 20)
+        assertTrue(milestoneMatchesDay(m, LocalDate.of(2025, 12, 20)))
+        assertTrue(milestoneMatchesDay(m, LocalDate.of(2030, 12, 20)))
+        assertFalse(milestoneMatchesDay(m, LocalDate.of(2025, 12, 21)))
+    }
+
+    @Test
+    fun `a corrupted day-for-month milestone does not throw, and matches nothing`() {
+        // month=2, day=31 - MonthDay.of(2, 31) would throw DateTimeException; safeDateForYear clamps
+        // day=31 down to February's real max (28 or 29), so this becomes an ordinary Feb 28/29 milestone
+        // rather than crashing the screen.
+        val corrupted = milestone(month = 2, day = 31)
+        assertTrue(milestoneMatchesDay(corrupted, LocalDate.of(2026, 2, 28)))
+        assertFalse(milestoneMatchesDay(corrupted, LocalDate.of(2026, 2, 27)))
+    }
+
+    @Test
+    fun `a Feb 29th milestone falls back to Feb 28th in a non-leap year`() {
+        val m = milestone(month = 2, day = 29)
+        assertFalse(2026 % 4 == 0) // sanity: 2026 is not a leap year
+        assertTrue(milestoneMatchesDay(m, LocalDate.of(2026, 2, 28)))
+        assertFalse(milestoneMatchesDay(m, LocalDate.of(2026, 2, 27)))
+    }
+
+    @Test
+    fun `a Feb 29th milestone matches Feb 29th exactly in a leap year`() {
+        val m = milestone(month = 2, day = 29)
+        assertTrue(2028 % 4 == 0) // sanity: 2028 is a leap year
+        assertTrue(milestoneMatchesDay(m, LocalDate.of(2028, 2, 29)))
+        assertFalse(milestoneMatchesDay(m, LocalDate.of(2028, 2, 28)))
     }
 }
 
