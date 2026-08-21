@@ -58,6 +58,7 @@ import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.data.db.DayNote
 import com.ssbmedia.twogether.data.db.TogetherSession
+import com.ssbmedia.twogether.ble.ProximityStateMachine
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.DatePickerField
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
@@ -391,7 +392,7 @@ fun CalendarScreen(
                                 // must stay untouchable, so neither icon is even rendered for it.
                                 if (s.isManual) {
                                     IconButton(
-                                        onClick = { sessionPendingEdit = s },
+                                        onClick = { sessionPendingEdit = s.manualSession },
                                         modifier = Modifier.size(32.dp)
                                     ) {
                                         Icon(
@@ -401,7 +402,7 @@ fun CalendarScreen(
                                         )
                                     }
                                     IconButton(
-                                        onClick = { sessionPendingDelete = s },
+                                        onClick = { sessionPendingDelete = s.manualSession },
                                         modifier = Modifier.size(32.dp)
                                     ) {
                                         Icon(
@@ -734,17 +735,52 @@ private fun DayNoteSection(date: Long) {
     }
 }
 
-private fun sessionsOverlapping(sessions: List<TogetherSession>, day: LocalDate, zone: ZoneId, lastSeenAt: Long): List<TogetherSession> {
+/** One row of the day-detail dialog's session list - either a real manual [TogetherSession] (kept
+ * individual, editable/deletable via [manualSession]) or a merged, non-editable span covering one or
+ * more overlapping BLE-detected rows - see [sessionsOverlapping]'s own doc for why these need
+ * different treatment. */
+private data class DaySessionRow(val startedAt: Long, val endedAt: Long?, val isManual: Boolean, val manualSession: TogetherSession?)
+
+/** BUG fix (user-reported): "timings are repeated twice... only for non manual entry". Root cause: two
+ * paired phones can each independently BLE-detect and create their OWN TogetherSession row for the
+ * SAME real togetherness window - SessionRepository.mergeRemoteSessions inserts an unrecognized remote
+ * syncId as a brand new row rather than merging it against an already-overlapping local one (by
+ * design - together-sessions are additive history, not a single mutable record). Every other stats
+ * surface (StatsCalculator.compute/buildDailyMinuteMap) already merges overlapping intervals before
+ * ever turning them into hours/days, via the shared, private mergedIntervals() - this dialog was the
+ * one surface still rendering the RAW, unmerged per-row list, so the same real interval could show up
+ * as two identical "4:45 - 6:30" lines.
+ *
+ * Fix: only BLE-detected (non-manual) rows get merged through that same shared logic - a manual entry
+ * is always a single deliberate user action producing exactly one row (structurally impossible to
+ * duplicate this way), and edit/delete need the real per-row TogetherSession identity, so manual rows
+ * are always kept individual and never merged with anything, even a BLE-detected row that happens to
+ * overlap one (both are shown as separate, honest rows in that rare edge case, rather than silently
+ * merging user-entered data into an automatic detection or vice versa). */
+private fun sessionsOverlapping(sessions: List<TogetherSession>, day: LocalDate, zone: ZoneId, lastSeenAt: Long): List<DaySessionRow> {
     val dayStart = day.atStartOfDay(zone).toInstant().toEpochMilli()
     val dayEnd = day.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
     val now = System.currentTimeMillis()
-    return sessions.filter { s ->
+    val overlapping = sessions.filter { s ->
         // Same clamp as StatsCalculator.effectiveOpenSessionEnd: an open session's displayed end must
         // never be credited past its newest confirmed sighting + the absence timeout. Computed per row
         // because the no-lastSeenAt fallback is bounded by that row's own startedAt.
         val end = s.endedAt ?: StatsCalculator.effectiveOpenSessionEnd(s.startedAt, now, lastSeenAt)
         s.startedAt < dayEnd && end > dayStart
     }
+    val (manual, nonManual) = overlapping.partition { it.isManual }
+    val manualRows = manual.map { DaySessionRow(it.startedAt, it.endedAt, isManual = true, manualSession = it) }
+    // A merged interval's end always comes out as a concrete clamped timestamp (mergedIntervals clamps
+    // every open row's end via effectiveOpenSessionEnd internally) - but the ORIGINAL per-row render
+    // showed "now" (endedAt = null) for a session still actively in progress, not a clock time. A merged
+    // interval is still "ongoing" iff its end exactly matches the clamped end of some contributing
+    // still-open row - reconstructed here since that identity is otherwise lost once rows are merged.
+    val openEnds = nonManual.filter { it.endedAt == null }
+        .map { StatsCalculator.effectiveOpenSessionEnd(it.startedAt, now, lastSeenAt) }
+        .toSet()
+    val mergedNonManualRows = StatsCalculator.mergedIntervals(nonManual, now, lastSeenAt, ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS)
+        .map { DaySessionRow(it.start, if (it.end in openEnds) null else it.end, isManual = false, manualSession = null) }
+    return (manualRows + mergedNonManualRows).sortedBy { it.startedAt }
 }
 
 /**
