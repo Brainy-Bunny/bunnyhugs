@@ -505,7 +505,19 @@ private fun ListCategoryCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(list.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    // BUG fix (user-reported "faded text", live-confirmed): this Card has no explicit
+                    // containerColor/contentColor pairing of its own, so with no explicit color here this
+                    // Text inherited whatever muted ambient content color was in effect upstream - same
+                    // visible symptom as SettingsSection's confirmed bug (see its own doc in
+                    // SettingsScreen.kt), rendering nearly indistinguishable from the "N ideas" subtitle
+                    // right below it, which is deliberately onSurfaceVariant. Explicit onSurface here
+                    // guarantees the correct full-emphasis role regardless of what's ambient upstream.
+                    Text(
+                        list.name,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
                     Text(
                         text = if (activeCount == 1) "1 idea" else "$activeCount ideas",
                         style = MaterialTheme.typography.bodySmall,

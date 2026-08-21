@@ -859,7 +859,21 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
 
 @Composable
 private fun SettingsSection(title: String, content: @Composable ColumnScope.() -> Unit) {
-    Card(shape = MaterialTheme.shapes.large, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+    // BUG fix (user-reported "faded text" + ultimate-app-review Round 2 visual inspection, live-
+    // confirmed): CardDefaults.cardColors(containerColor = ...) with no explicit contentColor defaults
+    // content color to contentColorFor(containerColor), which for surfaceVariant resolves to
+    // onSurfaceVariant - the deliberately MUTED text role (see onSurfaceVariant's own doc in Theme.kt).
+    // Every Text() below with no explicit color of its own (the section title here, and every
+    // SettingsRow label) silently inherited that muted color too, reading as faded/low-hierarchy
+    // primary text - not a contrast-tuning issue, a wrong ambient role. subtitle text (SettingsRow's
+    // second line, already explicitly onSurfaceVariant) was correctly muted and is unaffected.
+    Card(
+        shape = MaterialTheme.shapes.large,
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+            contentColor = MaterialTheme.colorScheme.onSurface
+        )
+    ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             content()

@@ -105,3 +105,16 @@ val WarmSurfaceContainerLowDark = WarmDarkBackground
 val WarmSurfaceContainerDark = WarmDarkSurface
 val WarmSurfaceContainerHighDark = Color(0xFF382A30)
 val WarmSurfaceContainerHighestDark = WarmDarkSurfaceVariant
+
+// BUG fix (ultimate-app-review Round 2, Opus): surfaceDim/surfaceBright were the only two M3 surface
+// roles still left unset in this scheme (same class of gap this file's other roles already closed -
+// see the container ramp above) - latent (no component currently pulls them), but still worth closing
+// for the same "every role explicitly set, none silently falling back to M3's baseline purple"
+// completeness this whole palette already established. Extends the SAME container ramp one step past
+// each end: surfaceDim sits below Highest (darker/more saturated, same warm dusty-rose family) as the
+// dimmest surface tone; surfaceBright sits at/above Lowest (already near-white in light mode, so
+// pure white) as the brightest.
+val WarmSurfaceDim = Color(0xFFE6D2D6)
+val WarmSurfaceBright = Color(0xFFFFFFFF)
+val WarmSurfaceDimDark = Color(0xFF120C0E)
+val WarmSurfaceBrightDark = Color(0xFF57434A)

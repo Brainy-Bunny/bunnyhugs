@@ -222,9 +222,16 @@ private fun BadgeCardContent(status: BadgeStatus, unlockDates: Map<String, Long>
  */
 @Composable
 private fun BadgeProgressBarsSection(stats: TogetherStats) {
+    // BUG fix (user-reported "faded text" pattern, same root cause as SettingsSection's confirmed bug -
+    // see its own doc in SettingsScreen.kt): containerColor = surfaceVariant with no explicit
+    // contentColor defaults content color to onSurfaceVariant (muted), which BadgeProgressBarRow/
+    // BadgeMaxedRow's own title Text below has no explicit color to override.
     Card(
         shape = MaterialTheme.shapes.large,
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+            contentColor = MaterialTheme.colorScheme.onSurface
+        )
     ) {
         Column(
             modifier = Modifier.padding(16.dp).fillMaxWidth(),

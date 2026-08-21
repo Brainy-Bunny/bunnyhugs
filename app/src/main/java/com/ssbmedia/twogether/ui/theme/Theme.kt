@@ -56,7 +56,11 @@ private val LightColors = lightColorScheme(
     surfaceContainerLow = WarmSurfaceContainerLow,
     surfaceContainer = WarmSurfaceContainer,
     surfaceContainerHigh = WarmSurfaceContainerHigh,
-    surfaceContainerHighest = WarmSurfaceContainerHighest
+    surfaceContainerHighest = WarmSurfaceContainerHighest,
+    // BUG fix (ultimate-app-review Round 2, Opus): see WarmSurfaceDim/WarmSurfaceBright's own doc in
+    // Color.kt - the last two unset M3 surface roles in this scheme.
+    surfaceDim = WarmSurfaceDim,
+    surfaceBright = WarmSurfaceBright
 )
 
 private val DarkColors = darkColorScheme(
@@ -95,7 +99,9 @@ private val DarkColors = darkColorScheme(
     surfaceContainerLow = WarmSurfaceContainerLowDark,
     surfaceContainer = WarmSurfaceContainerDark,
     surfaceContainerHigh = WarmSurfaceContainerHighDark,
-    surfaceContainerHighest = WarmSurfaceContainerHighestDark
+    surfaceContainerHighest = WarmSurfaceContainerHighestDark,
+    surfaceDim = WarmSurfaceDimDark,
+    surfaceBright = WarmSurfaceBrightDark
 )
 
 private val TwogetherShapes = Shapes(

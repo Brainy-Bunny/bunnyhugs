@@ -1314,10 +1314,17 @@ private fun UsStatusCard(isTogether: Boolean, continuousTogetherSinceMillis: Lon
  * this exact category. Tapping through opens the full Badges screen. */
 @Composable
 private fun NextBadgeProgressCard(row: BadgeProgressRow, onClick: () -> Unit) {
+    // BUG fix (user-reported "faded text" pattern, same root cause as SettingsSection's confirmed bug -
+    // see its own doc in SettingsScreen.kt): containerColor = surfaceVariant with no explicit
+    // contentColor defaults content color to onSurfaceVariant (muted), which BadgeProgressBarRow/
+    // BadgeMaxedRow's own title Text below has no explicit color to override.
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.large,
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+            contentColor = MaterialTheme.colorScheme.onSurface
+        ),
         onClick = onClick
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
