@@ -122,29 +122,6 @@ class CapsulesViewModel : ViewModel() {
             }
         }
     }
-
-    /** User-requested: an already-unlocked capsule can now also be deleted - scoped down from a genuine
-     * mutual-consent flow ("only once both partners agree") to the simpler shape below, since a real
-     * dual-approval mechanism needs a new synced field (something like "which device(s) have requested
-     * deletion"), a DB migration, and - the part that actually raises the risk here - a GattSyncManager
-     * wire-format change; this app's own established convention (see GattSyncManager.kt's own doc)
-     * treats that file as hand-edited-only, reviewed with real scrutiny, not a place to bolt on a new
-     * field lightly. This instead reuses the exact same shape unlocked-vs-locked deletion already has:
-     * either partner can delete, propagating to the other via the existing tombstone-sync path - no new
-     * schema, no sync-format change, same confirm-dialog UX the locked-capsule delete already uses. The
-     * repository's plain (unconditional) [TimeCapsuleRepository.delete] is safe to use here specifically
-     * BECAUSE this is unlocked: [TimeCapsuleRepository.deleteIfLocked]'s atomic `unlockedAt IS NULL`
-     * guard exists to close a race against a concurrent unlockEligible() pass - a race that can only ever
-     * happen to a still-LOCKED capsule in the first place, so it simply doesn't apply once unlockedAt is
-     * already set and permanent. */
-    fun deleteUnlocked(capsule: TimeCapsule) {
-        viewModelScope.launch {
-            ServiceLocator.timeCapsuleRepository.delete(capsule)
-            if (ServiceLocator.proximityStateStore.current().isTogether) {
-                AppEvents.requestManualSync()
-            }
-        }
-    }
 }
 
 @Composable
@@ -212,19 +189,7 @@ fun CapsulesScreen(onBack: () -> Unit, onOpenCalendar: (jumpToEpochDay: Long) ->
                             // with reality, and so item 11's persistent timeline text below can reuse it too.
                             val effectiveThreshold = TimeCapsuleRepository.effectiveThreshold(capsule, manualCredit)
                             if (unlocked) {
-                                // User-requested: an unlocked capsule can now be deleted too - see
-                                // CapsulesViewModel.deleteUnlocked's own doc for the scoped-down (not
-                                // full mutual-consent) shape this took.
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text("💌 Unlocked", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
-                                    IconButton(onClick = { showDeleteConfirm = true }) {
-                                        Icon(Icons.Filled.Delete, contentDescription = "Delete capsule")
-                                    }
-                                }
+                                Text("💌 Unlocked", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
                                 Text(capsule.text, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.padding(top = 4.dp))
                             } else {
                                 // MAJOR fix (ultimate-app-review round 3, both Opus and Sonnet independently
@@ -316,10 +281,7 @@ fun CapsulesScreen(onBack: () -> Unit, onOpenCalendar: (jumpToEpochDay: Long) ->
                             title = { Text("Delete this time capsule?") },
                             text = { Text("This can't be undone, and will be removed for both of you once you next sync.") },
                             confirmButton = {
-                                TextButton(onClick = {
-                                    showDeleteConfirm = false
-                                    if (unlocked) vm.deleteUnlocked(capsule) else vm.delete(capsule)
-                                }) { Text("Delete") }
+                                TextButton(onClick = { showDeleteConfirm = false; vm.delete(capsule) }) { Text("Delete") }
                             },
                             dismissButton = { TextButton(onClick = { showDeleteConfirm = false }) { Text("Cancel") } }
                         )
