@@ -38,7 +38,9 @@ data class BadgeProgressRow(
     val fraction: Float,
     val prevThreshold: Int,
     val nextThreshold: Int,
-    /** Always a Double (even for the 3 whole-number categories) - see [BadgeProgressBarRow]'s own doc in
+    /** The LIVE current value (see [BadgeCatalog.liveValueFor]'s doc) - NOT necessarily this category's
+     * historical best, for DAILY_STREAK/WEEKLY_STREAK specifically once a streak has broken. Always a
+     * Double (even for the 3 whole-number categories) - see [BadgeProgressBarRow]'s own doc in
      * BadgesScreen.kt for why: Hours is the one category genuinely tracked as a fraction of an hour. */
     val current: Double,
     val caption: String
@@ -114,12 +116,37 @@ object BadgeCatalog {
         return pow10 * 10
     }
 
+    /** BUG fix (user-reported): WEEKLY_STREAK used to track the longest CONSECUTIVE run of qualifying
+     * weeks (like DAILY_STREAK, but for weeks) - resetting the moment a single week was missed, which
+     * made its badge progress bar look like it had regressed to nearly nothing after a single missed
+     * week, even with months of real history behind it. Redefined to [TogetherStats.weeksTogetherCount]
+     * - a cumulative count of every distinct week the couple has EVER met at least once, which only ever
+     * grows, never resets. This is a pure monotonic counter (like HOURS/REUNIONS), so - unlike
+     * DAILY_STREAK, which keeps its genuine current/longest distinction - there is no separate "live vs
+     * historical" value needed here any more; [liveValueFor] below falls through to this for
+     * WEEKLY_STREAK now. */
     private fun currentValueFor(type: BadgeType, stats: TogetherStats): Int = when (type) {
         BadgeType.HOURS -> stats.totalHoursAllTime.toInt()
         BadgeType.DAILY_STREAK -> stats.longestDailyStreak
-        BadgeType.WEEKLY_STREAK -> stats.longestWeeklyStreak
+        BadgeType.WEEKLY_STREAK -> stats.weeksTogetherCount
         BadgeType.REUNIONS -> stats.reunionCount
         BadgeType.PERFECT_WEEKS -> stats.perfectWeekCount
+    }
+
+    /** BUG fix (user-reported): the LIVE, currently-in-progress value for [type] - identical to
+     * [currentValueFor] for every type except DAILY_STREAK, where it's the resettable
+     * currentDailyStreak rather than the permanent all-time-best longestDailyStreak [currentValueFor]
+     * uses. [currentValueFor] must stay on the historical best for unlock checks and threshold-bracket
+     * selection - a streak badge, once earned, stays earned forever even after a later break. But a
+     * PROGRESS BAR/caption toward a not-yet-earned DAILY_STREAK badge must reflect what the couple would
+     * actually need to do starting today: before this fix, a broken daily streak (currentDailyStreak = 0)
+     * still showed "1 more day to go" toward a threshold the couple's OLD, already-over streak had almost
+     * reached, when the real requirement - starting a fresh unbroken run from 0 - is the badge's full
+     * remaining distance. (WEEKLY_STREAK no longer needs this distinction at all - see
+     * [currentValueFor]'s doc on why it's now a pure monotonic counter, same shape as HOURS/REUNIONS.) */
+    private fun liveValueFor(type: BadgeType, stats: TogetherStats): Int = when (type) {
+        BadgeType.DAILY_STREAK -> stats.currentDailyStreak
+        else -> currentValueFor(type, stats)
     }
 
     /** The same id/title/emoji template each type's original seed badges used - applied across whatever
@@ -134,7 +161,7 @@ object BadgeCatalog {
             return when (type) {
                 BadgeType.HOURS -> Badge("hours_$threshold", type, threshold, "100,000 Hours — Soulmates Forever", "💍")
                 BadgeType.DAILY_STREAK -> Badge("daily_$threshold", type, threshold, "10,000 Days — A Lifetime Together", "🏆")
-                BadgeType.WEEKLY_STREAK -> Badge("weekly_$threshold", type, threshold, "1,000 Weeks — Unbreakable", "👑")
+                BadgeType.WEEKLY_STREAK -> Badge("weekly_$threshold", type, threshold, "1,000 Weeks Together — Unbreakable", "👑")
                 BadgeType.REUNIONS -> Badge("reunion_$threshold", type, threshold, "5,000 Reunions — Never Apart for Long", "💞")
                 BadgeType.PERFECT_WEEKS -> error("PERFECT_WEEKS has no cap (CAPS[PERFECT_WEEKS] == null) - unreachable")
             }
@@ -145,7 +172,10 @@ object BadgeCatalog {
             // its own singular case, this one just hadn't been.
             BadgeType.HOURS -> Badge("hours_$threshold", type, threshold, "$threshold Hour" + (if (threshold == 1) "" else "s") + " Together", "💛")
             BadgeType.DAILY_STREAK -> Badge("daily_$threshold", type, threshold, "$threshold Day Streak", "🔥")
-            BadgeType.WEEKLY_STREAK -> Badge("weekly_$threshold", type, threshold, "$threshold Week Streak", "🌟")
+            // BUG fix (user-reported): retitled from "$threshold Week Streak" now that this badge tracks
+            // cumulative weeks together (see currentValueFor's doc), not a consecutive streak - the old
+            // title actively implied the wrong (reset-on-break) semantics.
+            BadgeType.WEEKLY_STREAK -> Badge("weekly_$threshold", type, threshold, "$threshold Weeks Together", "🌟")
             BadgeType.REUNIONS -> Badge("reunion_$threshold", type, threshold, "$threshold Reunions", "🤗")
             BadgeType.PERFECT_WEEKS -> Badge(
                 "perfectweek_$threshold", type, threshold,
@@ -172,14 +202,10 @@ object BadgeCatalog {
         }
 
     fun statuses(stats: TogetherStats): List<BadgeStatus> = badgesFor(stats).map { badge ->
-        val (unlocked, current) = when (badge.type) {
-            BadgeType.HOURS -> (stats.totalHoursAllTime >= badge.threshold) to stats.totalHoursAllTime.toInt()
-            BadgeType.DAILY_STREAK -> (stats.longestDailyStreak >= badge.threshold) to stats.longestDailyStreak
-            BadgeType.WEEKLY_STREAK -> (stats.longestWeeklyStreak >= badge.threshold) to stats.longestWeeklyStreak
-            BadgeType.REUNIONS -> (stats.reunionCount >= badge.threshold) to stats.reunionCount
-            BadgeType.PERFECT_WEEKS -> (stats.perfectWeekCount >= badge.threshold) to stats.perfectWeekCount
-        }
-        val label = if (unlocked) "Unlocked" else "$current / ${badge.threshold}"
+        // Unlock stays permanent, keyed off the historical best (currentValueFor) - see liveValueFor's
+        // doc. Only the DISPLAYED progress for a still-locked badge uses the live value.
+        val unlocked = currentValueFor(badge.type, stats) >= badge.threshold
+        val label = if (unlocked) "Unlocked" else "${liveValueFor(badge.type, stats)} / ${badge.threshold}"
         BadgeStatus(badge, unlocked, label)
     }
 
@@ -217,33 +243,41 @@ object BadgeCatalog {
      * see [BadgeProgressRow.current]'s doc) rather than re-deriving it from [type], since HOURS is tracked
      * as a fraction (stats.totalHoursAllTime) while the other 3 categories use their own whole-number int
      * field - the caller already knows which. */
-    private fun progressRow(type: BadgeType, emoji: String, label: String, current: Double, singularUnit: String): BadgeProgressRow {
+    private fun progressRow(type: BadgeType, emoji: String, label: String, current: Double, liveCurrent: Double, singularUnit: String): BadgeProgressRow {
         val currentInt = current.toInt()
         if (isMaxed(type, currentInt)) {
             val badge = maxedBadge(type)!!
             return BadgeProgressRow(type, badge.emoji, label, maxed = true, fraction = 1f, prevThreshold = 0, nextThreshold = 0, current = current, caption = "${badge.title} 💛")
         }
+        // BUG fix (user-reported): threshold bracketing (prev/next) still uses the historical-best
+        // `current` - that's what determines which not-yet-earned badge is next, and must stay stable
+        // across a streak break (see liveValueFor's doc). But the FRACTION and the "remaining" caption
+        // below use `liveCurrent` instead - once a streak has broken, liveCurrent < current, and both
+        // formulas correctly reflect the true remaining distance from where the couple stands today
+        // (fraction naturally clamps to 0 - an empty bar - when liveCurrent has fallen behind `prev`,
+        // rather than showing a stale partial fill left over from the broken run).
         val (prev, next) = nextAndPrevThreshold(type, currentInt)
         val span = (next - prev).coerceAtLeast(1)
-        val fraction = ((current - prev) / span).toFloat().coerceIn(0f, 1f)
+        val liveCurrentInt = liveCurrent.toInt()
+        val fraction = ((liveCurrent - prev) / span).toFloat().coerceIn(0f, 1f)
         val caption = if (type == BadgeType.HOURS) {
-            "${"%.1f".format((next - current).coerceAtLeast(0.0))}h to your next badge"
+            "${"%.1f".format((next - liveCurrent).coerceAtLeast(0.0))}h to go"
         } else {
-            val remaining = (next - currentInt).coerceAtLeast(0)
+            val remaining = (next - liveCurrentInt).coerceAtLeast(0)
             // BUG fix (carried over from the original inline version): "1 days/weeks/reunions to your
             // next badge" was reachable whenever exactly 1 more unit would complete the badge.
-            "$remaining $singularUnit" + (if (remaining == 1) "" else "s") + " to your next badge"
+            "$remaining $singularUnit" + (if (remaining == 1) "" else "s") + " to go"
         }
-        return BadgeProgressRow(type, emoji, label, maxed = false, fraction = fraction, prevThreshold = prev, nextThreshold = next, current = current, caption = caption)
+        return BadgeProgressRow(type, emoji, label, maxed = false, fraction = fraction, prevThreshold = prev, nextThreshold = next, current = liveCurrent, caption = caption)
     }
 
     /** The 4 headline progress rows, in the fixed order the Badges screen's own section has always shown
      * them (Hours, Days streak, Week streak, Reunions) - see [BadgeProgressRow]'s doc. */
     fun progressRows(stats: TogetherStats): List<BadgeProgressRow> = listOf(
-        progressRow(BadgeType.HOURS, "💛", "Hours", stats.totalHoursAllTime, "hour"),
-        progressRow(BadgeType.DAILY_STREAK, "🔥", "Days", stats.longestDailyStreak.toDouble(), "day"),
-        progressRow(BadgeType.WEEKLY_STREAK, "🌟", "Week Streak", stats.longestWeeklyStreak.toDouble(), "week"),
-        progressRow(BadgeType.REUNIONS, "🤗", "Reunions", stats.reunionCount.toDouble(), "reunion")
+        progressRow(BadgeType.HOURS, "💛", "Hours", stats.totalHoursAllTime, stats.totalHoursAllTime, "hour"),
+        progressRow(BadgeType.DAILY_STREAK, "🔥", "Days", stats.longestDailyStreak.toDouble(), stats.currentDailyStreak.toDouble(), "day"),
+        progressRow(BadgeType.WEEKLY_STREAK, "🌟", "Weeks Together", stats.weeksTogetherCount.toDouble(), stats.weeksTogetherCount.toDouble(), "week"),
+        progressRow(BadgeType.REUNIONS, "🤗", "Reunions", stats.reunionCount.toDouble(), stats.reunionCount.toDouble(), "reunion")
     )
 
     /** UX-FIX-PLAN.md Phase 3 item 21: which single category is closest to unlocking its next badge, for

@@ -3,6 +3,7 @@ package com.ssbmedia.twogether.ui.badges
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -95,14 +96,18 @@ fun BadgesScreen(
         StatsCalculator.compute(sessions, lastSeenAt = proximityState.lastSeenAt, reunionCount = proximityState.reunionCount)
     }
     val statuses = remember(stats) { BadgeCatalog.statuses(stats) }
-    // Same DateRange lookups StatsScreen's own "Longest streak" cards already drive - see their doc there
+    // Same DateRange lookup StatsScreen's own "Longest streak" card already drives - see its doc there
     // for why min(...)-clamped LWW convergence, etc, isn't relevant here: this is a pure read.
     val longestDailyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt) {
         StatsCalculator.longestDailyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt)
     }
-    val longestWeeklyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt) {
-        StatsCalculator.longestWeeklyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt)
-    }
+    // BUG fix (user-reported): WEEKLY_STREAK no longer routes to a single contiguous streak range - now
+    // that it tracks cumulative weeks together (see BadgeCatalog.currentValueFor's doc), there's no one
+    // "the streak" date span to highlight in Calendar; the qualifying weeks are scattered across all of
+    // history, not one run. Dropped the longestWeeklyStreakRange lookup this screen used to feed that
+    // now-removed click-through with (StatsCalculator.longestWeeklyStreakRange itself is unaffected and
+    // still powers StatsScreen's own separate "Longest streak" card, which still means the true
+    // consecutive-streak concept).
 
     LaunchedEffect(statuses) {
         vm.recordNewlyUnlocked(statuses.filter { it.unlocked }.map { it.badge.id })
@@ -130,21 +135,21 @@ fun BadgesScreen(
             }
             items(statuses, key = { it.badge.id }) { status ->
                 // UX-FIX-PLAN.md Phase 3 item 20: Badge -> the stat that earned it. HOURS and REUNIONS
-                // route to their own dedicated detail screens; DAILY_STREAK/WEEKLY_STREAK route to
-                // Calendar highlighting the actual streak range (same DateRange lookups StatsScreen's own
-                // "Longest streak" cards use) - null (no qualifying streak yet) means no destination, so
-                // the card simply isn't clickable rather than navigating somewhere with nothing to show.
-                // PERFECT_WEEKS has no dedicated drill-down screen (grid-only by design, see
-                // BadgeProgressBarsSection's own doc), so it stays non-clickable too.
+                // route to their own dedicated detail screens; DAILY_STREAK routes to Calendar
+                // highlighting the actual streak range (same DateRange lookup StatsScreen's own "Longest
+                // streak" card uses) - null (no qualifying streak yet) means no destination, so the card
+                // simply isn't clickable rather than navigating somewhere with nothing to show.
+                // WEEKLY_STREAK (now cumulative weeks together, see BadgeCatalog.currentValueFor's doc)
+                // and PERFECT_WEEKS both have no single date range to highlight, so both stay
+                // non-clickable - grid-only by design, same as BadgeProgressBarsSection's own doc already
+                // established for PERFECT_WEEKS.
                 val onClick: (() -> Unit)? = when (status.badge.type) {
                     BadgeType.HOURS -> onOpenHoursDetail
                     BadgeType.REUNIONS -> onOpenGapsDetail
                     BadgeType.DAILY_STREAK -> longestDailyStreakRange?.let { range ->
                         { onOpenCalendarWithArgs(null, range.start.toEpochDay(), range.end.toEpochDay()) }
                     }
-                    BadgeType.WEEKLY_STREAK -> longestWeeklyStreakRange?.let { range ->
-                        { onOpenCalendarWithArgs(null, range.start.toEpochDay(), range.end.toEpochDay()) }
-                    }
+                    BadgeType.WEEKLY_STREAK -> null
                     BadgeType.PERFECT_WEEKS -> null
                 }
                 val cardColors = CardDefaults.cardColors(
@@ -281,11 +286,14 @@ internal fun BadgeMaxedRow(emoji: String, label: String, caption: String) {
     }
 }
 
-/** One progress-bar row: a label, a fraction-of-the-way-to-[nextThreshold] bar, and a countdown caption.
- * [current] is always passed as a Double (even for the 3 whole-number categories) purely so Hours - the
- * one category genuinely tracked as a fraction of an hour - can share this same row instead of a
- * near-duplicate Int-only version; the caller decides whether its own caption text needs decimal
- * precision (Hours) or a whole number (everything else). */
+/** One progress-bar row: a label, a fraction-of-the-way-to-[nextThreshold] bar, and a countdown caption
+ * with the actual goal number shown at the bar's end (e.g. "2 weeks to go" ... "12 Weeks Together") -
+ * user-reported: the bar used to show a countdown with no visible target, so there was no way to tell
+ * WHICH badge/number it was counting down toward without leaving this card. [current] is always passed
+ * as a Double (even for the 3 whole-number categories) purely so Hours - the one category genuinely
+ * tracked as a fraction of an hour - can share this same row instead of a near-duplicate Int-only
+ * version; the caller decides whether its own caption text needs decimal precision (Hours) or a whole
+ * number (everything else). */
 /** Non-private: reused directly by HomeScreen.NextBadgeProgressCard - see [BadgeMaxedRow]'s doc above for
  * why. */
 @Composable
@@ -306,11 +314,23 @@ internal fun BadgeProgressBarRow(emoji: String, label: String, current: Double, 
                 .height(8.dp)
                 .clip(RoundedCornerShape(4.dp))
         )
-        Text(
-            text = caption,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(top = 4.dp)
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text = caption,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f, fill = false)
+            )
+            Text(
+                text = "Goal: $nextThreshold $label",
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 8.dp)
+            )
+        }
     }
 }

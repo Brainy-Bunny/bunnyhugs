@@ -62,6 +62,18 @@ data class TogetherStats(
      * Same qualifying-day set the Calendar screen highlights - computed once here off the same
      * buildDailyMinuteMap() so the two screens can never drift apart. */
     val totalDaysTogether: Int,
+    /** Count of distinct ISO weeks with at least one qualifying day (see [buildDailyMinuteMap]) -
+     * [totalDaysTogether]'s week-level sibling. Unlike [currentWeeklyStreak]/[longestWeeklyStreak] (a
+     * CONSECUTIVE run, which resets to 0 the moment a week is missed), this only ever grows: a week
+     * once met never stops counting, even if a later week is missed. User-requested (badges/streak
+     * feedback): "the Week Streak badge shouldn't reset to zero every time the streak breaks - instead
+     * it should count all the weeks in which at least one day the couple has met." Computed as
+     * `qualifyingWeeks.size` in [compute] - the exact same set [computeWeeklyStreaks] already builds for
+     * the streak stats, so this is zero new aggregation and zero new persisted state (unlike
+     * [reunionCount], which needed a persisted counter + backfill because its threshold is user-
+     * configurable and retroactivity-sensitive - this metric has neither property, so live computation
+     * can never drift). */
+    val weeksTogetherCount: Int,
     // ---- Feature E: more stats, all derived from the same merged/deduped session data above ----
     /** The calendar month with the most distinct together-days. */
     val mostMetMonth: MonthStat?,
@@ -201,6 +213,7 @@ object StatsCalculator {
                 // own doc: it's never derived from `merged`, so an empty session list (nothing left after
                 // filtering/clamping) must not force it to 0 either.
                 longestSessionMinutes = 0, reunionCount = reunionCount, perfectWeekCount = 0, favoriteDayOfWeek = null, totalDaysTogether = 0,
+                weeksTogetherCount = 0,
                 mostMetMonth = null, mostHoursMonth = null, longestSingleDay = null, togetherSince = togetherSince,
                 monthTrend = Trend.FLAT, monthTrendDeltaDays = 0, avgDaysBetweenMeetups = null, longestApart = null
             )
@@ -330,6 +343,7 @@ object StatsCalculator {
             perfectWeekCount = perfectWeekCount,
             favoriteDayOfWeek = favoriteDayOfWeek,
             totalDaysTogether = qualifyingDays.size,
+            weeksTogetherCount = qualifyingWeeks.size,
             mostMetMonth = mostMetMonth,
             mostHoursMonth = mostHoursMonth,
             longestSingleDay = longestSingleDay,
