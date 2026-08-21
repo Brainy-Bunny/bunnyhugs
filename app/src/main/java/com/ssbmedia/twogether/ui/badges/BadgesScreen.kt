@@ -34,6 +34,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -211,6 +212,16 @@ private fun BadgeCardContent(status: BadgeStatus, unlockDates: Map<String, Long>
             text = status.badge.title,
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.SemiBold,
+            textAlign = TextAlign.Center,
+            // BUG fix (user-reported): row height was already equalized (IntrinsicSize.Max, see this
+            // Row's own comment above), but a 1-line title ("50 Hours Together") vs a 2-line one
+            // ("100 Hours Together" wraps) still left every card's OWN progress text ("0/50" etc.) at a
+            // different vertical offset within that equal-height card, since a plain top-aligned Column
+            // gives a shorter title less space above the progress line. minLines = 2 reserves the same
+            // title block height on every card regardless of whether its own title actually wraps, so
+            // the progress line lands at the same y-position across an entire row.
+            minLines = 2,
+            maxLines = 2,
             modifier = Modifier.padding(top = 8.dp)
         )
         Text(
