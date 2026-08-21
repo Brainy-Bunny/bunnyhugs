@@ -761,7 +761,13 @@ fun HomeScreen(
                         shape = MaterialTheme.shapes.large,
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
                     ) {
-                        Column(Modifier.padding(16.dp)) {
+                        // BUG fix (user-reported): same root cause as BadgesScreen's own take-3 fix (see
+                        // its doc in BadgesScreen.kt) - a Column with no fillMaxHeight/verticalArrangement
+                        // just wraps its own content and sits top-anchored inside whatever taller height a
+                        // row-mate's wrapped label ("🗓️ Days together" -> 2 lines) forces onto this equal-
+                        // height Card, leaving dead space below this card's own (1-line-label) content
+                        // instead of centering it.
+                        Column(Modifier.padding(16.dp).fillMaxHeight(), verticalArrangement = Arrangement.Center) {
                             Text("This week", style = MaterialTheme.typography.bodySmall)
                             Text("${"%.1f".format(stats.totalHoursThisWeek)}h", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                         }
@@ -771,7 +777,7 @@ fun HomeScreen(
                         shape = MaterialTheme.shapes.large,
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)
                     ) {
-                        Column(Modifier.padding(16.dp)) {
+                        Column(Modifier.padding(16.dp).fillMaxHeight(), verticalArrangement = Arrangement.Center) {
                             Text("🔥 Daily streak", style = MaterialTheme.typography.bodySmall)
                             // BUG fix: a 1-day streak (very common right after the couple's first day
                             // together) read as "1 days".
@@ -783,7 +789,7 @@ fun HomeScreen(
                         shape = MaterialTheme.shapes.large,
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
                     ) {
-                        Column(Modifier.padding(16.dp)) {
+                        Column(Modifier.padding(16.dp).fillMaxHeight(), verticalArrangement = Arrangement.Center) {
                             Text("🗓️ Days together", style = MaterialTheme.typography.bodySmall)
                             Text("${stats.totalDaysTogether}", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                         }

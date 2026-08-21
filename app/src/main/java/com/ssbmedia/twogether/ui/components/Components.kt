@@ -104,7 +104,12 @@ fun StatCard(
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Box {
-            Column(modifier = Modifier.padding(16.dp)) {
+            // BUG fix (user-reported): same root cause as BadgesScreen's/HomeScreen's own equivalent
+            // fixes (see BadgesScreen.kt's take-3 doc) - without fillMaxHeight/verticalArrangement, this
+            // Column just wraps its own content and sits top-anchored inside whatever taller height a
+            // row-mate's wrapped label/value forces onto this equal-height Card (fillMaxHeight above),
+            // leaving dead space below this card's own (shorter) content instead of centering it.
+            Column(modifier = Modifier.padding(16.dp).fillMaxHeight(), verticalArrangement = Arrangement.Center) {
                 Text(text = emoji, style = MaterialTheme.typography.headlineMedium)
                 androidx.compose.foundation.layout.Spacer(modifier = Modifier.padding(top = 4.dp))
                 // Item 7 (deferred UX fix, 4-model advisory audit): this value slot sits inside a
