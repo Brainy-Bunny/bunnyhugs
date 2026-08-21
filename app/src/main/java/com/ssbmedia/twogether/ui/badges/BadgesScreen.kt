@@ -4,7 +4,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -37,6 +36,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -186,7 +186,7 @@ fun BadgesScreen(
                     // Box instead of letting the lone card stretch to double width, matching a 2-column
                     // grid's own natural behavior for a trailing incomplete row.
                     if (rowStatuses.size == 1) {
-                        androidx.compose.foundation.layout.Box(modifier = Modifier.weight(1f))
+                        Box(modifier = Modifier.weight(1f))
                     }
                 }
             }
@@ -240,13 +240,26 @@ private fun BadgeCardContent(status: BadgeStatus, unlockDates: Map<String, Long>
         // minLines), so it doesn't have this gap. 48.dp comfortably fits two titleMedium lines at
         // default scale and, being a MINIMUM (not a cap), still grows further under larger accessibility
         // font sizes rather than clipping.
-        Box(modifier = Modifier.heightIn(min = 48.dp).padding(top = 8.dp), contentAlignment = Alignment.Center) {
+        // MINOR fix (independent audit): padding was INSIDE heightIn's min, so the 8dp top padding ate
+        // into the reserved 48dp, leaving only 40dp for two titleMedium lines (2 x 22sp lineHeight =
+        // 44dp) - a 2-line title's box (52dp, since the min no longer bound it) and a 1-line title's box
+        // (48dp) differed by 4dp, the "consistent progress-text offset" this fix's own comment promises
+        // was still off between row siblings. padding OUTSIDE heightIn fixes the order.
+        Box(modifier = Modifier.padding(top = 8.dp).heightIn(min = 48.dp), contentAlignment = Alignment.Center) {
             Text(
                 text = status.badge.title,
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
                 textAlign = TextAlign.Center,
-                maxLines = 2
+                maxLines = 2,
+                // MINOR fix (independent audit): the comment above claims the heightIn minimum "still
+                // grows further under larger accessibility font sizes rather than clipping" - true for
+                // the BOX, but maxLines=2 with the default TextOverflow.Clip silently clips the TEXT
+                // itself once a title needs a 3rd line (e.g. "1000 Hours Together" at a large font
+                // scale) - the exact silent-clipping bug class this whole fix sequence exists to close,
+                // just moved from the box to the text. Ellipsis at least signals truncation instead of
+                // silently dropping a word with no visual indication.
+                overflow = TextOverflow.Ellipsis
             )
         }
         Text(
@@ -275,9 +288,9 @@ private fun BadgeCardContent(status: BadgeStatus, unlockDates: Map<String, Long>
  * The 4 headline progress bars the owner asked for - one each for Hours/Daily streak/Weekly streak/
  * Reunions (deliberately NOT Perfect weeks, which stays grid-only) - showing how far along the couple is
  * toward their next not-yet-earned badge in that category, with a countdown caption underneath. Sits
- * above the badge grid itself as a full-width grid item (see the `item(span = ...)` call in
- * [BadgesScreen]).
- */
+ * above the badge cards, as the first child of [BadgesScreen]'s own scrolling Column - not a grid item
+ * (this screen no longer uses a LazyVerticalGrid at all - see this file's own row-equalization history
+ * for why - MINOR fix, independent audit: this doc used to describe the removed `item(span = ...)` shape). */
 @Composable
 private fun BadgeProgressBarsSection(stats: TogetherStats) {
     // BUG fix (user-reported "faded text" pattern, same root cause as SettingsSection's confirmed bug -
@@ -307,8 +320,7 @@ private fun BadgeProgressBarsSection(stats: TogetherStats) {
                     BadgeProgressBarRow(
                         emoji = row.emoji,
                         label = row.label,
-                        current = row.current,
-                        prevThreshold = row.prevThreshold,
+                        fraction = row.fraction,
                         nextThreshold = row.nextThreshold,
                         caption = row.caption
                     )
@@ -362,15 +374,22 @@ internal fun BadgeMaxedRow(emoji: String, label: String, caption: String) {
 /** Non-private: reused directly by HomeScreen.NextBadgeProgressCard - see [BadgeMaxedRow]'s doc above for
  * why. */
 @Composable
-internal fun BadgeProgressBarRow(emoji: String, label: String, current: Double, prevThreshold: Int, nextThreshold: Int, caption: String) {
+// MINOR fix (independent audit): was `current: Double, prevThreshold: Int, nextThreshold: Int` with the
+// fraction recomputed INLINE below - duplicating the exact same formula BadgeCatalog.progressRow already
+// computed as BadgeProgressRow.fraction (the value BadgeCatalogProgressTest.kt actually asserts against).
+// The two formulas happened to agree, but nothing enforced that - editing one without the other would
+// silently desync the drawn bar from its own tests. Both call sites (BadgesScreen's own
+// BadgeProgressBarsSection, HomeScreen.NextBadgeProgressCard) already have a real BadgeProgressRow with
+// .fraction on hand, so this now takes that value directly instead of re-deriving it. nextThreshold is
+// kept (needed for the "Goal: N Label" caption below), current/prevThreshold dropped (no longer needed
+// for anything once fraction isn't computed here).
+internal fun BadgeProgressBarRow(emoji: String, label: String, fraction: Float, nextThreshold: Int, caption: String) {
     Column {
         Text(
             text = "$emoji $label",
             style = MaterialTheme.typography.titleSmall,
             fontWeight = FontWeight.SemiBold
         )
-        val span = (nextThreshold - prevThreshold).coerceAtLeast(1)
-        val fraction = ((current - prevThreshold) / span).toFloat().coerceIn(0f, 1f)
         LinearProgressIndicator(
             progress = { fraction },
             modifier = Modifier
@@ -389,12 +408,17 @@ internal fun BadgeProgressBarRow(emoji: String, label: String, current: Double, 
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.weight(1f, fill = false)
             )
+            // MINOR fix (independent audit): was unweighted, so in a Row it gets measured against the
+            // FULL available width before the caption's own weight(1f, fill=false) claims its share -
+            // at a large system font scale, "Goal: 52 Weeks Together" could consume nearly the whole
+            // row, squeezing the caption ("3 weeks to go") into single-character-wide wraps. A bounded
+            // weight lets both texts share the row instead of one starving the other.
             Text(
                 text = "Goal: $nextThreshold $label",
                 style = MaterialTheme.typography.bodySmall,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(start = 8.dp)
+                modifier = Modifier.weight(1f, fill = false).padding(start = 8.dp)
             )
         }
     }

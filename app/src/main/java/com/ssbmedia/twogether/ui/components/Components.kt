@@ -76,7 +76,17 @@ fun StatCard(
     value: String,
     modifier: Modifier = Modifier,
     containerColor: Color = MaterialTheme.colorScheme.secondaryContainer,
-    onClick: (() -> Unit)? = null
+    onClick: (() -> Unit)? = null,
+    // MAJOR fix (independent audit, live-reproducible): defaults to 2 everywhere (unchanged behavior for
+    // every existing call site), but "Together since" started passing a genuinely longer narrative date
+    // string ("20th September 2026" - see DateFormats.formatDateLong's own doc) that, on a 360dp-class
+    // phone at default font scale, can't fit its own long month name across 2 lines in a half-width
+    // card and got silently ellipsized mid-word ("20th September…", the year cut off entirely). Exposed
+    // as a parameter rather than just bumping the shared default to 3 everywhere, since every OTHER
+    // call site's value genuinely only ever needs 1-2 lines and a wider default would just reserve
+    // occasionally-unused space again - the exact "ugly gaps" complaint this whole card already went
+    // through several rounds of fixing for.
+    valueMaxLines: Int = 2
 ) {
     // Deliberately NOT using Card's own onClick/enabled overload here - Material3 applies a dimmed
     // disabled-content alpha to that overload whenever enabled=false, which would visually fade every
@@ -124,7 +134,7 @@ fun StatCard(
                     text = value,
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
-                    maxLines = 2,
+                    maxLines = valueMaxLines,
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(

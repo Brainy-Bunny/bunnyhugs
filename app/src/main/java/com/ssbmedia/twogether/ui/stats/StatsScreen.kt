@@ -181,7 +181,11 @@ fun StatsScreen(
                     )
                 }
                 Text(
-                    text = "Daily streak = consecutive days together. Weekly streak is separate — consecutive weeks with any time together. Tap a \"longest\" card to see it on the calendar.",
+                    // MINOR fix (independent audit): the "current" streak cards became tappable too
+                    // (see currentDailyStreakRange/currentWeeklyStreakRange), but this line still only
+                    // mentioned "longest" - actively telling the user an affordance doesn't exist that
+                    // now does.
+                    text = "Daily streak = consecutive days together. Weekly streak is separate — consecutive weeks with any time together. Tap a streak card to see it on the calendar.",
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(top = 8.dp)
                 )
@@ -217,6 +221,10 @@ fun StatsScreen(
                         // site app-wide is deliberately left on the numeric convention.
                         value = stats.togetherSince?.let { DateFormats.formatDateLong(it) } ?: "—",
                         modifier = Modifier.weight(1f),
+                        // MAJOR fix (independent audit): a long month name ("20th September 2026") can't
+                        // fit this half-width card's own value slot in 2 lines at default font scale on a
+                        // 360dp-class phone - see StatCard's own valueMaxLines doc.
+                        valueMaxLines = 3,
                         onClick = stats.togetherSince?.let { date ->
                             { onOpenCalendarWithArgs(date.toEpochDay(), null, null) }
                         }

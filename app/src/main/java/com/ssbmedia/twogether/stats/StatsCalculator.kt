@@ -799,6 +799,12 @@ object StatsCalculator {
         val end = anchor
         var cursor = anchor
         while (previousWeekKey(cursor) in qualifyingWeeks) cursor = previousWeekKey(cursor)
-        return DateRange(weekKeyToMonday(cursor), weekKeyToMonday(end).plusDays(6))
+        // MAJOR fix (independent audit, live-reproducible): weekKeyToMonday(end).plusDays(6) is always
+        // the anchor week's own SUNDAY, regardless of what day `today` actually is within that week - so
+        // tapping this card on, say, a Monday used to highlight the calendar all the way through that
+        // Tuesday-Sunday, six days that hadn't happened yet. coerceAtMost(today) caps the highlighted
+        // range at today on every day of the week except Sunday itself (where it's already a no-op).
+        val rangeEnd = weekKeyToMonday(end).plusDays(6).coerceAtMost(today)
+        return DateRange(weekKeyToMonday(cursor), rangeEnd)
     }
 }

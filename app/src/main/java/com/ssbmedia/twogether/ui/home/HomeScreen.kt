@@ -1381,8 +1381,7 @@ private fun NextBadgeProgressCard(row: BadgeProgressRow, onClick: () -> Unit) {
             BadgeProgressBarRow(
                 emoji = row.emoji,
                 label = row.label,
-                current = row.current,
-                prevThreshold = row.prevThreshold,
+                fraction = row.fraction,
                 nextThreshold = row.nextThreshold,
                 caption = row.caption
             )

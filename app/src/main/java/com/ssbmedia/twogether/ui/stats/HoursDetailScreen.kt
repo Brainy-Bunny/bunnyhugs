@@ -43,6 +43,7 @@ import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
 import com.ssbmedia.twogether.util.DateFormats
 import kotlinx.coroutines.flow.SharingStarted
 import java.util.Locale
+import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.stateIn
 import java.time.LocalDate
 import java.time.ZoneId
@@ -232,7 +233,14 @@ private fun DailyHoursBarChart(data: List<Pair<LocalDate, Double>>, modifier: Mo
                 // Both labels are measured and centered against this exact bar's own `centerX` - the
                 // same value that placed the bar itself, so alignment can't drift between them.
                 val dayLayout = textMeasurer.measure(date.dayOfMonth.toString(), dayLabelStyle)
-                drawText(dayLayout, topLeft = Offset(centerX - dayLayout.size.width / 2f, barAreaHeight + 2.dp.toPx()))
+                // MINOR fix (independent audit): the value label just below gets edge-clamped (see its
+                // own comment), but this day label never did, despite the comment above claiming "both
+                // labels are measured and centered against this exact bar's own centerX ... so alignment
+                // can't drift between them" - for the first/last bar that was false, since only one of
+                // the two was actually clamped to the canvas bounds.
+                val dayLeft = (centerX - dayLayout.size.width / 2f)
+                    .coerceIn(0f, (size.width - dayLayout.size.width).coerceAtLeast(0f))
+                drawText(dayLayout, topLeft = Offset(dayLeft, barAreaHeight + 2.dp.toPx()))
                 // BUG fix (ultimate-app-review Round 2, Opus, live-confirmed): a 2-digit-hour value like
                 // "12.4h" measured wider than this bar's own slot at typical widths (14 bars/chart), so
                 // neighboring value labels visibly collided/merged, worse at larger accessibility font
@@ -240,9 +248,13 @@ private fun DailyHoursBarChart(data: List<Pair<LocalDate, Double>>, modifier: Mo
                 // enough to fit the same slot single-digit-hour values already fit in - single decimal
                 // precision was never meaningful at that magnitude anyway (see DAYS metric elsewhere in
                 // this app's charts, which never shows sub-unit precision at all).
+                // MINOR fix (independent audit): was hours.toInt() (truncates toward zero) - a 12.9h
+                // bar labelled "12h", visibly self-contradicting this same chart's own header just above
+                // ("${"%.1f"...}h") when that 12.9h bar happens to be the chart's maximum. roundToInt()
+                // matches what a reader actually expects "dropping the decimal" to mean.
                 val valueText = when {
                     hours <= 0 -> "–"
-                    hours >= 10 -> "${hours.toInt()}h"
+                    hours >= 10 -> "${hours.roundToInt()}h"
                     else -> "%.1fh".format(Locale.US, hours)
                 }
                 val valueLayout = textMeasurer.measure(valueText, valueLabelStyle)
