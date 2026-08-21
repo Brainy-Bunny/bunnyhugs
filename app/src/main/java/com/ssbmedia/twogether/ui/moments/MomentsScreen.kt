@@ -45,6 +45,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -137,6 +138,17 @@ fun MomentsScreen(
     // coming back from a Moment's fullscreen view) keeps the size the user picked, without the extra
     // complexity of persisting it past this screen instance.
     var thumbnailSizeDp by rememberSaveable { mutableFloatStateOf(100f) }
+    // BUG fix (user-reported "thumbnails don't refresh immediately after rotating"): MomentThumbnail's
+    // own cacheBustKey (see PhotoEditor.cacheBustKey's doc) fixes staleness that survives a close/reopen
+    // of this screen, but a thumbnail already composed and still on-screen when a rotate happens (view
+    // full-screen -> rotate -> back to the SAME still-alive grid) has no reason to recompose on its own -
+    // neither moment.photoUri nor moment.photoDownloaded (its produceState keys) actually change just
+    // because the file's bytes changed underneath them. Bumped by MomentFullScreen's onPhotoRotated
+    // right after a successful rotate and threaded into every visible MomentThumbnail's own produceState
+    // keys below, so the one rotate that just happened forces every visible thumbnail to re-check its
+    // mtime immediately - cheap (a stat, not a re-download) even though it re-checks thumbnails whose
+    // photo didn't actually change.
+    var photoRotateTick by remember { mutableIntStateOf(0) }
 
     val zone = remember { ZoneId.systemDefault() }
     val grouped = remember(moments) {
@@ -260,6 +272,7 @@ fun MomentsScreen(
                                         moment = moment,
                                         isTransferring = moment.syncId in transferring,
                                         size = thumbnailSizeDp.dp,
+                                        rotateTick = photoRotateTick,
                                         onClick = { selected = moment }
                                     )
                                 }
@@ -286,7 +299,8 @@ fun MomentsScreen(
                 // Flow - closing the detail view here sidesteps ever rendering a deleted moment's
                 // fullscreen view after the fact, rather than needing extra reactivity to notice it's gone.
                 onDelete = { vm.deleteMoment(moment); selected = null },
-                onSetTakenWhileTogether = { together -> vm.setTakenWhileTogether(moment, together) }
+                onSetTakenWhileTogether = { together -> vm.setTakenWhileTogether(moment, together) },
+                onPhotoRotated = { photoRotateTick++ }
             )
         }
         }
@@ -294,7 +308,7 @@ fun MomentsScreen(
 }
 
 @Composable
-private fun MomentThumbnail(moment: Moment, isTransferring: Boolean, size: androidx.compose.ui.unit.Dp, onClick: () -> Unit) {
+private fun MomentThumbnail(moment: Moment, isTransferring: Boolean, size: androidx.compose.ui.unit.Dp, rotateTick: Int, onClick: () -> Unit) {
     // Feature 2: renders off photoDownloaded now (not isRemote) - a remote-stub moment whose photo
     // transfer has since completed correctly shows the real image here, not the placeholder forever. The
     // File(...).isFile check stays as a defensive belt-and-suspenders against the flag and disk disagreeing.
@@ -307,7 +321,7 @@ private fun MomentThumbnail(moment: Moment, isTransferring: Boolean, size: andro
     // BUG fix (user-reported "rotated images are not saved"): also captures the file's mtime here
     // (see PhotoEditor.cacheBustKey's own doc) so this grid thumbnail picks up an in-place rotate
     // instead of continuing to show Coil's stale pre-rotate cached bitmap forever.
-    val localPhotoState by produceState(initialValue = false to 0L, moment.photoUri, moment.photoDownloaded) {
+    val localPhotoState by produceState(initialValue = false to 0L, moment.photoUri, moment.photoDownloaded, rotateTick) {
         value = withContext(Dispatchers.IO) {
             val exists = moment.photoDownloaded && File(moment.photoUri).isFile
             exists to (if (exists) PhotoEditor.cacheBustKey(moment.photoUri) else 0L)
@@ -356,7 +370,11 @@ private fun MomentFullScreen(
     isTransferring: Boolean,
     onDismiss: () -> Unit,
     onDelete: () -> Unit,
-    onSetTakenWhileTogether: (Boolean) -> Unit
+    onSetTakenWhileTogether: (Boolean) -> Unit,
+    // BUG fix (user-reported "thumbnails don't refresh immediately"): see photoRotateTick's own doc at
+    // the MomentsScreen call site - fired right after a rotate actually succeeds, so the grid catches up
+    // the moment the user backs out of this viewer instead of only on the screen's next fresh open.
+    onPhotoRotated: () -> Unit = {}
 ) {
     val zone = remember { ZoneId.systemDefault() }
     val dateLabel = remember(moment.takenAt) {
@@ -440,6 +458,7 @@ private fun MomentFullScreen(
                                     // see photoCacheBustKey's own doc for why a monotonic local counter
                                     // isn't durable enough on its own to fix this across close/reopen.
                                     photoCacheBustKey = PhotoEditor.cacheBustKey(moment.photoUri)
+                                    onPhotoRotated()
                                     isRotating = false
                                 }
                             },
