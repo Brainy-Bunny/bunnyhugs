@@ -225,8 +225,15 @@ fun StatsScreen(
                         // Feature 1 / Phase 1 item 5: emoji now tracks the actual day-delta being shown
                         // (not the separate hours-based Trend enum below it), so the arrow can never
                         // point a different direction than the number next to it.
+                        //
+                        // BUG fix (user-reported, live-verified as a labeling issue not a calculation
+                        // bug): this compares "days met so far this month" against the SAME ELAPSED
+                        // WINDOW last month (e.g. days 1-21 of each month, not last month's full total) -
+                        // deliberately, to avoid unfairly reading "down" early in a month. The math was
+                        // always correct, but nothing on screen said so, which read as contradictory
+                        // against the "Most met month" card's full-month total sitting right next to it.
                         emoji = monthTrendDeltaEmoji(stats.monthTrendDeltaDays),
-                        label = "This month vs last",
+                        label = "This month vs last (so far)",
                         value = monthTrendDeltaLabel(stats.monthTrendDeltaDays),
                         modifier = Modifier.weight(1f),
                         onClick = { onOpenMonthlyDetail("days") }
