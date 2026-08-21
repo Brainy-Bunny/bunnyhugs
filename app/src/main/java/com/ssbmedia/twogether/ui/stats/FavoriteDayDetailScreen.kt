@@ -150,11 +150,17 @@ private fun WeekdayBarChart(data: List<Pair<DayOfWeek, Int>>, modifier: Modifier
                 // StatsScreen.kt's monthLabel doc for the cross-screen inconsistency this exact pattern
                 // caused (this screen's own chart was the "lun." half of that live-observed mismatch).
                 val dayLayout = textMeasurer.measure(day.getDisplayName(TextStyle.SHORT, Locale.US), dayLabelStyle)
-                drawText(dayLayout, topLeft = Offset(centerX - dayLayout.size.width / 2f, barAreaHeight + 2.dp.toPx()))
+                // BUG fix (user-requested, same class as HoursDetailScreen/MonthlyDetailScreen's matching
+                // fix): un-clamped centerX-based positioning let the first/last bar's label paint partly
+                // outside the Canvas - applying the same edge-clamp to every bar chart in this app, not
+                // just the two that already had a live-reported symptom.
+                val dayLeft = (centerX - dayLayout.size.width / 2f).coerceIn(0f, (size.width - dayLayout.size.width).coerceAtLeast(0f))
+                drawText(dayLayout, topLeft = Offset(dayLeft, barAreaHeight + 2.dp.toPx()))
                 val countLayout = textMeasurer.measure("$count", countLabelStyle)
+                val countLeft = (centerX - countLayout.size.width / 2f).coerceIn(0f, (size.width - countLayout.size.width).coerceAtLeast(0f))
                 drawText(
                     countLayout,
-                    topLeft = Offset(centerX - countLayout.size.width / 2f, barAreaHeight + 2.dp.toPx() + dayLayout.size.height)
+                    topLeft = Offset(countLeft, barAreaHeight + 2.dp.toPx() + dayLayout.size.height)
                 )
             }
             drawLine(

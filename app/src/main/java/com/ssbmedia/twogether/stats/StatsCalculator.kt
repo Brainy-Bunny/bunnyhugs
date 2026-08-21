@@ -376,14 +376,19 @@ object StatsCalculator {
         return (all - verifiedOnly).toFloat()
     }
 
-    private data class Interval(val start: Long, val end: Long)
+    // BUG fix (user-reported, Calendar day-detail duplicate timing): widened from private to internal so
+    // CalendarScreen.kt can reuse the exact same merge this class's own stats already trust - see
+    // mergedIntervals' own doc for the fix this enables.
+    internal data class Interval(val start: Long, val end: Long)
 
     /** Sorts sessions by start, clamps any open one's end via [effectiveOpenSessionEnd] (per row, since
      * the fallback bound depends on that row's own startedAt), drops degenerate non-positive-duration
      * rows, then merges overlapping/touching intervals into a normalized non-overlapping timeline.
      * Shared by [compute] and [buildDailyMinuteMap] so both can never drift apart on how overlap is
      * resolved. */
-    private fun mergedIntervals(
+    // BUG fix (user-reported): widened from private to internal - see the fix this enables at this
+    // function's own call site doc, and Interval's own doc above.
+    internal fun mergedIntervals(
         sessions: List<TogetherSession>,
         now: Long,
         lastSeenAt: Long,
@@ -746,5 +751,54 @@ object StatsCalculator {
             if (curLen >= bestLen) { bestLen = curLen; bestStart = curStart; bestEnd = sortedWeeks[i] }
         }
         return DateRange(weekKeyToMonday(bestStart), weekKeyToMonday(bestEnd).plusDays(6))
+    }
+
+    /** User-requested: "Weekly streak (current)" should be tappable too, matching "(longest)" - the
+     * actual calendar-date span of [TogetherStats.currentDailyStreak], i.e. the run ENDING today (or
+     * yesterday, if today hasn't qualified yet), mirroring [computeDailyStreaks]'s own "walk back from
+     * today" anchor logic exactly, just returning the real dates instead of only the length. Null if the
+     * current streak is 0 (today and yesterday both non-qualifying, or no history at all) - nothing to
+     * highlight. */
+    fun currentDailyStreakRange(
+        sessions: List<TogetherSession>,
+        now: Long = System.currentTimeMillis(),
+        zone: ZoneId = ZoneId.systemDefault(),
+        lastSeenAt: Long = 0L,
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+    ): DateRange? {
+        val qualifyingDays = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis).keys
+        if (qualifyingDays.isEmpty()) return null
+        val today = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
+        var anchor = today
+        if (anchor !in qualifyingDays) anchor = anchor.minusDays(1)
+        if (anchor !in qualifyingDays) return null
+        val end = anchor
+        var cursor = anchor
+        while (cursor.minusDays(1) in qualifyingDays) cursor = cursor.minusDays(1)
+        return DateRange(cursor, end)
+    }
+
+    /** Same idea as [currentDailyStreakRange] but for [TogetherStats.currentWeeklyStreak] - the run of
+     * consecutive ISO weeks ending at the current week (or the previous one, if the current week hasn't
+     * qualified yet), mirroring [computeWeeklyStreaks]'s own anchor logic. Null if the current streak is
+     * 0. */
+    fun currentWeeklyStreakRange(
+        sessions: List<TogetherSession>,
+        now: Long = System.currentTimeMillis(),
+        zone: ZoneId = ZoneId.systemDefault(),
+        lastSeenAt: Long = 0L,
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+    ): DateRange? {
+        val qualifyingDays = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis).keys
+        if (qualifyingDays.isEmpty()) return null
+        val qualifyingWeeks = qualifyingDays.map { weekKeyOf(it) }.toSet()
+        val today = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
+        var anchor = weekKeyOf(today)
+        if (anchor !in qualifyingWeeks) anchor = previousWeekKey(anchor)
+        if (anchor !in qualifyingWeeks) return null
+        val end = anchor
+        var cursor = anchor
+        while (previousWeekKey(cursor) in qualifyingWeeks) cursor = previousWeekKey(cursor)
+        return DateRange(weekKeyToMonday(cursor), weekKeyToMonday(end).plusDays(6))
     }
 }

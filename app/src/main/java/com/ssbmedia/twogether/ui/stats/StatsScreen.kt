@@ -84,6 +84,13 @@ fun StatsScreen(
     val longestWeeklyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt) {
         StatsCalculator.longestWeeklyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt)
     }
+    // User-requested: "current" streak cards should be tappable too, matching "longest".
+    val currentDailyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt) {
+        StatsCalculator.currentDailyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt)
+    }
+    val currentWeeklyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt) {
+        StatsCalculator.currentWeeklyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt)
+    }
 
     Scaffold(
         topBar = {
@@ -134,7 +141,15 @@ fun StatsScreen(
             item {
                 SectionHeader("Streaks")
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Max)) {
-                    StatCard(emoji = "🔥", label = "Daily streak (current)", value = "${stats.currentDailyStreak}d", modifier = Modifier.weight(1f))
+                    StatCard(
+                        emoji = "🔥",
+                        label = "Daily streak (current)",
+                        value = "${stats.currentDailyStreak}d",
+                        modifier = Modifier.weight(1f),
+                        onClick = currentDailyStreakRange?.let { range ->
+                            { onOpenCalendarWithArgs(null, range.start.toEpochDay(), range.end.toEpochDay()) }
+                        }
+                    )
                     StatCard(
                         emoji = "🏆",
                         label = "Daily streak (longest)",
@@ -146,7 +161,15 @@ fun StatsScreen(
                     )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Max).padding(top = 12.dp)) {
-                    StatCard(emoji = "🌟", label = "Weekly streak (current)", value = "${stats.currentWeeklyStreak}w", modifier = Modifier.weight(1f))
+                    StatCard(
+                        emoji = "🌟",
+                        label = "Weekly streak (current)",
+                        value = "${stats.currentWeeklyStreak}w",
+                        modifier = Modifier.weight(1f),
+                        onClick = currentWeeklyStreakRange?.let { range ->
+                            { onOpenCalendarWithArgs(null, range.start.toEpochDay(), range.end.toEpochDay()) }
+                        }
+                    )
                     StatCard(
                         emoji = "✨",
                         label = "Weekly streak (longest)",
