@@ -200,18 +200,19 @@ fun BadgesScreen(
 @Composable
 private fun BadgeCardContent(status: BadgeStatus, unlockDates: Map<String, Long>) {
     // BUG fix (user-reported), take 3: the previous fix aligned the progress line's OWN position
-    // consistently regardless of title length (Box.heightIn below), but left this Column - which has
-    // no fillMaxHeight/verticalArrangement, so it just wraps its own content height - top-anchored
-    // inside whatever taller height a row's tallest sibling forces onto this Card (IntrinsicSize.Max on
-    // the parent Row). A card with genuinely shorter content (e.g. "7 Day Streak", 1-line title) than
-    // its row-mate (e.g. "500 Hours Together", 2-line title) ended up with its icon/title/progress
-    // cluster sitting at the top and a dead gap below it, rather than looking vertically centered like
-    // the taller card (whose content happens to already fill its own height). fillMaxHeight +
-    // Arrangement.Center makes every card's content block centered in whatever height the row ends up
-    // at, so a shorter card's extra space splits evenly above/below instead of all collecting at the
-    // bottom.
+    // consistently regardless of title length (Box.heightIn below), but left this Column - which had
+    // no fillMaxHeight/fillMaxWidth, so it just wrapped its own content size - anchored to the TOP-START
+    // corner of whatever bigger box a row's tallest/widest sibling forces onto this Card
+    // (IntrinsicSize.Max on the parent Row, Modifier.weight(1f) giving every card equal width).
+    // horizontalAlignment/verticalArrangement only center children WITHIN the Column's own bounds - with
+    // no fillMaxHeight/fillMaxWidth, those bounds were only as big as the content itself (e.g. the width
+    // of "50 Hours Together"'s text), so there was nothing wider/taller to actually center against,
+    // leaving dead space collect at the bottom (shorter-content card in a row with a 2-line-title
+    // sibling) and on the right (narrower-content card in a row with a wider-title sibling) instead of
+    // splitting evenly. fillMaxSize() gives the Column the card's FULL bounds so
+    // horizontalAlignment/verticalArrangement have real room to center within.
     Column(
-        modifier = Modifier.padding(16.dp).fillMaxHeight(),
+        modifier = Modifier.padding(16.dp).fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
