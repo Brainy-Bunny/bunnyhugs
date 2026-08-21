@@ -337,6 +337,34 @@ class UltimateReviewRound2SpecTest {
     }
 
     @Test
+    fun `unlockIfNotDeleted's own @Query string still contains the AND unlockedAt IS NULL race guard`() {
+        // MAJOR fix (final Opus re-audit): the test above models the INTENDED race semantics correctly,
+        // but it is a hand-rolled Kotlin re-implementation - it has zero coupling to the real
+        // TimeCapsuleDao.unlockIfNotDeleted @Query string, and would keep passing unchanged even if that
+        // clause were reverted in Daos.kt. An independent Opus verification pass proved this empirically:
+        // it reverted the clause in the real DAO and re-ran the full suite, which stayed green at 398/0.
+        //
+        // Room's @Query has AnnotationRetention.BINARY (confirmed via room-common's own class file), so the
+        // query string cannot be read back via runtime reflection - there is no annotation-processor-free
+        // way to assert against the COMPILED query from a plain JUnit test. This instead pins the *source*
+        // text directly: a cheap, deliberately blunt regression check that fails loudly the moment someone
+        // edits the WHERE clause, whether that's an accidental revert or a well-intentioned refactor that
+        // forgets why the clause is there - either way, this test forces them to read the KDoc on
+        // unlockIfNotDeleted (Daos.kt) and Repositories.kt's unlockEligible before touching it.
+        val daosSource = java.io.File("src/main/java/com/ssbmedia/twogether/data/db/Daos.kt").readText()
+        val queryStart = daosSource.indexOf("fun unlockIfNotDeleted")
+        assertTrue("Daos.kt must still declare unlockIfNotDeleted - has it been renamed or removed?", queryStart >= 0)
+        val precedingQuery = daosSource.substring(0, queryStart).substringAfterLast("@Query(")
+        assertTrue(
+            "unlockIfNotDeleted's @Query must still guard with 'AND unlockedAt IS NULL' - without it, two " +
+                "concurrent callers (ProximityForegroundService's tick and CapsulesViewModel's own collector) " +
+                "can both get a nonzero affected-row-count for the same capsule and both fire a duplicate " +
+                "unlock notification",
+            precedingQuery.contains("AND unlockedAt IS NULL")
+        )
+    }
+
+    @Test
     fun `unlockEligible - deleting a manual session after creation cannot pull the threshold below unlockAtHours (honest-case fix)`() {
         // currentManualHoursCredit dropping below manualHoursAtCreation (a manual entry deleted after the
         // capsule was created) used to silently LOWER effectiveThreshold below the capsule's own stated

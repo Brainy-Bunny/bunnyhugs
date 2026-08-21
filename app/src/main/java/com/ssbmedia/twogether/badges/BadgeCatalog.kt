@@ -1,6 +1,7 @@
 package com.ssbmedia.twogether.badges
 
 import com.ssbmedia.twogether.stats.TogetherStats
+import java.util.Locale
 
 enum class BadgeType { HOURS, DAILY_STREAK, WEEKLY_STREAK, REUNIONS, PERFECT_WEEKS }
 
@@ -261,7 +262,11 @@ object BadgeCatalog {
         val liveCurrentInt = liveCurrent.toInt()
         val fraction = ((liveCurrent - prev) / span).toFloat().coerceIn(0f, 1f)
         val caption = if (type == BadgeType.HOURS) {
-            "${"%.1f".format((next - liveCurrent).coerceAtLeast(0.0))}h to go"
+            // MINOR fix (final Opus re-audit): pinned to Locale.US, matching the ui/stats/ convention
+            // (see GapsDetailScreen's own doc) - unpinned, this used the JVM default locale's decimal
+            // separator (e.g. "2,5" on a comma-decimal device locale), which also made
+            // BadgeCatalogProgressTest's own "2.5h to go" assertion locale-dependent.
+            "${"%.1f".format(Locale.US, (next - liveCurrent).coerceAtLeast(0.0))}h to go"
         } else {
             val remaining = (next - liveCurrentInt).coerceAtLeast(0)
             // BUG fix (carried over from the original inline version): "1 days/weeks/reunions to your

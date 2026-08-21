@@ -117,6 +117,7 @@ import java.io.File
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
+import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -781,7 +782,9 @@ fun HomeScreen(
                         // instead of centering it.
                         Column(Modifier.padding(16.dp).fillMaxHeight(), verticalArrangement = Arrangement.Center) {
                             Text("This week", style = MaterialTheme.typography.bodySmall)
-                            Text("${"%.1f".format(stats.totalHoursThisWeek)}h", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                            // MINOR fix (final Opus re-audit): pinned to Locale.US, matching the
+                            // ui/stats/ convention (see GapsDetailScreen's own doc).
+                            Text("${"%.1f".format(Locale.US, stats.totalHoursThisWeek)}h", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                         }
                     }
                     Card(
@@ -1567,7 +1570,8 @@ private fun OnThisDayCard(info: OnThisDayInfo, onClick: () -> Unit = {}) {
                 fontWeight = FontWeight.SemiBold
             )
             Text(
-                "You spent ${"%.1f".format(info.hours)}h together 💛",
+                // MINOR fix (final Opus re-audit): pinned to Locale.US, matching the ui/stats/ convention.
+                "You spent ${"%.1f".format(Locale.US, info.hours)}h together 💛",
                 style = MaterialTheme.typography.bodySmall
             )
         }

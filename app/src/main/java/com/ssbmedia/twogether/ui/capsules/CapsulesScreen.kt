@@ -51,6 +51,7 @@ import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
 import com.ssbmedia.twogether.util.DateFormats
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.combine
+import java.util.Locale
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.time.Instant
@@ -336,8 +337,11 @@ private fun AddCapsuleDialog(currentTotalHours: Float, onDismiss: () -> Unit, on
     // suggestion is always meaningfully ahead of currentTotalHours (round-to-nearest-50 lands at most 25h
     // below it, and the +50 covers that gap several times over), never behind it the way a flat "50" could
     // be. Still just a suggestion, not a floor - the field stays freely editable either direction.
+    // MINOR fix (final Opus re-audit): unclamped, this could suggest a value past MAX_CAPSULE_UNLOCK_HOURS
+    // once currentTotalHours got within 50h of it - the dialog would then open pre-filled with an invalid
+    // suggestion, Save disabled and an error already showing, on first open with zero user input.
     val suggestedHours = remember(currentTotalHours) {
-        (Math.round(currentTotalHours / 50f) * 50) + 50
+        ((Math.round(currentTotalHours / 50f) * 50) + 50).coerceAtMost(MAX_CAPSULE_UNLOCK_HOURS.toInt())
     }
     var hoursText by remember { mutableStateOf(suggestedHours.toString()) }
 
@@ -381,7 +385,9 @@ private fun AddCapsuleDialog(currentTotalHours: Float, onDismiss: () -> Unit, on
 }
 
 private fun Float.trimZeros(): String {
-    return if (this == this.toInt().toFloat()) this.toInt().toString() else "%.1f".format(this)
+    // MINOR fix (final Opus re-audit): pinned to Locale.US, matching the ui/stats/ convention (see
+    // GapsDetailScreen's own doc) - unpinned, this used the JVM default locale's decimal separator.
+    return if (this == this.toInt().toFloat()) this.toInt().toString() else "%.1f".format(Locale.US, this)
 }
 
 /** UX-FIX-PLAN.md Phase 2 item 11: the two lines of persistent timeline text a capsule card shows -

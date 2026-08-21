@@ -544,7 +544,15 @@ private fun EditMilestoneDialog(
     onSave: (label: String, month: Int, day: Int, year: Int?, linkedMomentSyncId: String?) -> Unit
 ) {
     var label by remember(milestone.id) { mutableStateOf(milestone.label) }
-    var month by remember(milestone.id) { mutableStateOf(milestone.month) }
+    // MAJOR fix (final Opus re-audit, live-reproducible): a milestone row can carry a raw, unclamped
+    // month (1-13, 0, etc.) - reachable from a pre-this-session peer/backup, or one that predates
+    // GattSyncManager.deserializeMilestones'/BackupManager.parseMilestones' own month clamp fixes and
+    // is still sitting in some phone's local DB right now (see monthDayLabel's own doc). The card
+    // itself never crashes on such a row, since monthDayLabel clamps before display - but this dialog
+    // used to seed straight from the raw value, and YearMonth.of(2024, month) / Month.of(month) below
+    // both throw DateTimeException for anything outside 1-12, crashing the app the instant Edit was
+    // tapped on exactly the row this dialog most needs to let the user fix.
+    var month by remember(milestone.id) { mutableStateOf(milestone.month.coerceIn(1, 12)) }
     var dayText by remember(milestone.id) { mutableStateOf(milestone.day.toString()) }
     var yearText by remember(milestone.id) { mutableStateOf(milestone.year?.toString() ?: "") }
     var monthMenuExpanded by remember { mutableStateOf(false) }
@@ -827,9 +835,16 @@ private fun monthDayLabel(month: Int, day: Int): String =
  * MilestoneAlarmScheduler.safeDate's own reasoning for the exact same clamp. Internal (not private) so
  * MilestonesScreenTest can exercise it directly without any Compose test infra. */
 internal fun safeDateForYear(year: Int, month: Int, day: Int): LocalDate {
+    // MAJOR fix (final Opus re-audit): month/day were clamped here, but year passed straight through -
+    // this function's own doc claims it's a total, crash-proof builder, but LocalDate's valid range
+    // (Year.MIN_VALUE..Year.MAX_VALUE) is narrower than Int, so an out-of-range milestone.year (reachable
+    // via a peer/backup - see GattSyncManager.deserializeMilestones' and BackupManager.parseMilestones'
+    // own year clamps, which are the primary fix for that boundary) could still crash LocalDate.of here.
+    // Defense-in-depth, same reasoning as the month/day clamps immediately below.
+    val safeYear = year.coerceIn(java.time.Year.MIN_VALUE, java.time.Year.MAX_VALUE)
     val safeMonth = month.coerceIn(1, 12)
-    val maxDay = YearMonth.of(year, safeMonth).lengthOfMonth()
-    return LocalDate.of(year, safeMonth, day.coerceIn(1, maxDay))
+    val maxDay = YearMonth.of(safeYear, safeMonth).lengthOfMonth()
+    return LocalDate.of(safeYear, safeMonth, day.coerceIn(1, maxDay))
 }
 
 /** UX-FIX-PLAN.md Phase 3 item 20: which calendar year to jump to when a milestone's date itself is

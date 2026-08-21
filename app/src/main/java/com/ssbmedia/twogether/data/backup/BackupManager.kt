@@ -267,7 +267,9 @@ object BackupManager {
     private fun formatBackupSize(sizeBytes: Long): String = when {
         sizeBytes < 1024 -> "$sizeBytes bytes"
         sizeBytes < 1024 * 1024 -> "${Math.round(sizeBytes / 1024.0)} KB"
-        else -> "${"%.1f".format(sizeBytes / (1024.0 * 1024.0))} MB"
+        // MINOR fix (final Opus re-audit): pinned to Locale.US, same ui/stats/ convention this file's
+        // own parseMilestones neighbour otherwise follows for numeric display text.
+        else -> "${"%.1f".format(Locale.US, sizeBytes / (1024.0 * 1024.0))} MB"
     }
 
     private fun photoZipEntryName(moment: Moment): String = "photos/${moment.id}_${File(moment.photoUri).name}"
@@ -1441,7 +1443,12 @@ object BackupManager {
                 // via a malicious paired peer over BLE.
                 month = o.getInt("month").coerceIn(1, 12),
                 day = o.getInt("day").coerceIn(1, 31),
-                year = if (o.isNull("year")) null else o.optInt("year"),
+                // MAJOR fix (final Opus re-audit): same gap as GattSyncManager.deserializeMilestones' matching
+                // fix - year wasn't clamped like month/day are, and an implausible year from a crafted backup
+                // reaches MilestonesScreen.safeDateForYear's LocalDate.of, whose valid range is narrower than
+                // Int, crashing the retrospective date-tap. Clamped to the same 4-digit range the UI's own
+                // yearText entry field already enforces.
+                year = if (o.isNull("year")) null else o.optInt("year").coerceIn(1, 9999),
                 createdAt = o.getLong("createdAt"),
                 updatedAt = updatedAt,
                 deleted = o.optBoolean("deleted", false),

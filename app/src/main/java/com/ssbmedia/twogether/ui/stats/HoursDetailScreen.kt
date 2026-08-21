@@ -157,17 +157,25 @@ fun HoursDetailScreen(onBack: () -> Unit) {
                     modifier = Modifier.padding(bottom = 8.dp)
                 )
                 HorizontalPager(state = pagerState, modifier = Modifier.fillMaxWidth()) { page ->
-                    val bounds = pageBounds.getOrNull(page) ?: (0 until 0)
-                    val windowData = dailyHours.subList(bounds.first, bounds.last + 1)
-                    Column {
-                        val rangeLabel = if (windowData.size > 1) {
-                            "${DateFormats.formatDateLong(windowData.first().first)} – " +
-                                DateFormats.formatDateLong(windowData.last().first)
-                        } else {
-                            DateFormats.formatDateLong(windowData.first().first)
+                    // MINOR fix (final Opus re-audit): the old fallback `?: (0 until 0)` was itself a
+                    // crash - an empty range's .first/.last feed subList(0, 0), an empty windowData, and
+                    // then windowData.first() below throws NoSuchElementException. pageBounds.size ==
+                    // pageCount always holds today, so this is defense-in-depth only, but a "safe" fallback
+                    // that guarantees the exact crash it exists to prevent isn't defensive at all - skip
+                    // rendering that page instead if it ever fires.
+                    val bounds = pageBounds.getOrNull(page)
+                    if (bounds != null) {
+                        val windowData = dailyHours.subList(bounds.first, bounds.last + 1)
+                        Column {
+                            val rangeLabel = if (windowData.size > 1) {
+                                "${DateFormats.formatDateLong(windowData.first().first)} – " +
+                                    DateFormats.formatDateLong(windowData.last().first)
+                            } else {
+                                DateFormats.formatDateLong(windowData.first().first)
+                            }
+                            Text(rangeLabel, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                            DailyHoursBarChart(windowData, modifier = Modifier.padding(top = 12.dp))
                         }
-                        Text(rangeLabel, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                        DailyHoursBarChart(windowData, modifier = Modifier.padding(top = 12.dp))
                     }
                 }
             }

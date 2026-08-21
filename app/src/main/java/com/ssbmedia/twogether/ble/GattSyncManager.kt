@@ -939,7 +939,13 @@ class GattSyncManager(
                 // BackupManager.parseMilestones' matching fix for the same issue via a crafted backup file.
                 month = o.getInt("month").coerceIn(1, 12),
                 day = o.getInt("day").coerceIn(1, 31),
-                year = if (o.isNull("year")) null else o.getInt("year"),
+                // MAJOR fix (final Opus re-audit): month/day above are clamped at this exact boundary for
+                // the same reason - year wasn't, and an implausible peer-supplied year (the UI's own entry
+                // field caps at 4 digits via yearText's .take(4), so this is specifically a wire-only gap)
+                // reaches MilestonesScreen.safeDateForYear's LocalDate.of, whose valid range is narrower
+                // than Int, crashing the retrospective date-tap. Clamped to the same 4-digit range the UI
+                // itself already enforces for a locally-entered year.
+                year = if (o.isNull("year")) null else o.getInt("year").coerceIn(1, 9999),
                 createdAt = o.getLong("createdAt"),
                 updatedAt = updatedAt,
                 deleted = o.optBoolean("deleted", false),

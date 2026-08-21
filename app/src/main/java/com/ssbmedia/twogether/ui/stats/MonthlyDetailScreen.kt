@@ -162,16 +162,20 @@ fun MonthlyDetailScreen(initialMetric: String, onBack: () -> Unit) {
                     modifier = Modifier.padding(top = 12.dp, bottom = 8.dp)
                 )
                 HorizontalPager(state = pagerState, modifier = Modifier.fillMaxWidth()) { page ->
-                    val bounds = pageBounds.getOrNull(page) ?: (0 until 0)
-                    val windowData = monthly.subList(bounds.first, bounds.last + 1)
-                    Column {
-                        val rangeLabel = if (windowData.size > 1) {
-                            "${monthLabel(windowData.first().yearMonth)} – ${monthLabel(windowData.last().yearMonth)}"
-                        } else {
-                            monthLabel(windowData.first().yearMonth)
+                    // MINOR fix (final Opus re-audit): the old fallback `?: (0 until 0)` was itself a
+                    // crash - see HoursDetailScreen's matching fix for the identical bug and reasoning.
+                    val bounds = pageBounds.getOrNull(page)
+                    if (bounds != null) {
+                        val windowData = monthly.subList(bounds.first, bounds.last + 1)
+                        Column {
+                            val rangeLabel = if (windowData.size > 1) {
+                                "${monthLabel(windowData.first().yearMonth)} – ${monthLabel(windowData.last().yearMonth)}"
+                            } else {
+                                monthLabel(windowData.first().yearMonth)
+                            }
+                            Text(rangeLabel, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                            MonthlyBarChart(windowData, metric, modifier = Modifier.padding(top = 12.dp))
                         }
-                        Text(rangeLabel, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                        MonthlyBarChart(windowData, metric, modifier = Modifier.padding(top = 12.dp))
                     }
                 }
             }
