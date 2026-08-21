@@ -1,6 +1,7 @@
 package com.ssbmedia.twogether.ui.badges
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
@@ -9,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -208,22 +210,32 @@ private fun BadgeCardContent(status: BadgeStatus, unlockDates: Map<String, Long>
                 alpha = if (status.unlocked) 1f else 0.35f
             }
         )
-        Text(
-            text = status.badge.title,
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.SemiBold,
-            textAlign = TextAlign.Center,
-            // BUG fix (user-reported): row height was already equalized (IntrinsicSize.Max, see this
-            // Row's own comment above), but a 1-line title ("50 Hours Together") vs a 2-line one
-            // ("100 Hours Together" wraps) still left every card's OWN progress text ("0/50" etc.) at a
-            // different vertical offset within that equal-height card, since a plain top-aligned Column
-            // gives a shorter title less space above the progress line. minLines = 2 reserves the same
-            // title block height on every card regardless of whether its own title actually wraps, so
-            // the progress line lands at the same y-position across an entire row.
-            minLines = 2,
-            maxLines = 2,
-            modifier = Modifier.padding(top = 8.dp)
-        )
+        // BUG fix (user-reported), take 2: row height was already equalized (IntrinsicSize.Max, see
+        // this Row's own comment above), but a 1-line title ("50 Hours Together") vs a 2-line one
+        // ("100 Hours Together" wraps) still left every card's OWN progress text ("0/50" etc.) at a
+        // different vertical offset, since a plain top-aligned Column gives a shorter title less space
+        // above the progress line. The first fix for this used Text's own minLines = 2 to reserve a
+        // consistent 2-line block - which looked right whenever the SAME row happened to contain a
+        // genuinely-2-line title (its real, correctly-measured height set the row's IntrinsicSize.Max
+        // tall enough for everyone), but broke completely whenever EVERY title in a row was naturally
+        // 1-line ("30 Day Streak" + "100 Day Streak"): IntrinsicSize.Max's intrinsic-measurement pass
+        // doesn't correctly account for Text's minLines (a known Compose rough edge - minLines is
+        // enforced in the real measure pass but not faithfully mirrored in the cheaper intrinsic-measure
+        // pass), so the ROW itself was sized too short, and the Card's Surface then clipped the
+        // progress text off entirely rather than just showing misaligned. A fixed-dp Box.heightIn(min)
+        // is a plain layout constraint Compose's intrinsic-measure pass handles correctly (unlike
+        // minLines), so it doesn't have this gap. 48.dp comfortably fits two titleMedium lines at
+        // default scale and, being a MINIMUM (not a cap), still grows further under larger accessibility
+        // font sizes rather than clipping.
+        Box(modifier = Modifier.heightIn(min = 48.dp).padding(top = 8.dp), contentAlignment = Alignment.Center) {
+            Text(
+                text = status.badge.title,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                textAlign = TextAlign.Center,
+                maxLines = 2
+            )
+        }
         Text(
             text = status.progressLabel,
             style = MaterialTheme.typography.bodySmall,
