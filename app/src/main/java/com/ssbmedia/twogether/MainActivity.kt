@@ -73,6 +73,14 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // User-requested privacy fix: without this, Android's Recents/task-switcher shows a live
+        // screenshot-style thumbnail of whatever screen was open when the app was backgrounded - a real
+        // leak past the PIN lock, since Recents is reachable with no PIN prompt at all. FLAG_SECURE
+        // also blocks actual screenshots/screen-recording of this app, which is a reasonable bonus for
+        // an app whose whole purpose is private content between two people, not a stated ask but a
+        // natural extension of the same concern. The Recents entry itself still shows the app's icon
+        // and name (this doesn't hide that the app exists, only its content).
+        window.setFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE, android.view.WindowManager.LayoutParams.FLAG_SECURE)
         RestorePickerHost.launchPicker = { restorePickerLauncher.launch(arrayOf("*/*")) }
 
         if (intent?.getBooleanExtra(Notifications.EXTRA_OPEN_CAMERA, false) == true) {
