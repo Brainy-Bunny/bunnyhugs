@@ -4,7 +4,11 @@ import android.content.Intent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -227,8 +231,11 @@ class HomeViewModel : ViewModel() {
     val milestones: StateFlow<List<Milestone>> = ServiceLocator.milestoneRepository.observeActive()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    // Picked once per Home visit (this ViewModel instance) — a simple "throwback" surface.
-    val randomMoment: MutableStateFlow<Moment?> = MutableStateFlow(null)
+    // Picked once per Home visit (this ViewModel instance) — a simple "throwback" surface. User-
+    // requested slideshow: when more than one anniversary photo exists (see pickRandomMomentIfNeeded's
+    // own doc), this holds all of them (capped) so MemoryThrowbackCard can page through them; a plain
+    // random pick (no anniversary match) is always a single-element list.
+    val memoryMoments: MutableStateFlow<List<Moment>> = MutableStateFlow(emptyList())
 
     /** Only ever picks from moments this device actually HOLDS the photo bytes for - a remote-stub
      * moment (partner's photo metadata synced, but the bytes haven't transferred yet - see
@@ -239,14 +246,38 @@ class HomeViewModel : ViewModel() {
      * shows a real memory or doesn't appear at all, never a broken-image placeholder where a photo was
      * expected. The isFile check (not just the DB flag) additionally covers the rare case of the flag
      * being true but the file having since vanished some other way. */
+    // User-requested: "okay Random is good.. BUT it should show anniversary photo if available if
+    // not then only random... If we can show all the photos of that anniversary... last 3-5 photos
+    // from same day in last year or last to last year.. as slide show.. that would be the best." A
+    // photo taken on this exact month+day in a PAST year is a genuine "on this day" memory, not just
+    // any random photo - so the whole anniversary pool (every qualifying photo, across every matching
+    // year) wins over the plain-random pool whenever at least one exists, capped at
+    // MAX_MEMORY_SLIDESHOW_PHOTOS so a couple with many years of photos still gets a short slideshow,
+    // not an unbounded one. Falls back to a single random photo only when there's no anniversary match
+    // at all.
     suspend fun pickRandomMomentIfNeeded(all: List<Moment>) {
-        if (randomMoment.value != null) return
+        if (memoryMoments.value.isNotEmpty()) return
         // MINOR fix: File.isFile is blocking disk I/O, and this used to run directly on whatever
         // dispatcher the caller's LaunchedEffect is on (Main) - moved off Main here so a large moment
         // list (or repeated re-runs while nothing is downloaded yet, e.g. right after a restore) can't
         // ever cause a stutter.
         val withPhoto = withContext(Dispatchers.IO) { all.filter { it.photoDownloaded && File(it.photoUri).isFile } }
-        if (withPhoto.isNotEmpty()) randomMoment.value = withPhoto.random()
+        if (withPhoto.isEmpty()) return
+        val zone = ZoneId.systemDefault()
+        val today = LocalDate.now(zone)
+        val anniversaryPool = withPhoto.filter { moment ->
+            val takenDate = Instant.ofEpochMilli(moment.takenAt).atZone(zone).toLocalDate()
+            takenDate.monthValue == today.monthValue && takenDate.dayOfMonth == today.dayOfMonth && takenDate.year != today.year
+        }.sortedByDescending { it.takenAt }
+        memoryMoments.value = if (anniversaryPool.isNotEmpty()) {
+            anniversaryPool.take(MAX_MEMORY_SLIDESHOW_PHOTOS)
+        } else {
+            listOf(withPhoto.random())
+        }
+    }
+
+    companion object {
+        private const val MAX_MEMORY_SLIDESHOW_PHOTOS = 5
     }
 }
 
@@ -276,7 +307,7 @@ fun HomeScreen(
     // subscribed to here.
     val proximityState by vm.proximityState.collectAsState()
     val moments by vm.moments.collectAsState()
-    val randomMoment by vm.randomMoment.collectAsState()
+    val memoryMoments by vm.memoryMoments.collectAsState()
     val milestones by vm.milestones.collectAsState()
     val quickLinksOrder by vm.quickLinksOrder.collectAsState()
     val settings by vm.settings.collectAsState()
@@ -769,22 +800,16 @@ fun HomeScreen(
                     NextBadgeProgressCard(row = nextBadgeRow, onClick = onNavigateBadges)
                 }
             }
-            if (randomMoment != null) {
+            if (memoryMoments.isNotEmpty()) {
                 item {
-                    val linkedMilestoneLabel = remember(randomMoment, milestones) {
-                        milestones.firstOrNull { it.linkedMomentSyncId == randomMoment!!.syncId }?.label
-                    }
-                    // UX-FIX-PLAN.md Phase 3 item 20: opens Moments scrolled to this photo's own day -
-                    // the closest this app can get to "open the exact Moment" without a dedicated
-                    // single-photo deep link, and consistent with Calendar's own day -> Moments link.
-                    val momentEpochDay = remember(randomMoment) {
-                        Instant.ofEpochMilli(randomMoment!!.takenAt).atZone(ZoneId.systemDefault()).toLocalDate().toEpochDay()
-                    }
+                    // User-requested slideshow: MemoryThrowbackCard now owns its own pager over
+                    // [memoryMoments] (1 element for a plain random pick, up to 5 for an anniversary
+                    // match) - see HomeViewModel.pickRandomMomentIfNeeded's own doc.
                     MemoryThrowbackCard(
-                        moment = randomMoment!!,
+                        moments = memoryMoments,
+                        milestones = milestones,
                         now = now,
-                        milestoneLabel = linkedMilestoneLabel,
-                        onClick = { onOpenMoments(momentEpochDay) }
+                        onOpenMoments = onOpenMoments
                     )
                 }
             }
@@ -1402,35 +1427,86 @@ private fun NotificationInboxSheet(
 }
 
 @Composable
-private fun MemoryThrowbackCard(moment: Moment, now: Long, milestoneLabel: String? = null, onClick: () -> Unit = {}) {
+private fun MemoryThrowbackCard(
+    moments: List<Moment>,
+    milestones: List<Milestone>,
+    now: Long,
+    onOpenMoments: (jumpToEpochDay: Long) -> Unit = {}
+) {
+    // User-requested slideshow: a single-element list renders exactly like the old one-photo card
+    // (no pager chrome for the common case); more than one (an anniversary match across several years -
+    // see HomeViewModel.pickRandomMomentIfNeeded's own doc) becomes swipeable, with dot indicators.
+    val pagerState = rememberPagerState(pageCount = { moments.size })
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.large,
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
-        onClick = onClick
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
     ) {
-        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            AsyncImage(
-                model = moment.photoUri,
-                contentDescription = "Memory",
-                contentScale = ContentScale.Crop,
-                modifier = Modifier
-                    .fillMaxWidth(0.28f)
-                    .aspectRatio(1f)
-                    .clip(RoundedCornerShape(14.dp))
-                    .padding(end = 0.dp)
-            )
-            Column(modifier = Modifier.padding(start = 12.dp)) {
-                // Feature: when this randomly-picked photo happens to be one linked to a milestone (see
-                // Milestone.linkedMomentSyncId's doc), name the actual occasion instead of the generic
-                // caption - "📸 Anniversary" says more than "📸 A memory from 40 weeks ago" when we
-                // genuinely know what the photo is of.
-                if (milestoneLabel != null) {
-                    Text("📸 $milestoneLabel", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Text("From ${timeAgo(moment.takenAt, now)} 💛", style = MaterialTheme.typography.bodySmall)
-                } else {
-                    Text("📸 A memory from ${timeAgo(moment.takenAt, now)}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Text("A little throwback for you two 💛", style = MaterialTheme.typography.bodySmall)
+        Column(modifier = Modifier.padding(12.dp)) {
+            HorizontalPager(state = pagerState, modifier = Modifier.fillMaxWidth()) { page ->
+                val moment = moments[page]
+                // UX-FIX-PLAN.md Phase 3 item 20: opens Moments scrolled to THIS page's own photo day -
+                // the closest this app can get to "open the exact Moment" without a dedicated
+                // single-photo deep link, consistent with Calendar's own day -> Moments link. Recomputed
+                // per page (not hoisted once outside the pager) since each page is a different photo/day.
+                val momentEpochDay = remember(moment) {
+                    Instant.ofEpochMilli(moment.takenAt).atZone(ZoneId.systemDefault()).toLocalDate().toEpochDay()
+                }
+                val milestoneLabel = remember(moment, milestones) {
+                    milestones.firstOrNull { it.linkedMomentSyncId == moment.syncId }?.label
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth().clickable(onClick = { onOpenMoments(momentEpochDay) }),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    AsyncImage(
+                        model = moment.photoUri,
+                        contentDescription = "Memory",
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier
+                            .fillMaxWidth(0.28f)
+                            .aspectRatio(1f)
+                            .clip(RoundedCornerShape(14.dp))
+                    )
+                    Column(modifier = Modifier.padding(start = 12.dp)) {
+                        // Feature: when this photo happens to be one linked to a milestone (see
+                        // Milestone.linkedMomentSyncId's doc), name the actual occasion instead of the
+                        // generic caption - "📸 Anniversary" says more than "📸 A memory from 40 weeks
+                        // ago" when we genuinely know what the photo is of.
+                        if (milestoneLabel != null) {
+                            Text("📸 $milestoneLabel", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                            Text("From ${timeAgo(moment.takenAt, now)} 💛", style = MaterialTheme.typography.bodySmall)
+                        } else if (moments.size > 1) {
+                            // More than one qualifying photo only ever happens for an anniversary-day
+                            // match (see pickRandomMomentIfNeeded) - a plain random pick is always a
+                            // single-element list, so reaching this branch already implies "on this day".
+                            Text("📸 On this day, ${timeAgo(moment.takenAt, now)}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                            Text("Swipe for more from this day 💛", style = MaterialTheme.typography.bodySmall)
+                        } else {
+                            Text("📸 A memory from ${timeAgo(moment.takenAt, now)}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                            Text("A little throwback for you two 💛", style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+            }
+            if (moments.size > 1) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    repeat(moments.size) { i ->
+                        val active = i == pagerState.currentPage
+                        Box(
+                            modifier = Modifier
+                                .padding(horizontal = 3.dp)
+                                .size(if (active) 7.dp else 6.dp)
+                                .clip(androidx.compose.foundation.shape.CircleShape)
+                                .background(
+                                    if (active) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.3f)
+                                )
+                        )
+                    }
                 }
             }
         }
