@@ -250,7 +250,24 @@ fun MilestonesScreen(
                     // MilestoneRetrospective already uses below for its own date-matched gallery. A link
                     // that no longer resolves to a locally-held photo (not yet synced, or deleted) is
                     // treated as "no photo" - see the field's own doc.
-                    val linkedMoment = milestone.linkedMomentSyncId?.let { syncId -> moments.firstOrNull { it.syncId == syncId } }
+                    //
+                    // User-requested auto-sync: when there's no EXPLICIT link, fall back to the same
+                    // date-matched gallery MilestoneRetrospective already shows (matchingMomentsByYear) -
+                    // most-recent year, most-recently-taken photo that day. This is a pure display-time
+                    // fallback (never writes linkedMomentSyncId), so an explicit user choice can never be
+                    // silently overridden by construction - there's simply nothing to override, this only
+                    // ever fills in when the field is genuinely null. Deliberately NOT scoped to only
+                    // exact-dated milestones (milestone.year != null) - a recurring milestone with no
+                    // year still has a real "this specific day" per occurrence, and showing whichever
+                    // year's photo exists is strictly more informative than showing nothing.
+                    val linkedMoment = remember(moments, milestone.linkedMomentSyncId, milestone.month, milestone.day) {
+                        val explicit = milestone.linkedMomentSyncId?.let { syncId -> moments.firstOrNull { it.syncId == syncId } }
+                        explicit ?: if (milestone.linkedMomentSyncId == null) {
+                            matchingMomentsByYear(moments, milestone.month, milestone.day, zone)
+                                .values.firstOrNull()
+                                ?.maxByOrNull { it.takenAt }
+                        } else null
+                    }
                     val hasLinkedPhoto = linkedMoment != null && linkedMoment.photoDownloaded && File(linkedMoment.photoUri).isFile
                     Card(
                         shape = MaterialTheme.shapes.large,
@@ -659,13 +676,7 @@ private fun MilestoneRetrospective(
     // "Throughout the years": every Moment whose takenAt falls on this same month+day, in any year,
     // grouped by year - the whole point being it works even across many years of photos.
     val byYear = remember(moments, milestone.month, milestone.day) {
-        moments
-            .filter {
-                val d = Instant.ofEpochMilli(it.takenAt).atZone(zone).toLocalDate()
-                d.monthValue == milestone.month && d.dayOfMonth == milestone.day
-            }
-            .groupBy { Instant.ofEpochMilli(it.takenAt).atZone(zone).toLocalDate().year }
-            .toSortedMap(compareByDescending { it })
+        matchingMomentsByYear(moments, milestone.month, milestone.day, zone)
     }
 
     Box(
@@ -745,6 +756,21 @@ private fun MilestoneRetrospective(
  * Clamped here too, at the single shared formatter both call sites go through, so a pre-existing bad row
  * displays a nearest-valid label instead of crashing - matching MilestoneAlarmScheduler.safeDate's own
  * defensive clamp for the exact same reason. */
+/** User-requested (milestone photo auto-sync): every Moment whose takenAt falls on the given month+day,
+ * in ANY year, grouped by year and sorted most-recent-year-first - extracted from
+ * [MilestoneRetrospective]'s own "throughout the years" gallery (unchanged behavior there) so the
+ * milestone card below can reuse the EXACT same match logic for its own auto-linked preview, rather than
+ * growing a second, independently-maintained copy that could drift from what the retrospective view
+ * itself considers a match. */
+private fun matchingMomentsByYear(moments: List<Moment>, month: Int, day: Int, zone: ZoneId): Map<Int, List<Moment>> =
+    moments
+        .filter {
+            val d = Instant.ofEpochMilli(it.takenAt).atZone(zone).toLocalDate()
+            d.monthValue == month && d.dayOfMonth == day
+        }
+        .groupBy { Instant.ofEpochMilli(it.takenAt).atZone(zone).toLocalDate().year }
+        .toSortedMap(compareByDescending { it })
+
 private fun monthDayLabel(month: Int, day: Int): String =
     "${Month.of(month.coerceIn(1, 12)).getDisplayName(TextStyle.FULL, Locale.getDefault())} ${day.coerceIn(1, 31)}"
 
