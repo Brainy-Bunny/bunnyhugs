@@ -164,6 +164,11 @@ class SettingsViewModel : ViewModel() {
         viewModelScope.launch { ServiceLocator.settingsStore.setBiometricUnlockEnabled(enabled) }
     }
 
+    /** See AppSettings.screenshotProtectionEnabled's own doc. */
+    fun setScreenshotProtectionEnabled(enabled: Boolean) {
+        viewModelScope.launch { ServiceLocator.settingsStore.setScreenshotProtectionEnabled(enabled) }
+    }
+
     /** Launched on the app-scoped coroutine (same reasoning as backupNow() below - a mid-check screen
      * navigation must not cancel a download that's already in flight) rather than viewModelScope.
      * Bypasses both the auto-check toggle and the throttle window: an explicit tap on "Check for
@@ -505,6 +510,25 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                             onCheckedChange = { vm.setBiometricUnlockEnabled(it) }
                         )
                     }
+                }
+                // User-requested: FLAG_SECURE, applied live by MainActivity off this same setting - see
+                // AppSettings.screenshotProtectionEnabled's own doc for the tradeoff this exists to let
+                // the user choose for themselves (blocks Recents' thumbnail AND screenshots/screen-
+                // recording, for anyone including the phone's own owner - there's no way to allow one but
+                // not the other). Defaults OFF so a fresh install doesn't silently break the user's own
+                // ability to screenshot the app.
+                SettingsRow(
+                    label = "Hide app content from Recents",
+                    subtitle = if (settings.screenshotProtectionEnabled) {
+                        "On — also blocks screenshots/screen-recording of this app, including your own"
+                    } else {
+                        "Off — Recents shows a live preview, and screenshots work normally"
+                    }
+                ) {
+                    Switch(
+                        checked = settings.screenshotProtectionEnabled,
+                        onCheckedChange = { vm.setScreenshotProtectionEnabled(it) }
+                    )
                 }
             }
 

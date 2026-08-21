@@ -73,14 +73,6 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // User-requested privacy fix: without this, Android's Recents/task-switcher shows a live
-        // screenshot-style thumbnail of whatever screen was open when the app was backgrounded - a real
-        // leak past the PIN lock, since Recents is reachable with no PIN prompt at all. FLAG_SECURE
-        // also blocks actual screenshots/screen-recording of this app, which is a reasonable bonus for
-        // an app whose whole purpose is private content between two people, not a stated ask but a
-        // natural extension of the same concern. The Recents entry itself still shows the app's icon
-        // and name (this doesn't hide that the app exists, only its content).
-        window.setFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE, android.view.WindowManager.LayoutParams.FLAG_SECURE)
         RestorePickerHost.launchPicker = { restorePickerLauncher.launch(arrayOf("*/*")) }
 
         if (intent?.getBooleanExtra(Notifications.EXTRA_OPEN_CAMERA, false) == true) {
@@ -98,6 +90,22 @@ class MainActivity : FragmentActivity() {
             var settings by remember { mutableStateOf<AppSettings?>(null) }
             LaunchedEffect(Unit) {
                 ServiceLocator.settingsStore.settings.collect { settings = it }
+            }
+            // User-requested privacy feature, now a Settings toggle (defaults OFF - see
+            // AppSettings.screenshotProtectionEnabled's own doc for why): without it, Android's Recents/
+            // task-switcher shows a live screenshot-style thumbnail of whatever screen was open when the
+            // app was backgrounded - a real leak past the PIN lock, since Recents is reachable with no
+            // PIN prompt at all. FLAG_SECURE also blocks actual screenshots/screen-recording of this app
+            // entirely, for anyone, which is why this must be opt-in rather than always-on: the user
+            // needs their OWN screenshots (e.g. for bug reports) to keep working unless they've
+            // deliberately turned this on. Reads live off the same settings Flow above, so toggling it in
+            // Settings applies immediately without needing to restart the app.
+            LaunchedEffect(settings?.screenshotProtectionEnabled) {
+                if (settings?.screenshotProtectionEnabled == true) {
+                    window.setFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE, android.view.WindowManager.LayoutParams.FLAG_SECURE)
+                } else {
+                    window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+                }
             }
             // While settings hasn't loaded yet (settings == null, a brief one-or-two-frame window on
             // first launch), falls back to isSystemInDarkTheme() - i.e. exactly today's existing

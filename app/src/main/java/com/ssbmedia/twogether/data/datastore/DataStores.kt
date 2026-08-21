@@ -538,7 +538,15 @@ data class AppSettings(
      * THRESHOLD just means both phones agree on which future gaps qualify - it has no bearing on the
      * non-retroactivity guarantee, since a synced threshold change is still only ever applied to each
      * phone's own subsequent apart->together transitions, never rescanned into either phone's past. */
-    val reunionThresholdMinutesUpdatedAt: Long = 0L
+    val reunionThresholdMinutesUpdatedAt: Long = 0L,
+    /** User-requested: whether MainActivity applies FLAG_SECURE (blocks this app's content from
+     * Recents' task-switcher thumbnail, and from screenshots/screen-recording entirely - by anyone,
+     * not just other apps, there's no OS-level "block others but allow the owner" mode). Defaults OFF,
+     * not on: the user hit this exact tradeoff directly - they'd been sending screenshots for bug
+     * reports throughout live-testing, and an always-on FLAG_SECURE would have silently broken that
+     * for themselves too. Deliberately per-device (like [themeMode]/[quickLinksOrder]), not synced -
+     * each phone's owner decides for themselves whether their own screen needs this protection. */
+    val screenshotProtectionEnabled: Boolean = false
 )
 
 class SettingsStore(private val context: Context) {
@@ -567,6 +575,7 @@ class SettingsStore(private val context: Context) {
         val REUNION_THRESHOLD_MINUTES = intPreferencesKey("reunion_threshold_minutes")
         val SESSION_GRACE_MINUTES_UPDATED_AT = longPreferencesKey("session_grace_minutes_updated_at")
         val REUNION_THRESHOLD_MINUTES_UPDATED_AT = longPreferencesKey("reunion_threshold_minutes_updated_at")
+        val SCREENSHOT_PROTECTION_ENABLED = booleanPreferencesKey("screenshot_protection_enabled")
     }
 
     val settings: Flow<AppSettings> = context.settingsDs.data.map { p -> fromPreferences(p) }
@@ -605,7 +614,8 @@ class SettingsStore(private val context: Context) {
             sessionGraceMinutes = p[Keys.SESSION_GRACE_MINUTES] ?: 10,
             sessionGraceMinutesUpdatedAt = p[Keys.SESSION_GRACE_MINUTES_UPDATED_AT] ?: 0L,
             reunionThresholdMinutes = p[Keys.REUNION_THRESHOLD_MINUTES] ?: 60,
-            reunionThresholdMinutesUpdatedAt = p[Keys.REUNION_THRESHOLD_MINUTES_UPDATED_AT] ?: 0L
+            reunionThresholdMinutesUpdatedAt = p[Keys.REUNION_THRESHOLD_MINUTES_UPDATED_AT] ?: 0L,
+            screenshotProtectionEnabled = p[Keys.SCREENSHOT_PROTECTION_ENABLED] ?: false
         )
     }
 
@@ -755,6 +765,11 @@ class SettingsStore(private val context: Context) {
      * check - it trusts the caller the same way setDefaultSnoozeMinutes/setPhotoReminderMinutes do. */
     suspend fun setBiometricUnlockEnabled(enabled: Boolean) {
         context.settingsDs.edit { it[Keys.BIOMETRIC_UNLOCK_ENABLED] = enabled }
+    }
+
+    /** See [AppSettings.screenshotProtectionEnabled]'s own doc. */
+    suspend fun setScreenshotProtectionEnabled(enabled: Boolean) {
+        context.settingsDs.edit { it[Keys.SCREENSHOT_PROTECTION_ENABLED] = enabled }
     }
 
     suspend fun setLastSyncAt(time: Long) {
