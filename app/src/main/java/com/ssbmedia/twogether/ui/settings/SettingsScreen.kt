@@ -1141,7 +1141,8 @@ private fun ReunionThresholdDialog(current: Int, onDismiss: () -> Unit, onSave: 
  * here would silently shift every day boundary. */
 @Composable
 private fun DayStartDialog(current: Int, onDismiss: () -> Unit, onSave: (Int) -> Unit) {
-    var selected by remember { mutableStateOf(current) }
+    // Keyed on current: the saved value can arrive after the dialog opens, so the radio must follow it.
+    var selected by remember(current) { mutableStateOf(current) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Day starts at") },

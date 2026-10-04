@@ -172,6 +172,9 @@ fun MilestonesScreen(
     val milestones by vm.milestones.collectAsState()
     val availableMoments by vm.availableMoments.collectAsState()
     val moments by vm.moments.collectAsState()
+    // Day-based grouping follows the user's day start (AppSettings.dayStartHour), same as Moments/Calendar.
+    val settings by ServiceLocator.settingsStore.settings.collectAsState(initial = com.ssbmedia.twogether.data.datastore.AppSettings())
+    val dayStartHour = settings.dayStartHour
     val context = LocalContext.current
     val zone = remember { ZoneId.systemDefault() }
 
@@ -273,10 +276,10 @@ fun MilestonesScreen(
                     // photo" - so it now filters to locally-displayable candidates within each year
                     // first, and falls through to an EARLIER year if the newest year's photos aren't
                     // downloaded yet, rather than giving up after the single newest candidate.
-                    val linkedMoment = remember(moments, milestone.linkedMomentSyncId, milestone.month, milestone.day) {
+                    val linkedMoment = remember(moments, milestone.linkedMomentSyncId, milestone.month, milestone.day, dayStartHour) {
                         val explicit = milestone.linkedMomentSyncId?.let { syncId -> moments.firstOrNull { it.syncId == syncId } }
                         explicit ?: if (milestone.linkedMomentSyncId == null) {
-                            matchingMomentsByYear(moments, milestone.month, milestone.day, zone)
+                            matchingMomentsByYear(moments, milestone.month, milestone.day, zone, dayStartHour)
                                 .values.asSequence()
                                 .mapNotNull { yearMoments ->
                                     yearMoments.filter { it.photoDownloaded && File(it.photoUri).isFile }.maxByOrNull { it.takenAt }
@@ -717,8 +720,10 @@ private fun MilestoneRetrospective(
 ) {
     // "Throughout the years": every Moment whose takenAt falls on this same month+day, in any year,
     // grouped by year - the whole point being it works even across many years of photos.
-    val byYear = remember(moments, milestone.month, milestone.day) {
-        matchingMomentsByYear(moments, milestone.month, milestone.day, zone)
+    val settings by ServiceLocator.settingsStore.settings.collectAsState(initial = com.ssbmedia.twogether.data.datastore.AppSettings())
+    val dayStartHour = settings.dayStartHour
+    val byYear = remember(moments, milestone.month, milestone.day, dayStartHour) {
+        matchingMomentsByYear(moments, milestone.month, milestone.day, zone, dayStartHour)
     }
 
     Box(
@@ -807,13 +812,11 @@ private fun MilestoneRetrospective(
  * milestone card below can reuse the EXACT same match logic for its own auto-linked preview, rather than
  * growing a second, independently-maintained copy that could drift from what the retrospective view
  * itself considers a match. */
-private fun matchingMomentsByYear(moments: List<Moment>, month: Int, day: Int, zone: ZoneId): Map<Int, List<Moment>> =
+private fun matchingMomentsByYear(moments: List<Moment>, month: Int, day: Int, zone: ZoneId, dayStartHour: Int): Map<Int, List<Moment>> =
     moments
-        .filter {
-            val d = Instant.ofEpochMilli(it.takenAt).atZone(zone).toLocalDate()
-            d.monthValue == month && d.dayOfMonth == day
-        }
-        .groupBy { Instant.ofEpochMilli(it.takenAt).atZone(zone).toLocalDate().year }
+        .map { it to com.ssbmedia.twogether.stats.StatsCalculator.logicalDayOf(it.takenAt, zone, dayStartHour) }
+        .filter { (_, d) -> d.monthValue == month && d.dayOfMonth == day }
+        .groupBy({ (_, d) -> d.year }, { (moment, _) -> moment })
         .toSortedMap(compareByDescending { it })
 
 /** BLOCKER fix, defense-in-depth: month/day here come straight from a stored [Milestone] row - as of

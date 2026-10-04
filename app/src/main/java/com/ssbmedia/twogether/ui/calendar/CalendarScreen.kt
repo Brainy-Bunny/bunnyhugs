@@ -171,9 +171,9 @@ fun CalendarScreen(
     val milestones by vm.milestones.collectAsState()
     val proximityState by vm.proximityState.collectAsState()
     // User-configurable day start (AppSettings.dayStartHour). The grid's day-together dots, the "today"
-    // highlight, and each day's session detail all use the same logical-day boundary, so a 1 AM session
-    // lands on the same cell and detail list the stats count it toward. Moments and day notes are still
-    // keyed by calendar date (see daysWithPhotos below).
+    // highlight, each day's session detail, the photo dots and manual-entry dots all use the same
+    // logical-day boundary, so a 1 AM session or photo lands on the same cell the stats count it toward.
+    // Day notes are keyed by a plain epoch day that the user picked on the grid, so they stay as-is.
     val settings by ServiceLocator.settingsStore.settings.collectAsState(initial = AppSettings())
     val dayStartHour = settings.dayStartHour
     val zone = remember { ZoneId.systemDefault() }
@@ -190,7 +190,9 @@ fun CalendarScreen(
     // The highlight range takes priority over a plain jump-to-date when both would apply (they never
     // do in practice from how Stats wires these, but this keeps the initial month deterministic either
     // way): jump to whichever one was actually requested.
-    var yearMonth by remember { mutableStateOf(YearMonth.from(highlightRange?.first ?: jumpToDate ?: LocalDate.now(zone))) }
+    // Keyed on dayStartHour: settings load asynchronously (first composition sees AppSettings() default),
+    // so the initial month must be recomputed once the user's saved day start arrives.
+    var yearMonth by remember(dayStartHour) { mutableStateOf(YearMonth.from(highlightRange?.first ?: jumpToDate ?: StatsCalculator.logicalDayOf(System.currentTimeMillis(), zone, dayStartHour))) }
     var selectedDay by remember { mutableStateOf(jumpToDate) }
     var showAddDialog by remember { mutableStateOf(false) }
     // Only ever set for an isManual session (see the delete IconButton below, which is only rendered
@@ -310,8 +312,8 @@ fun CalendarScreen(
                 // once you've paged away from it - only shown when actually needed (see
                 // shouldShowBackToTodayButton's own doc), so it doesn't clutter the header on the common
                 // case of just viewing the current month.
-                if (shouldShowBackToTodayButton(yearMonth, YearMonth.now(zone))) {
-                    TextButton(onClick = { yearMonth = YearMonth.now(zone) }) { Text("Today") }
+                if (shouldShowBackToTodayButton(yearMonth, YearMonth.from(logicalToday))) {
+                    TextButton(onClick = { yearMonth = YearMonth.from(logicalToday) }) { Text("Today") }
                 }
                 IconButton(onClick = { yearMonth = yearMonth.plusMonths(1) }) {
                     Icon(Icons.Filled.ChevronRight, contentDescription = "Next month")
@@ -497,6 +499,7 @@ fun CalendarScreen(
     if (showAddDialog) {
         AddManualSessionDialog(
             zone = zone,
+            dayStartHour = dayStartHour,
             existing = null,
             onDismiss = { showAddDialog = false },
             onSave = { startedAt, endedAt ->
@@ -512,6 +515,7 @@ fun CalendarScreen(
     sessionPendingEdit?.let { session ->
         AddManualSessionDialog(
             zone = zone,
+            dayStartHour = dayStartHour,
             existing = session,
             onDismiss = { sessionPendingEdit = null },
             onSave = { startedAt, endedAt ->
@@ -916,11 +920,17 @@ private fun sessionsOverlapping(
 @Composable
 private fun AddManualSessionDialog(
     zone: ZoneId,
+    dayStartHour: Int,
     existing: TogetherSession? = null,
     onDismiss: () -> Unit,
     onSave: (startedAt: Long, endedAt: Long) -> Unit
 ) {
-    val today = remember { LocalDate.now(zone) }
+    // Pre-selected date follows the logical day, so at 1 AM the default is still the day the couple is in.
+    // The pre-selected date is the logical day (before the day start it is still yesterday's day), but the
+    // future rule and the picker's max use the real calendar date: a session earlier today (after midnight,
+    // before the day start) is entirely in the past and must stay selectable.
+    val today = remember(dayStartHour) { StatsCalculator.logicalDayOf(System.currentTimeMillis(), zone, dayStartHour) }
+    val calendarToday = remember { LocalDate.now(zone) }
     val existingStart = remember(existing) { existing?.let { Instant.ofEpochMilli(it.startedAt).atZone(zone) } }
     val existingEnd = remember(existing) { existing?.endedAt?.let { Instant.ofEpochMilli(it).atZone(zone) } }
 
@@ -944,10 +954,12 @@ private fun AddManualSessionDialog(
     // For a same-day (today) entry, an end time later than the actual current wall-clock time must be
     // rejected rather than silently clipped - same reasoning as this dialog always had, just re-expressed
     // against a real end TIME instead of a duration-from-midnight.
-    val nowTimeToday = remember(date, today) { if (date == today) LocalTime.now(zone) else null }
+    // Wall-clock cap applies only to the calendar date it actually is now. The logical "today" (before the day
+    // start) can be yesterday's calendar date, whose evening times are all in the past and must not be capped.
+    val nowTimeToday = remember(date) { if (date == LocalDate.now(zone)) LocalTime.now(zone) else null }
 
     val error: String? = when {
-        date.isAfter(today) -> "Date can't be in the future"
+        date.isAfter(calendarToday) -> "Date can't be in the future"
         date.isBefore(minPlausibleDate) -> "Date can't be before ${DateFormats.formatDateLong(minPlausibleDate)}"
         !endTime.isAfter(startTime) -> "End time must be after start time"
         nowTimeToday != null && endTime.isAfter(nowTimeToday) -> "End time can't be later than the current time"
@@ -969,7 +981,7 @@ private fun AddManualSessionDialog(
                     date = date,
                     onDateChange = { date = it },
                     minDate = minPlausibleDate,
-                    maxDate = today,
+                    maxDate = calendarToday,
                     modifier = Modifier.fillMaxWidth()
                 )
                 Row(modifier = Modifier.fillMaxWidth().padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {

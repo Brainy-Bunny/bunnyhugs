@@ -552,7 +552,7 @@ data class AppSettings(
      * 4 AM, not midnight, so a date night that runs past 12 AM stays ONE day instead of being split into
      * two. Deliberately per-device, like [screenshotProtectionEnabled]: it changes only how THIS phone
      * buckets the synced session history into days, never the history itself, so no sync protocol change
-     * is needed. Calendar and Moments grids still use the calendar date. */
+     * is needed. Stats, streaks, Calendar, Moments and Home memories all bucket by this same logical day. */
     val dayStartHour: Int = DEFAULT_DAY_START_HOUR
 ) {
     companion object {

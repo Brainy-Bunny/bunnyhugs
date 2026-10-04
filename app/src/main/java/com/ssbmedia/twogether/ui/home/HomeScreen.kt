@@ -258,6 +258,9 @@ class HomeViewModel : ViewModel() {
     // built for so a day rollover forces a real recompute, same as OnThisDayCard's own now-keyed refresh
     // just below it on this same screen already does.
     val memoryMomentsDate: MutableStateFlow<LocalDate?> = MutableStateFlow(null)
+    // The day-start hour the current pick was made with. A pick made before the saved hour loaded (the default
+    // 4 AM) must be redone once the real hour arrives, or an anniversary match near the day boundary is lost all day.
+    val memoryMomentsDayStartHour: MutableStateFlow<Int?> = MutableStateFlow(null)
 
     /** Only ever picks from moments this device actually HOLDS the photo bytes for - a remote-stub
      * moment (partner's photo metadata synced, but the bytes haven't transferred yet - see
@@ -281,7 +284,7 @@ class HomeViewModel : ViewModel() {
         val zone = ZoneId.systemDefault()
         // "Today" and the anniversary match use the logical day (AppSettings.dayStartHour), not the calendar date.
         val today = StatsCalculator.logicalDayOf(now, zone, dayStartHour)
-        if (memoryMoments.value.isNotEmpty() && memoryMomentsDate.value == today) return
+        if (memoryMoments.value.isNotEmpty() && memoryMomentsDate.value == today && memoryMomentsDayStartHour.value == dayStartHour) return
         // MINOR fix: File.isFile is blocking disk I/O, and this used to run directly on whatever
         // dispatcher the caller's LaunchedEffect is on (Main) - moved off Main here so a large moment
         // list (or repeated re-runs while nothing is downloaded yet, e.g. right after a restore) can't
@@ -300,6 +303,7 @@ class HomeViewModel : ViewModel() {
             memoryMomentsIsAnniversary.value = false
         }
         memoryMomentsDate.value = today
+        memoryMomentsDayStartHour.value = dayStartHour
     }
 
     companion object {
@@ -451,7 +455,14 @@ fun HomeScreen(
         // Only a reunion the couple is STILL in. A celebration left pending from a reunion the app never
         // displayed (the app wasn't open while they were together) must not fire as "Together again!" on a
         // later open taken while apart - handleBecameApart also clears it, this is the display-side guard.
-        if (persisted.pendingReunionCelebration && persisted.isTogether) {
+        // Uses the same staleness rule as effectivelyTogether below: a raw 'together' flag left behind by a
+        // process that was killed while together (no service left to clear it) does not count.
+        val elapsedSinceLastSeen = android.os.SystemClock.elapsedRealtime() - persisted.lastSeenElapsedRealtime
+        val stillTogether = persisted.isTogether && !(
+            persisted.lastSeenElapsedRealtime != 0L &&
+                (elapsedSinceLastSeen < 0L || elapsedSinceLastSeen >= ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS)
+            )
+        if (persisted.pendingReunionCelebration && stillTogether) {
             showReunion = true
         }
         if (persisted.pendingReunionCelebration) {
@@ -608,6 +619,12 @@ fun HomeScreen(
             proximityState.lastSeenElapsedRealtime != 0L &&
                 (elapsedSinceLastSeen < 0L || elapsedSinceLastSeen >= ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS)
             )
+    }
+
+    // Clear the in-memory celebration as soon as the couple is apart, so a reunion flag left over from an earlier
+    // meeting can never replay "Together again!" on a later, unrelated together-stretch.
+    LaunchedEffect(effectivelyTogether) {
+        if (!effectivelyTogether) showReunion = false
     }
 
     // Item 14 (update-nag reach fix): extracted to a val so both the "Update ready" banner below AND
@@ -866,19 +883,19 @@ fun HomeScreen(
                         isAnniversary = memoryMomentsIsAnniversary,
                         milestones = milestones,
                         now = now,
+                        dayStartHour = dayStartHour,
                         onOpenMoments = onOpenMoments
                     )
                 }
             }
             if (onThisDayInfo != null) {
                 item {
-                    // "On this day in {info.year}" always shares today's real month/day (see
-                    // StatsCalculator.onThisDayPreviousYear's own doc - it only ever matches entries whose
-                    // month/day equal TODAY's), so LocalDate.of(info.year, today.month, today.day) can
-                    // never throw even for a Feb 29 "today": that combination could only exist in the
-                    // qualifying-days map above in the first place if info.year genuinely supports it too.
-                    val onThisDayEpochDay = remember(onThisDayInfo, now) {
-                        val today = Instant.ofEpochMilli(now).atZone(ZoneId.systemDefault()).toLocalDate()
+                    // "On this day in {info.year}" matches the LOGICAL day's month/day (see
+                    // StatsCalculator.onThisDayPreviousYear's own doc), so build the target from that same
+                    // logical day. Using the calendar date here could ask for Feb 29 in a non-leap year
+                    // when it is 1 AM on Feb 29 and the logical day is still Feb 28.
+                    val onThisDayEpochDay = remember(onThisDayInfo, now, dayStartHour) {
+                        val today = StatsCalculator.logicalDayOf(now, ZoneId.systemDefault(), dayStartHour)
                         LocalDate.of(onThisDayInfo.year, today.monthValue, today.dayOfMonth).toEpochDay()
                     }
                     OnThisDayCard(info = onThisDayInfo, onClick = { onOpenCalendar(onThisDayEpochDay) })
@@ -925,7 +942,9 @@ fun HomeScreen(
         }
     }
 
-        if (showReunion) {
+        // Gated on the live together state too: showReunion can be set in memory by a reunion event while the
+        // app was stopped, and must never play "Together again!" once the couple is apart again.
+        if (showReunion && effectivelyTogether) {
             ReunionOverlay(onDismiss = { showReunion = false })
         }
     }
@@ -1512,6 +1531,7 @@ private fun MemoryThrowbackCard(
     isAnniversary: Boolean,
     milestones: List<Milestone>,
     now: Long,
+    dayStartHour: Int = 0,
     onOpenMoments: (jumpToEpochDay: Long) -> Unit = {}
 ) {
     // User-requested slideshow: a single-element list renders exactly like the old one-photo card
@@ -1530,8 +1550,9 @@ private fun MemoryThrowbackCard(
                 // the closest this app can get to "open the exact Moment" without a dedicated
                 // single-photo deep link, consistent with Calendar's own day -> Moments link. Recomputed
                 // per page (not hoisted once outside the pager) since each page is a different photo/day.
-                val momentEpochDay = remember(moment) {
-                    Instant.ofEpochMilli(moment.takenAt).atZone(ZoneId.systemDefault()).toLocalDate().toEpochDay()
+                // Same logical day Moments groups its headers by (AppSettings.dayStartHour), so the jump lands.
+                val momentEpochDay = remember(moment, dayStartHour) {
+                    StatsCalculator.logicalDayOf(moment.takenAt, ZoneId.systemDefault(), dayStartHour).toEpochDay()
                 }
                 val milestoneLabel = remember(moment, milestones) {
                     milestones.firstOrNull { it.linkedMomentSyncId == moment.syncId }?.label

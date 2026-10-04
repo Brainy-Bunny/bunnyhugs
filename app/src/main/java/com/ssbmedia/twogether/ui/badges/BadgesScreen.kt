@@ -97,8 +97,10 @@ fun BadgesScreen(
     // lastSeenAt clamps an open session's live duration so badge progress can't be inflated by a
     // stale/orphaned open session - see StatsCalculator.effectiveOpenSessionEnd's doc.
     // Day-based badges (streaks, days together) bucket by the user's day start - see AppSettings.dayStartHour.
-    val settings by ServiceLocator.settingsStore.settings.collectAsState(initial = AppSettings())
-    val dayStartHour = settings.dayStartHour
+    // Nullable until DataStore emits: the default (4 AM) must never be used to RECORD an unlock, because
+    // recordUnlockIfNeeded is first-write-wins and a wrong-day pass would persist a permanently wrong date.
+    val loadedSettings by ServiceLocator.settingsStore.settings.collectAsState(initial = null)
+    val dayStartHour = (loadedSettings ?: AppSettings()).dayStartHour
     val stats = remember(sessions, proximityState.lastSeenAt, proximityState.reunionCount, dayStartHour) {
         StatsCalculator.compute(
             sessions, lastSeenAt = proximityState.lastSeenAt, reunionCount = proximityState.reunionCount, dayStartHour = dayStartHour
@@ -118,7 +120,9 @@ fun BadgesScreen(
     // still powers StatsScreen's own separate "Longest streak" card, which still means the true
     // consecutive-streak concept).
 
-    LaunchedEffect(statuses) {
+    LaunchedEffect(statuses, loadedSettings) {
+        // Wait for the saved day start (see loadedSettings above) before writing any unlock timestamp.
+        if (loadedSettings == null) return@LaunchedEffect
         vm.recordNewlyUnlocked(statuses.filter { it.unlocked }.map { it.badge.id })
     }
 
@@ -180,11 +184,11 @@ fun BadgesScreen(
                         val cardModifier = Modifier.weight(1f).fillMaxHeight()
                         if (onClick != null) {
                             Card(modifier = cardModifier, shape = MaterialTheme.shapes.large, colors = cardColors, onClick = onClick) {
-                                BadgeCardContent(status, unlockDates)
+                                BadgeCardContent(status, unlockDates, dayStartHour)
                             }
                         } else {
                             Card(modifier = cardModifier, shape = MaterialTheme.shapes.large, colors = cardColors) {
-                                BadgeCardContent(status, unlockDates)
+                                BadgeCardContent(status, unlockDates, dayStartHour)
                             }
                         }
                     }
@@ -204,7 +208,7 @@ fun BadgesScreen(
  * in [BadgesScreen] above (Material3 gives them structurally different signatures, so the same Card
  * instance can't conditionally take an onClick) render identically. */
 @Composable
-private fun BadgeCardContent(status: BadgeStatus, unlockDates: Map<String, Long>) {
+private fun BadgeCardContent(status: BadgeStatus, unlockDates: Map<String, Long>, dayStartHour: Int) {
     // BUG fix (user-reported), take 3: the previous fix aligned the progress line's OWN position
     // consistently regardless of title length (Box.heightIn below), but left this Column - which had
     // no fillMaxHeight/fillMaxWidth, so it just wrapped its own content size - anchored to the TOP-START
@@ -276,8 +280,10 @@ private fun BadgeCardContent(status: BadgeStatus, unlockDates: Map<String, Long>
         if (status.unlocked) {
             val unlockedAt = unlockDates[status.badge.id]
             if (unlockedAt != null) {
-                val unlockedDate = remember(unlockedAt) {
-                    Instant.ofEpochMilli(unlockedAt).atZone(ZoneId.systemDefault()).toLocalDate()
+                // Same logical day as the streak it was earned on (AppSettings.dayStartHour), so a 1 AM unlock
+                // reads as the day the couple was still together, not the next calendar date.
+                val unlockedDate = remember(unlockedAt, dayStartHour) {
+                    StatsCalculator.logicalDayOf(unlockedAt, ZoneId.systemDefault(), dayStartHour)
                 }
                 Text(
                     text = "on ${DateFormats.formatDateLong(unlockedDate)}",

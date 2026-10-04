@@ -242,7 +242,15 @@ class ProximityForegroundService : LifecycleService() {
                 now
             }
             ServiceLocator.proximityStateStore.update {
-                it.copy(isTogether = false, continuousTogetherSince = 0L, currentSessionId = -1L, lastApartSince = estimatedApartSince)
+                // A stale recovery means the reunion this flag belonged to ended unseen - clear it so a later
+                // unrelated meeting cannot inherit the celebration (same as handleBecameApart).
+                it.copy(
+                    isTogether = false,
+                    continuousTogetherSince = 0L,
+                    currentSessionId = -1L,
+                    lastApartSince = estimatedApartSince,
+                    pendingReunionCelebration = false
+                )
             }
         }
 
@@ -439,12 +447,16 @@ class ProximityForegroundService : LifecycleService() {
             // reunionCount is the persisted, live-incrementing counter (see ProximityPersistedState.
             // reunionCount's own doc) - passed straight through, never recomputed here.
             val proximityStateForStats = ServiceLocator.proximityStateStore.current()
+            // Same day start as the Stats/Badges screens (AppSettings.dayStartHour), so a badge unlock recorded
+            // here is the same one the Badges screen would show - first-write-wins makes a mismatch permanent.
+            val dayStartHour = ServiceLocator.settingsStore.current().dayStartHour
             val stats = StatsCalculator.compute(
                 sessions,
                 now = now,
                 lastSeenAt = stateMachine.lastSeenAt,
                 absenceTimeoutMillis = stateMachine.absenceTimeoutMillis,
-                reunionCount = proximityStateForStats.reunionCount
+                reunionCount = proximityStateForStats.reunionCount,
+                dayStartHour = dayStartHour
             )
             val manualCredit = StatsCalculator.manualHoursCredit(
                 sessions,

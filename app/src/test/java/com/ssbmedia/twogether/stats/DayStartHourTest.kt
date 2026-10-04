@@ -93,4 +93,37 @@ class DayStartHourTest {
         assertEquals(t(2026, 10, 3, 4, 0), today.firstStartMillis)
         assertEquals(t(2026, 10, 3, 5, 0), today.lastEndMillis)
     }
+
+    @Test
+    fun logicalDay_exactlyAtDayStart_belongsToTheNewDay() {
+        assertEquals(LocalDate.of(2026, 10, 4), StatsCalculator.logicalDayOf(t(2026, 10, 4, 4, 0), ist, 4))
+    }
+
+    @Test
+    fun logicalDay_startAt23_nightBeforeMidnightStillBelongsToPreviousDay() {
+        // With a 11 PM start, 10:30 PM on Oct 3 is still the day that began Oct 2 at 11 PM.
+        assertEquals(LocalDate.of(2026, 10, 2), StatsCalculator.logicalDayOf(t(2026, 10, 3, 22, 30), ist, 23))
+    }
+
+    @Test
+    fun sessionSpanningThreeLogicalDays_splitsAtEachDayStart() {
+        // Oct 2 10:00 AM to Oct 4 10:00 AM with a 4 AM day start:
+        // Oct 2 gets 10:00 AM -> Oct 3 4:00 AM = 18h, Oct 3 gets a full 24h, Oct 4 gets 4:00 AM -> 10:00 AM = 6h.
+        val s = session(t(2026, 10, 2, 10, 0), t(2026, 10, 4, 10, 0))
+        val map = StatsCalculator.buildDailyMinuteMap(listOf(s), zone = ist, dayStartHour = 4)
+        assertEquals(1080L, map[LocalDate.of(2026, 10, 2)])
+        assertEquals(1440L, map[LocalDate.of(2026, 10, 3)])
+        assertEquals(360L, map[LocalDate.of(2026, 10, 4)])
+    }
+
+    @Test
+    fun togetherToday_twoSessionsSameDay_sumsAndSpansFirstStartToLastEnd() {
+        val a = session(t(2026, 10, 3, 9, 0), t(2026, 10, 3, 10, 0))
+        val b = session(t(2026, 10, 3, 14, 0), t(2026, 10, 3, 15, 30))
+        val today = StatsCalculator.togetherToday(listOf(a, b), now = t(2026, 10, 3, 16, 0), zone = ist, dayStartHour = 4)
+        assertNotNull(today)
+        assertEquals(150L * 60_000L, today!!.totalMillis)
+        assertEquals(t(2026, 10, 3, 9, 0), today.firstStartMillis)
+        assertEquals(t(2026, 10, 3, 15, 30), today.lastEndMillis)
+    }
 }
