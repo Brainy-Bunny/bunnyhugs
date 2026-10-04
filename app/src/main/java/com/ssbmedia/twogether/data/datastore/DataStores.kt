@@ -546,8 +546,19 @@ data class AppSettings(
      * reports throughout live-testing, and an always-on FLAG_SECURE would have silently broken that
      * for themselves too. Deliberately per-device (like [themeMode]/[quickLinksOrder]), not synced -
      * each phone's owner decides for themselves whether their own screen needs this protection. */
-    val screenshotProtectionEnabled: Boolean = false
-)
+    val screenshotProtectionEnabled: Boolean = false,
+    /** User-requested: the local hour (0-23) a new "day" starts for every day-based stat (days together,
+     * streaks, weekly/monthly breakdowns, the Home "Together today" line, favorite day, gaps). Defaults to
+     * 4 AM, not midnight, so a date night that runs past 12 AM stays ONE day instead of being split into
+     * two. Deliberately per-device, like [screenshotProtectionEnabled]: it changes only how THIS phone
+     * buckets the synced session history into days, never the history itself, so no sync protocol change
+     * is needed. Calendar and Moments grids still use the calendar date. */
+    val dayStartHour: Int = DEFAULT_DAY_START_HOUR
+) {
+    companion object {
+        const val DEFAULT_DAY_START_HOUR = 4
+    }
+}
 
 class SettingsStore(private val context: Context) {
     private object Keys {
@@ -576,6 +587,7 @@ class SettingsStore(private val context: Context) {
         val SESSION_GRACE_MINUTES_UPDATED_AT = longPreferencesKey("session_grace_minutes_updated_at")
         val REUNION_THRESHOLD_MINUTES_UPDATED_AT = longPreferencesKey("reunion_threshold_minutes_updated_at")
         val SCREENSHOT_PROTECTION_ENABLED = booleanPreferencesKey("screenshot_protection_enabled")
+        val DAY_START_HOUR = intPreferencesKey("day_start_hour")
     }
 
     val settings: Flow<AppSettings> = context.settingsDs.data.map { p -> fromPreferences(p) }
@@ -615,7 +627,10 @@ class SettingsStore(private val context: Context) {
             sessionGraceMinutesUpdatedAt = p[Keys.SESSION_GRACE_MINUTES_UPDATED_AT] ?: 0L,
             reunionThresholdMinutes = p[Keys.REUNION_THRESHOLD_MINUTES] ?: 60,
             reunionThresholdMinutesUpdatedAt = p[Keys.REUNION_THRESHOLD_MINUTES_UPDATED_AT] ?: 0L,
-            screenshotProtectionEnabled = p[Keys.SCREENSHOT_PROTECTION_ENABLED] ?: false
+            screenshotProtectionEnabled = p[Keys.SCREENSHOT_PROTECTION_ENABLED] ?: false,
+            // Defensive clamp: a hand-edited or future-build value outside 0..23 must never produce an
+            // invalid LocalDateTime hour downstream (StatsCalculator.logicalDayStartMillis).
+            dayStartHour = (p[Keys.DAY_START_HOUR] ?: AppSettings.DEFAULT_DAY_START_HOUR).coerceIn(0, 23)
         )
     }
 
@@ -720,6 +735,12 @@ class SettingsStore(private val context: Context) {
             it[Keys.REUNION_THRESHOLD_MINUTES] = minutes
             it[Keys.REUNION_THRESHOLD_MINUTES_UPDATED_AT] = System.currentTimeMillis()
         }
+    }
+
+    /** Persists the local hour (0-23) a new day starts at - see [AppSettings.dayStartHour]. Local-only, so
+     * there is no matching couple-level sync setter. Clamped here as well as on read. */
+    suspend fun setDayStartHour(hour: Int) {
+        context.settingsDs.edit { it[Keys.DAY_START_HOUR] = hour.coerceIn(0, 23) }
     }
 
     /** Couple-level settings sync: same role as [applySyncedSessionGraceMinutes] above, for

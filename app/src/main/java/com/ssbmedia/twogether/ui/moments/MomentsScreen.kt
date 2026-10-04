@@ -152,8 +152,11 @@ fun MomentsScreen(
     var photoRotateTick by remember { mutableIntStateOf(0) }
 
     val zone = remember { ZoneId.systemDefault() }
-    val grouped = remember(moments) {
-        moments.groupBy { Instant.ofEpochMilli(it.takenAt).atZone(zone).toLocalDate() }
+    // Day headers group by the user's day start (AppSettings.dayStartHour), so a 1 AM photo sits under the previous day.
+    val settings by ServiceLocator.settingsStore.settings.collectAsState(initial = com.ssbmedia.twogether.data.datastore.AppSettings())
+    val dayStartHour = settings.dayStartHour
+    val grouped = remember(moments, dayStartHour) {
+        moments.groupBy { com.ssbmedia.twogether.stats.StatsCalculator.logicalDayOf(it.takenAt, zone, dayStartHour) }
     }
     val listState = androidx.compose.foundation.lazy.rememberLazyListState()
     val jumpToDate = remember(jumpToEpochDay) { jumpToEpochDay?.let { LocalDate.ofEpochDay(it) } }

@@ -36,6 +36,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
+import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.stats.GapInfo
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.EmptyState
@@ -66,10 +67,13 @@ fun GapsDetailScreen(onBack: () -> Unit) {
     val vm: GapsDetailViewModel = viewModel(factory = SimpleViewModelFactory { GapsDetailViewModel() })
     val sessions by vm.sessions.collectAsState()
     val proximityState by vm.proximityState.collectAsState()
+    val settings by ServiceLocator.settingsStore.settings.collectAsState(initial = AppSettings())
     val zone = remember { ZoneId.systemDefault() }
 
-    val gaps = remember(sessions, proximityState.lastSeenAt) {
-        StatsCalculator.computeMeetupGaps(sessions, zone = zone, lastSeenAt = proximityState.lastSeenAt)
+    val gaps = remember(sessions, proximityState.lastSeenAt, settings.dayStartHour) {
+        StatsCalculator.computeMeetupGaps(
+            sessions, zone = zone, lastSeenAt = proximityState.lastSeenAt, dayStartHour = settings.dayStartHour
+        )
             .sortedByDescending { it.days }
     }
     val avgDays = remember(gaps) { if (gaps.isNotEmpty()) gaps.map { it.days }.average() else null }

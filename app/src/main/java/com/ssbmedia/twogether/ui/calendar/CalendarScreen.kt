@@ -57,6 +57,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.events.AppEvents
+import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.data.db.DayNote
 import com.ssbmedia.twogether.data.db.Milestone
 import com.ssbmedia.twogether.data.db.TogetherSession
@@ -169,6 +170,12 @@ fun CalendarScreen(
     val dayNotes by vm.dayNotes.collectAsState()
     val milestones by vm.milestones.collectAsState()
     val proximityState by vm.proximityState.collectAsState()
+    // User-configurable day start (AppSettings.dayStartHour). The grid's day-together dots, the "today"
+    // highlight, and each day's session detail all use the same logical-day boundary, so a 1 AM session
+    // lands on the same cell and detail list the stats count it toward. Moments and day notes are still
+    // keyed by calendar date (see daysWithPhotos below).
+    val settings by ServiceLocator.settingsStore.settings.collectAsState(initial = AppSettings())
+    val dayStartHour = settings.dayStartHour
     val zone = remember { ZoneId.systemDefault() }
 
     val jumpToDate = remember(jumpToEpochDay) { jumpToEpochDay?.let { LocalDate.ofEpochDay(it) } }
@@ -195,14 +202,16 @@ fun CalendarScreen(
 
     // lastSeenAt clamps an open session's live duration so a stale/orphaned open session can't inflate
     // day totals - see StatsCalculator.effectiveOpenSessionEnd's doc.
-    val minutesPerDay = remember(sessions, proximityState.lastSeenAt) {
-        StatsCalculator.buildDailyMinuteMap(sessions, zone = zone, lastSeenAt = proximityState.lastSeenAt)
+    val minutesPerDay = remember(sessions, proximityState.lastSeenAt, dayStartHour) {
+        StatsCalculator.buildDailyMinuteMap(sessions, zone = zone, lastSeenAt = proximityState.lastSeenAt, dayStartHour = dayStartHour)
     }
-    val daysWithPhotos = remember(moments) {
-        moments.map { Instant.ofEpochMilli(it.takenAt).atZone(zone).toLocalDate() }.toSet()
+    val logicalToday = StatsCalculator.logicalDayOf(System.currentTimeMillis(), zone, dayStartHour)
+    // Photos and manual entries bucket by the same logical day (AppSettings.dayStartHour) as the minute totals.
+    val daysWithPhotos = remember(moments, dayStartHour) {
+        moments.map { StatsCalculator.logicalDayOf(it.takenAt, zone, dayStartHour) }.toSet()
     }
-    val daysWithManualEntry = remember(sessions) {
-        sessions.filter { it.isManual }.map { Instant.ofEpochMilli(it.startedAt).atZone(zone).toLocalDate() }.toSet()
+    val daysWithManualEntry = remember(sessions, dayStartHour) {
+        sessions.filter { it.isManual }.map { StatsCalculator.logicalDayOf(it.startedAt, zone, dayStartHour) }.toSet()
     }
     // UX-FIX-PLAN.md Phase 4 item 25: [DayNote.date] is already an epoch-day Long, so this is a plain
     // wrap rather than a zone-derived conversion like the maps above.
@@ -219,8 +228,10 @@ fun CalendarScreen(
     // Reuses StatsCalculator's qualifying-day count (same buildDailyMinuteMap() call above feeds it)
     // rather than re-deriving "day with any together-time" locally, so this can never drift from the
     // "days together" stat shown on the Stats/Home screens.
-    val totalDaysTogether = remember(sessions, proximityState.lastSeenAt, proximityState.reunionCount) {
-        StatsCalculator.compute(sessions, zone = zone, lastSeenAt = proximityState.lastSeenAt, reunionCount = proximityState.reunionCount).totalDaysTogether
+    val totalDaysTogether = remember(sessions, proximityState.lastSeenAt, proximityState.reunionCount, dayStartHour) {
+        StatsCalculator.compute(
+            sessions, zone = zone, lastSeenAt = proximityState.lastSeenAt, reunionCount = proximityState.reunionCount, dayStartHour = dayStartHour
+        ).totalDaysTogether
     }
     // Membership in minutesPerDay (not minutes >= 1) is what "qualifies" a day - see StatsCalculator's
     // buildDailyMinuteMap: every key it inserts already had a real positive-duration segment
@@ -337,7 +348,7 @@ fun CalendarScreen(
                         hasManualEntry = hasManualEntry,
                         hasNote = hasNote,
                         hasMilestone = hasMilestone,
-                        isToday = day == LocalDate.now(zone),
+                        isToday = day == logicalToday,
                         isStreakHighlight = isStreakHighlight,
                         onClick = { selectedDay = day }
                     )
@@ -370,15 +381,15 @@ fun CalendarScreen(
 
     selectedDay?.let { day ->
         val minutes = minutesPerDay[day] ?: 0L
-        val daySessions = remember(day, sessions, proximityState.lastSeenAt) {
-            sessionsOverlapping(sessions, day, zone, proximityState.lastSeenAt)
+        val daySessions = remember(day, sessions, proximityState.lastSeenAt, dayStartHour) {
+            sessionsOverlapping(sessions, day, zone, proximityState.lastSeenAt, dayStartHour)
         }
         // UX-FIX-PLAN.md Phase 3 item 20: how many Moments were actually taken on this day - drives the
         // "View N photos from this day" row below, only shown when there's something to jump to. Reuses
         // the same day-grouping key (zone-local LocalDate off takenAt) [daysWithPhotos] above already
         // uses, so this can never disagree with that dot marker about which days "have a photo".
-        val dayMomentsCount = remember(day, moments) {
-            moments.count { Instant.ofEpochMilli(it.takenAt).atZone(zone).toLocalDate() == day }
+        val dayMomentsCount = remember(day, moments, dayStartHour) {
+            moments.count { StatsCalculator.logicalDayOf(it.takenAt, zone, dayStartHour) == day }
         }
         // BUG fix (user-reported): matches via the same milestoneMatchesDay the grid marker itself uses
         // (see its own doc) - a milestone recurs every year, so this must find it regardless of which
@@ -848,9 +859,17 @@ private data class DaySessionRow(val startedAt: Long, val endedAt: Long?, val is
  * are always kept individual and never merged with anything, even a BLE-detected row that happens to
  * overlap one (both are shown as separate, honest rows in that rare edge case, rather than silently
  * merging user-entered data into an automatic detection or vice versa). */
-private fun sessionsOverlapping(sessions: List<TogetherSession>, day: LocalDate, zone: ZoneId, lastSeenAt: Long): List<DaySessionRow> {
-    val dayStart = day.atStartOfDay(zone).toInstant().toEpochMilli()
-    val dayEnd = day.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+private fun sessionsOverlapping(
+    sessions: List<TogetherSession>,
+    day: LocalDate,
+    zone: ZoneId,
+    lastSeenAt: Long,
+    dayStartHour: Int
+): List<DaySessionRow> {
+    // The logical day's window (see StatsCalculator.logicalDayOf), not calendar midnight, so the detail list
+    // agrees with the grid's day-together dots for the same cell.
+    val dayStart = StatsCalculator.logicalDayStartMillis(day, zone, dayStartHour)
+    val dayEnd = StatsCalculator.logicalDayStartMillis(day.plusDays(1), zone, dayStartHour)
     val now = System.currentTimeMillis()
     val overlapping = sessions.filter { s ->
         // Same clamp as StatsCalculator.effectiveOpenSessionEnd: an open session's displayed end must

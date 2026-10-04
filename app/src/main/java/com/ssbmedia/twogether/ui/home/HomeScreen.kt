@@ -109,6 +109,7 @@ import com.ssbmedia.twogether.ui.components.QuickLinkChip
 import com.ssbmedia.twogether.ui.components.SectionHeader
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
 import com.ssbmedia.twogether.util.BatteryOptimization
+import com.ssbmedia.twogether.util.DateFormats
 import com.ssbmedia.twogether.util.DndAccess
 import com.ssbmedia.twogether.util.PhotoEditor
 import com.ssbmedia.twogether.util.RelativeTime
@@ -276,9 +277,10 @@ class HomeViewModel : ViewModel() {
     // MAX_MEMORY_SLIDESHOW_PHOTOS so a couple with many years of photos still gets a short slideshow,
     // not an unbounded one. Falls back to a single random photo only when there's no anniversary match
     // at all.
-    suspend fun pickRandomMomentIfNeeded(all: List<Moment>, now: Long) {
+    suspend fun pickRandomMomentIfNeeded(all: List<Moment>, now: Long, dayStartHour: Int = 0) {
         val zone = ZoneId.systemDefault()
-        val today = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
+        // "Today" and the anniversary match use the logical day (AppSettings.dayStartHour), not the calendar date.
+        val today = StatsCalculator.logicalDayOf(now, zone, dayStartHour)
         if (memoryMoments.value.isNotEmpty() && memoryMomentsDate.value == today) return
         // MINOR fix: File.isFile is blocking disk I/O, and this used to run directly on whatever
         // dispatcher the caller's LaunchedEffect is on (Main) - moved off Main here so a large moment
@@ -287,7 +289,7 @@ class HomeViewModel : ViewModel() {
         val withPhoto = withContext(Dispatchers.IO) { all.filter { it.photoDownloaded && File(it.photoUri).isFile } }
         if (withPhoto.isEmpty()) return
         val anniversaryPool = withPhoto.filter { moment ->
-            val takenDate = Instant.ofEpochMilli(moment.takenAt).atZone(zone).toLocalDate()
+            val takenDate = StatsCalculator.logicalDayOf(moment.takenAt, zone, dayStartHour)
             takenDate.monthValue == today.monthValue && takenDate.dayOfMonth == today.dayOfMonth && takenDate.year != today.year
         }.sortedByDescending { it.takenAt }
         if (anniversaryPool.isNotEmpty()) {
@@ -438,7 +440,7 @@ fun HomeScreen(
     // HomeViewModel.pickRandomMomentIfNeeded's own doc. The relaunch itself is cheap: the vast majority
     // of these calls (every 30s until the date changes) exit on pickRandomMomentIfNeeded's very first
     // date-comparison line, well before its IO-dispatched filter.
-    LaunchedEffect(moments, now) { vm.pickRandomMomentIfNeeded(moments, now) }
+    LaunchedEffect(moments, now, settings.dayStartHour) { vm.pickRandomMomentIfNeeded(moments, now, settings.dayStartHour) }
 
     // Item 22 (UX-FIX-PLAN.md Phase 3): whether the notification-bell panel is currently open.
     var showInboxPanel by remember { mutableStateOf(false) }
@@ -446,8 +448,13 @@ fun HomeScreen(
     var showReunion by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         val persisted = ServiceLocator.proximityStateStore.current()
-        if (persisted.pendingReunionCelebration) {
+        // Only a reunion the couple is STILL in. A celebration left pending from a reunion the app never
+        // displayed (the app wasn't open while they were together) must not fire as "Together again!" on a
+        // later open taken while apart - handleBecameApart also clears it, this is the display-side guard.
+        if (persisted.pendingReunionCelebration && persisted.isTogether) {
             showReunion = true
+        }
+        if (persisted.pendingReunionCelebration) {
             ServiceLocator.proximityStateStore.update { it.copy(pendingReunionCelebration = false) }
         }
     }
@@ -552,16 +559,26 @@ fun HomeScreen(
     // timeout, matching Home's own effectivelyTogether staleness check below - see
     // StatsCalculator.effectiveOpenSessionEnd's doc for why (a stale/orphaned open session must
     // never silently "grow" forever just because something read it).
-    val stats = remember(sessions, now, proximityState.lastSeenAt, proximityState.reunionCount) {
-        StatsCalculator.compute(sessions, now, lastSeenAt = proximityState.lastSeenAt, reunionCount = proximityState.reunionCount)
+    // Day boundary per AppSettings.dayStartHour (4 AM default): "today" and every day bucket below start there.
+    val dayStartHour = settings.dayStartHour
+    val stats = remember(sessions, now, proximityState.lastSeenAt, proximityState.reunionCount, dayStartHour) {
+        StatsCalculator.compute(
+            sessions, now, lastSeenAt = proximityState.lastSeenAt, reunionCount = proximityState.reunionCount, dayStartHour = dayStartHour
+        )
     }
 
     // Same "on this exact calendar date, in a past year" lookup used by the Calendar screen's per-day
     // data - a NEW time-based callback, distinct from MemoryThrowbackCard's photo-based one below.
     // Keyed the same way `stats` above already is (sessions/now/lastSeenAt), so it only recomputes on
     // this screen's existing 30s ticker cadence rather than every recomposition.
-    val onThisDayInfo: OnThisDayInfo? = remember(sessions, now, proximityState.lastSeenAt) {
-        StatsCalculator.onThisDayPreviousYear(sessions, now, lastSeenAt = proximityState.lastSeenAt)
+    val onThisDayInfo: OnThisDayInfo? = remember(sessions, now, proximityState.lastSeenAt, dayStartHour) {
+        StatsCalculator.onThisDayPreviousYear(sessions, now, lastSeenAt = proximityState.lastSeenAt, dayStartHour = dayStartHour)
+    }
+
+    // "Together today" for the Apart-right-now card: the together-window within today's logical day (see
+    // StatsCalculator.togetherToday). Null when the couple hasn't met today yet, which the card handles.
+    val togetherToday: StatsCalculator.TogetherToday? = remember(sessions, now, proximityState.lastSeenAt, dayStartHour) {
+        StatsCalculator.togetherToday(sessions, now, lastSeenAt = proximityState.lastSeenAt, dayStartHour = dayStartHour)
     }
 
     // Defensive UI-level staleness check, independent of whether the foreground service is even
@@ -764,6 +781,7 @@ fun HomeScreen(
             item {
                 UsStatusCard(
                     isTogether = effectivelyTogether,
+                    todayTogether = togetherToday,
                     // Session-split fix: reads proximityState.continuousTogetherSince (the service's
                     // display-purpose accumulator - see ProximityForegroundService.
                     // resumedContinuousTogetherSince) instead of openSession.startedAt. After a
@@ -1339,7 +1357,16 @@ private fun UpdateAvailableWarningCard(versionName: String, onInstallClick: () -
 }
 
 @Composable
-private fun UsStatusCard(isTogether: Boolean, continuousTogetherSinceMillis: Long, now: Long, partnerName: String, partnerEmoji: String) {
+private fun UsStatusCard(
+    isTogether: Boolean,
+    continuousTogetherSinceMillis: Long,
+    now: Long,
+    partnerName: String,
+    partnerEmoji: String,
+    // Only read while apart: when the couple already met today, the apart card recaps that window ("Together
+    // for 3h 20m today, 2:10 PM to 5:30 PM") instead of saying nothing about today at all.
+    todayTogether: StatsCalculator.TogetherToday? = null
+) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.extraLarge,
@@ -1370,7 +1397,18 @@ private fun UsStatusCard(isTogether: Boolean, continuousTogetherSinceMillis: Lon
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.padding(top = 8.dp)
                 )
-                Text("Hoping to see $partnerName again soon 💭", style = MaterialTheme.typography.bodyMedium)
+                if (todayTogether != null) {
+                    val zone = ZoneId.systemDefault()
+                    val from = DateFormats.formatTime(Instant.ofEpochMilli(todayTogether.firstStartMillis).atZone(zone).toLocalTime())
+                    val to = DateFormats.formatTime(Instant.ofEpochMilli(todayTogether.lastEndMillis).atZone(zone).toLocalTime())
+                    Text(
+                        text = "Together for ${RelativeTime.formatDuration(todayTogether.totalMillis)} today, $from to $to",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
+                Text("Hoping to see $partnerName again soon 💭", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 4.dp))
             }
         }
     }

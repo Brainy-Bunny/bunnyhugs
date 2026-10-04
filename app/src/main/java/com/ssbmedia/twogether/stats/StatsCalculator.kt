@@ -171,6 +171,20 @@ object StatsCalculator {
         absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
     ): Long = minOf(now, maxOf(lastSeenAt, startedAt) + absenceTimeoutMillis)
 
+    /** The "logical day" a local instant belongs to: the day runs from [dayStartHour] local time to the same
+     * time the next morning, so with the 4 AM default a session at 1 AM Saturday is still Friday's day.
+     * Every day-bucketing decision in this file goes through this one function so the rule can't drift
+     * between stats, streaks, and the Home card. dayStartHour 0 is plain calendar midnight. */
+    internal fun logicalDayOf(epochMillis: Long, zone: ZoneId, dayStartHour: Int): LocalDate =
+        LocalDateTime.ofInstant(Instant.ofEpochMilli(epochMillis), zone)
+            .minusHours(dayStartHour.coerceIn(0, 23).toLong())
+            .toLocalDate()
+
+    /** Epoch millis of the moment [day] starts (its [dayStartHour] local time). The inverse of [logicalDayOf]
+     * for the first instant of a logical day. */
+    internal fun logicalDayStartMillis(day: LocalDate, zone: ZoneId, dayStartHour: Int): Long =
+        day.atTime(dayStartHour.coerceIn(0, 23), 0).atZone(zone).toInstant().toEpochMilli()
+
     fun compute(
         sessions: List<TogetherSession>,
         now: Long = System.currentTimeMillis(),
@@ -191,13 +205,17 @@ object StatsCalculator {
          * only for callers that don't care about this field (e.g. [manualHoursCredit]'s two internal
          * `compute()` calls, which only ever read totalHoursAllTime) - every real UI call site must pass
          * its own ProximityPersistedState's reunionCount explicitly. */
-        reunionCount: Int = 0
+        reunionCount: Int = 0,
+        /** User-configurable day boundary (see [logicalDayOf]). Defaults to calendar midnight only so
+         * existing callers and tests keep their historical semantics; every production UI call site
+         * passes the user's own AppSettings.dayStartHour. Kept last so no positional caller can shift. */
+        dayStartHour: Int = 0
     ): TogetherStats {
 
         // Computed from raw session start times (not the merged/clamped timeline below) so it reflects
         // the true first-ever recorded moment regardless of how open sessions get clamped elsewhere.
         val togetherSince = sessions.minByOrNull { it.startedAt }
-            ?.let { LocalDateTime.ofInstant(Instant.ofEpochMilli(it.startedAt), zone).toLocalDate() }
+            ?.let { logicalDayOf(it.startedAt, zone, dayStartHour) }
 
         // Merges possibly-overlapping session intervals (e.g. a manually backfilled "today, 2h" entry
         // stacked on top of BLE-detected time already logged that day) into a normalized,
@@ -231,14 +249,14 @@ object StatsCalculator {
         // silently reporting 0.0 for totalHoursThisWeek/totalHoursThisMonth even though the couple has
         // real together-time already inside the new week/month - a real, reproducible under-count on
         // every single week rollover. See StatsCalculatorAuditTest's "BUG - totalHoursThisWeek..." test.
-        val today = LocalDateTime.ofInstant(Instant.ofEpochMilli(now), zone).toLocalDate()
-        val startOfWeek = today.with(java.time.DayOfWeek.MONDAY).atStartOfDay(zone).toInstant().toEpochMilli()
-        val startOfMonth = today.withDayOfMonth(1).atStartOfDay(zone).toInstant().toEpochMilli()
+        val today = logicalDayOf(now, zone, dayStartHour)
+        val startOfWeek = logicalDayStartMillis(today.with(java.time.DayOfWeek.MONDAY), zone, dayStartHour)
+        val startOfMonth = logicalDayStartMillis(today.withDayOfMonth(1), zone, dayStartHour)
 
         val totalHoursThisWeek = merged.sumOf { clippedIntervalMillis(it, startOfWeek, now) } / 3_600_000.0
         val totalHoursThisMonth = merged.sumOf { clippedIntervalMillis(it, startOfMonth, now) } / 3_600_000.0
 
-        val minutesPerDay = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis)
+        val minutesPerDay = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis, dayStartHour)
 
         // Every key buildDailyMinuteMap() inserts already corresponds to a day with at least one
         // genuine positive-duration segment (segmentEnd > cursor is guaranteed inside its loop), even if
@@ -288,7 +306,7 @@ object StatsCalculator {
         val longestSingleDay = minutesPerDay.maxByOrNull { it.value }?.let { DayStat(it.key, it.value / 60.0) }
 
         val elapsedIntoMonth = (now - startOfMonth).coerceAtLeast(0L)
-        val lastMonthStart = today.minusMonths(1).withDayOfMonth(1).atStartOfDay(zone).toInstant().toEpochMilli()
+        val lastMonthStart = logicalDayStartMillis(today.minusMonths(1).withDayOfMonth(1), zone, dayStartHour)
         val hoursThisMonthSoFar = merged.sumOf { clippedIntervalMillis(it, startOfMonth, startOfMonth + elapsedIntoMonth) } / 3_600_000.0
         // Cap the "last month" window's end at startOfMonth (this month's start, i.e. last month's real
         // exclusive end) - NEVER let it run past into this month. Without this cap, on any day-of-month
@@ -326,7 +344,7 @@ object StatsCalculator {
         }
         val monthTrendDeltaDays = daysThisMonthSoFar - daysLastMonthSameWindow
 
-        val gaps = dayGapsFromQualifyingDays(qualifyingDays.toList(), zone)
+        val gaps = dayGapsFromQualifyingDays(qualifyingDays.toList(), zone, dayStartHour)
         val avgDaysBetweenMeetups = if (gaps.isNotEmpty()) gaps.map { it.days }.average() else null
         val longestApart = gaps.maxByOrNull { it.days }
 
@@ -444,8 +462,10 @@ object StatsCalculator {
         return (end - start).coerceAtLeast(0L)
     }
 
-    /** Splits every (overlap-merged) together-interval across the calendar days it spans and sums
-     * minutes-together per local day. Public so the Calendar screen can reuse it. */
+    /** Splits every (overlap-merged) together-interval across the logical days it spans and sums
+     * minutes-together per day. Public so the Calendar screen can reuse it. A session running past
+     * midnight but not past [dayStartHour] stays in ONE day here - that is the whole point of the
+     * configurable day start (see [logicalDayOf]). */
     fun buildDailyMinuteMap(
         sessions: List<TogetherSession>,
         now: Long = System.currentTimeMillis(),
@@ -453,16 +473,16 @@ object StatsCalculator {
         /** See [compute]'s doc - forwarded to [effectiveOpenSessionEnd] so an open session's minutes
          * here can't grow unbounded off a stale/orphaned row either. */
         lastSeenAt: Long = 0L,
-        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS,
+        dayStartHour: Int = 0
     ): Map<LocalDate, Long> {
         val merged = mergedIntervals(sessions, now, lastSeenAt, absenceTimeoutMillis)
         val map = HashMap<LocalDate, Long>()
         for (interval in merged) {
             var cursor = interval.start
             while (cursor < interval.end) {
-                val cursorDateTime = LocalDateTime.ofInstant(Instant.ofEpochMilli(cursor), zone)
-                val day = cursorDateTime.toLocalDate()
-                val dayEndMillis = day.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+                val day = logicalDayOf(cursor, zone, dayStartHour)
+                val dayEndMillis = logicalDayStartMillis(day.plusDays(1), zone, dayStartHour)
                 val segmentEnd = minOf(interval.end, dayEndMillis)
                 val minutes = (segmentEnd - cursor) / 60_000L
                 map[day] = (map[day] ?: 0L) + minutes
@@ -501,14 +521,43 @@ object StatsCalculator {
         now: Long = System.currentTimeMillis(),
         zone: ZoneId = ZoneId.systemDefault(),
         lastSeenAt: Long = 0L,
-        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS,
+        dayStartHour: Int = 0
     ): OnThisDayInfo? {
-        val today = LocalDateTime.ofInstant(Instant.ofEpochMilli(now), zone).toLocalDate()
-        val map = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis)
+        val today = logicalDayOf(now, zone, dayStartHour)
+        val map = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis, dayStartHour)
         return map.entries
             .filter { it.key.year < today.year && it.key.monthValue == today.monthValue && it.key.dayOfMonth == today.dayOfMonth && it.value > 0L }
             .maxByOrNull { it.key.year }
             ?.let { OnThisDayInfo(it.key.year, it.value / 60.0) }
+    }
+
+    /** The together-time that falls inside the logical day [now] belongs to, for the Home "Apart right now"
+     * card: "Together for 3h 20m today, 2:10 PM to 5:30 PM" when the couple met earlier today and is apart
+     * again. Intervals are clipped to the day's start and to [now], so it is always today-only and never
+     * credits time before the day boundary. [firstStartMillis]/[lastEndMillis] are the earliest start and
+     * latest end across all of today's together-time - the "from ... to ..." span. Null when there was no
+     * together-time today at all. */
+    data class TogetherToday(val totalMillis: Long, val firstStartMillis: Long, val lastEndMillis: Long)
+
+    fun togetherToday(
+        sessions: List<TogetherSession>,
+        now: Long = System.currentTimeMillis(),
+        zone: ZoneId = ZoneId.systemDefault(),
+        lastSeenAt: Long = 0L,
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS,
+        dayStartHour: Int = 0
+    ): TogetherToday? {
+        val dayStart = logicalDayStartMillis(logicalDayOf(now, zone, dayStartHour), zone, dayStartHour)
+        val clipped = mergedIntervals(sessions, now, lastSeenAt, absenceTimeoutMillis)
+            .filter { it.end > dayStart && it.start < now }
+            .map { Interval(maxOf(it.start, dayStart), minOf(it.end, now)) }
+        if (clipped.isEmpty()) return null
+        return TogetherToday(
+            totalMillis = clipped.sumOf { it.end - it.start },
+            firstStartMillis = clipped.first().start,
+            lastEndMillis = clipped.last().end
+        )
     }
 
     private fun computeDailyStreaks(qualifyingDays: Set<LocalDate>, today: LocalDate): Pair<Int, Int> {
@@ -639,15 +688,15 @@ object StatsCalculator {
      * are each day's local midnight so the UI can render the exact date range. Shared by [compute]
      * (which already has qualifyingDays in hand) and the public [computeMeetupGaps] below - both must
      * resolve to the exact same gap list, never two independently re-derived ones. */
-    private fun dayGapsFromQualifyingDays(sortedDays: List<LocalDate>, zone: ZoneId): List<GapInfo> {
+    private fun dayGapsFromQualifyingDays(sortedDays: List<LocalDate>, zone: ZoneId, dayStartHour: Int): List<GapInfo> {
         if (sortedDays.size < 2) return emptyList()
         return (1 until sortedDays.size).map {
             val prevDay = sortedDays[it - 1]
             val nextDay = sortedDays[it]
             GapInfo(
                 ChronoUnit.DAYS.between(prevDay, nextDay).toDouble(),
-                prevDay.atStartOfDay(zone).toInstant().toEpochMilli(),
-                nextDay.atStartOfDay(zone).toInstant().toEpochMilli()
+                logicalDayStartMillis(prevDay, zone, dayStartHour),
+                logicalDayStartMillis(nextDay, zone, dayStartHour)
             )
         }
     }
@@ -660,10 +709,12 @@ object StatsCalculator {
         now: Long = System.currentTimeMillis(),
         zone: ZoneId = ZoneId.systemDefault(),
         lastSeenAt: Long = 0L,
-        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS,
+        dayStartHour: Int = 0
     ): List<GapInfo> = dayGapsFromQualifyingDays(
-        buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis).keys.sorted(),
-        zone
+        buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis, dayStartHour).keys.sorted(),
+        zone,
+        dayStartHour
     )
 
     /** Shared by [compute]'s mostMetMonth/mostHoursMonth and the public [computeMonthlyBreakdown] below -
@@ -688,13 +739,14 @@ object StatsCalculator {
         now: Long = System.currentTimeMillis(),
         zone: ZoneId = ZoneId.systemDefault(),
         lastSeenAt: Long = 0L,
-        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS,
+        dayStartHour: Int = 0
     ): List<MonthlyBreakdown> {
-        val minutesPerDay = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis)
+        val minutesPerDay = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis, dayStartHour)
         if (minutesPerDay.isEmpty()) return emptyList()
         val byMonth = monthlyBreakdownFromDailyMap(minutesPerDay).associateBy { it.yearMonth }
         val firstMonth = minutesPerDay.keys.minOf { YearMonth.from(it) }
-        val lastMonth = YearMonth.from(LocalDateTime.ofInstant(Instant.ofEpochMilli(now), zone).toLocalDate())
+        val lastMonth = YearMonth.from(logicalDayOf(now, zone, dayStartHour))
         val out = mutableListOf<MonthlyBreakdown>()
         var cursor = firstMonth
         while (!cursor.isAfter(lastMonth)) {
@@ -712,9 +764,10 @@ object StatsCalculator {
         now: Long = System.currentTimeMillis(),
         zone: ZoneId = ZoneId.systemDefault(),
         lastSeenAt: Long = 0L,
-        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS,
+        dayStartHour: Int = 0
     ): DateRange? {
-        val qualifyingDays = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis).keys.sorted()
+        val qualifyingDays = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis, dayStartHour).keys.sorted()
         if (qualifyingDays.isEmpty()) return null
         var bestStart = qualifyingDays[0]
         var bestEnd = qualifyingDays[0]
@@ -736,9 +789,10 @@ object StatsCalculator {
         now: Long = System.currentTimeMillis(),
         zone: ZoneId = ZoneId.systemDefault(),
         lastSeenAt: Long = 0L,
-        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS,
+        dayStartHour: Int = 0
     ): DateRange? {
-        val qualifyingDays = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis).keys
+        val qualifyingDays = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis, dayStartHour).keys
         if (qualifyingDays.isEmpty()) return null
         val sortedWeeks = qualifyingDays.map { weekKeyOf(it) }.toSortedSet(compareBy({ it.first }, { it.second })).toList()
         var bestStart = sortedWeeks[0]
@@ -764,11 +818,12 @@ object StatsCalculator {
         now: Long = System.currentTimeMillis(),
         zone: ZoneId = ZoneId.systemDefault(),
         lastSeenAt: Long = 0L,
-        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS,
+        dayStartHour: Int = 0
     ): DateRange? {
-        val qualifyingDays = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis).keys
+        val qualifyingDays = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis, dayStartHour).keys
         if (qualifyingDays.isEmpty()) return null
-        val today = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
+        val today = logicalDayOf(now, zone, dayStartHour)
         var anchor = today
         if (anchor !in qualifyingDays) anchor = anchor.minusDays(1)
         if (anchor !in qualifyingDays) return null
@@ -787,12 +842,13 @@ object StatsCalculator {
         now: Long = System.currentTimeMillis(),
         zone: ZoneId = ZoneId.systemDefault(),
         lastSeenAt: Long = 0L,
-        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS,
+        dayStartHour: Int = 0
     ): DateRange? {
-        val qualifyingDays = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis).keys
+        val qualifyingDays = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis, dayStartHour).keys
         if (qualifyingDays.isEmpty()) return null
         val qualifyingWeeks = qualifyingDays.map { weekKeyOf(it) }.toSet()
-        val today = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
+        val today = logicalDayOf(now, zone, dayStartHour)
         var anchor = weekKeyOf(today)
         if (anchor !in qualifyingWeeks) anchor = previousWeekKey(anchor)
         if (anchor !in qualifyingWeeks) return null

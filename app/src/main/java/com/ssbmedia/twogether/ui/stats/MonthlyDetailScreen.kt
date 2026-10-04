@@ -40,6 +40,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
+import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.stats.MonthlyBreakdown
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.EmptyState
@@ -104,8 +105,9 @@ fun MonthlyDetailScreen(initialMetric: String, onBack: () -> Unit) {
         mutableStateOf(if (initialMetric == "hours") MonthlyMetric.HOURS else MonthlyMetric.DAYS)
     }
 
-    val monthly = remember(sessions, proximityState.lastSeenAt) {
-        StatsCalculator.computeMonthlyBreakdown(sessions, lastSeenAt = proximityState.lastSeenAt)
+    val settings by ServiceLocator.settingsStore.settings.collectAsState(initial = AppSettings())
+    val monthly = remember(sessions, proximityState.lastSeenAt, settings.dayStartHour) {
+        StatsCalculator.computeMonthlyBreakdown(sessions, lastSeenAt = proximityState.lastSeenAt, dayStartHour = settings.dayStartHour)
     }
 
     // Phase 1 item 6: windows anchored from the END (the current month) backward - see

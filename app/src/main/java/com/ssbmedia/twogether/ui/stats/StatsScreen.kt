@@ -31,6 +31,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
+import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.stats.DateRange
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.SectionHeader
@@ -72,24 +73,29 @@ fun StatsScreen(
     val proximityState by vm.proximityState.collectAsState()
     // lastSeenAt clamps an open session's live duration to the last confirmed sighting + absence
     // timeout - see StatsCalculator.effectiveOpenSessionEnd's doc.
-    val stats = remember(sessions, proximityState.lastSeenAt, proximityState.reunionCount) {
-        StatsCalculator.compute(sessions, lastSeenAt = proximityState.lastSeenAt, reunionCount = proximityState.reunionCount)
+    // User-configurable day start (AppSettings.dayStartHour): every day-based stat below buckets by it.
+    val settings by ServiceLocator.settingsStore.settings.collectAsState(initial = AppSettings())
+    val dayStartHour = settings.dayStartHour
+    val stats = remember(sessions, proximityState.lastSeenAt, proximityState.reunionCount, dayStartHour) {
+        StatsCalculator.compute(
+            sessions, lastSeenAt = proximityState.lastSeenAt, reunionCount = proximityState.reunionCount, dayStartHour = dayStartHour
+        )
     }
     // Feature 1: the actual calendar-date span of the longest daily/weekly streak, so "Longest streak"
     // cards can jump Calendar there and highlight it - see StatsCalculator's doc for why this is a
     // separate call from stats.longestDailyStreak/longestWeeklyStreak (which only expose the length).
-    val longestDailyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt) {
-        StatsCalculator.longestDailyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt)
+    val longestDailyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt, dayStartHour) {
+        StatsCalculator.longestDailyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt, dayStartHour = dayStartHour)
     }
-    val longestWeeklyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt) {
-        StatsCalculator.longestWeeklyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt)
+    val longestWeeklyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt, dayStartHour) {
+        StatsCalculator.longestWeeklyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt, dayStartHour = dayStartHour)
     }
     // User-requested: "current" streak cards should be tappable too, matching "longest".
-    val currentDailyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt) {
-        StatsCalculator.currentDailyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt)
+    val currentDailyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt, dayStartHour) {
+        StatsCalculator.currentDailyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt, dayStartHour = dayStartHour)
     }
-    val currentWeeklyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt) {
-        StatsCalculator.currentWeeklyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt)
+    val currentWeeklyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt, dayStartHour) {
+        StatsCalculator.currentWeeklyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt, dayStartHour = dayStartHour)
     }
 
     Scaffold(

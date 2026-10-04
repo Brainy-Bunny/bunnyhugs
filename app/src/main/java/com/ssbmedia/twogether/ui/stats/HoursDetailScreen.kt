@@ -37,6 +37,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
+import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.EmptyState
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
@@ -93,15 +94,20 @@ fun HoursDetailScreen(onBack: () -> Unit) {
     val vm: HoursDetailViewModel = viewModel(factory = SimpleViewModelFactory { HoursDetailViewModel() })
     val sessions by vm.sessions.collectAsState()
     val proximityState by vm.proximityState.collectAsState()
+    val settings by ServiceLocator.settingsStore.settings.collectAsState(initial = AppSettings())
     val zone = remember { ZoneId.systemDefault() }
 
-    val dailyHours = remember(sessions, proximityState.lastSeenAt) {
-        val minutesPerDay = StatsCalculator.buildDailyMinuteMap(sessions, zone = zone, lastSeenAt = proximityState.lastSeenAt)
+    val dailyHours = remember(sessions, proximityState.lastSeenAt, settings.dayStartHour) {
+        val minutesPerDay = StatsCalculator.buildDailyMinuteMap(
+            sessions, zone = zone, lastSeenAt = proximityState.lastSeenAt, dayStartHour = settings.dayStartHour
+        )
         if (minutesPerDay.isEmpty()) {
             emptyList()
         } else {
             val first = minutesPerDay.keys.min()
-            val today = LocalDate.now(zone)
+            // "Today" is the logical day (see StatsCalculator.logicalDayOf), so the window's last page ends
+            // on today's day-together bucket rather than the calendar date.
+            val today = StatsCalculator.logicalDayOf(System.currentTimeMillis(), zone, settings.dayStartHour)
             val out = mutableListOf<Pair<LocalDate, Double>>()
             var cursor = first
             while (!cursor.isAfter(today)) {

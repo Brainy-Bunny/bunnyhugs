@@ -42,6 +42,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
+import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.badges.BadgeCatalog
 import com.ssbmedia.twogether.badges.BadgeStatus
 import com.ssbmedia.twogether.badges.BadgeType
@@ -95,14 +96,19 @@ fun BadgesScreen(
     val unlockDates by vm.unlockDates.collectAsState()
     // lastSeenAt clamps an open session's live duration so badge progress can't be inflated by a
     // stale/orphaned open session - see StatsCalculator.effectiveOpenSessionEnd's doc.
-    val stats = remember(sessions, proximityState.lastSeenAt, proximityState.reunionCount) {
-        StatsCalculator.compute(sessions, lastSeenAt = proximityState.lastSeenAt, reunionCount = proximityState.reunionCount)
+    // Day-based badges (streaks, days together) bucket by the user's day start - see AppSettings.dayStartHour.
+    val settings by ServiceLocator.settingsStore.settings.collectAsState(initial = AppSettings())
+    val dayStartHour = settings.dayStartHour
+    val stats = remember(sessions, proximityState.lastSeenAt, proximityState.reunionCount, dayStartHour) {
+        StatsCalculator.compute(
+            sessions, lastSeenAt = proximityState.lastSeenAt, reunionCount = proximityState.reunionCount, dayStartHour = dayStartHour
+        )
     }
     val statuses = remember(stats) { BadgeCatalog.statuses(stats) }
     // Same DateRange lookup StatsScreen's own "Longest streak" card already drives - see its doc there
     // for why min(...)-clamped LWW convergence, etc, isn't relevant here: this is a pure read.
-    val longestDailyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt) {
-        StatsCalculator.longestDailyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt)
+    val longestDailyStreakRange: DateRange? = remember(sessions, proximityState.lastSeenAt, dayStartHour) {
+        StatsCalculator.longestDailyStreakRange(sessions, lastSeenAt = proximityState.lastSeenAt, dayStartHour = dayStartHour)
     }
     // BUG fix (user-reported): WEEKLY_STREAK no longer routes to a single contiguous streak range - now
     // that it tracks cumulative weeks together (see BadgeCatalog.currentValueFor's doc), there's no one

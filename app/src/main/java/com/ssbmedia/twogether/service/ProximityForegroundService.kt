@@ -805,6 +805,11 @@ class ProximityForegroundService : LifecycleService() {
                 currentSessionId = if (openSession != null) it.currentSessionId else -1L,
                 reminderFiredForSession = false,
                 snoozeUntil = 0L,
+                // A reunion celebration that was never displayed belongs to the together-stretch that just
+                // ended. Clearing it here stops it from firing on a later app open taken while apart, or
+                // from carrying over into an unrelated future together-stretch (HomeScreen's own guard
+                // only checks isTogether, which is true again the next time they meet).
+                pendingReunionCelebration = false,
                 lastApartSince = apartSince,
                 pendingApartSince = if (openSession != null) now else 0L,
                 // Item 24 (UX-FIX-PLAN.md): same reset as reminderFiredForSession above - the
@@ -910,7 +915,11 @@ class ProximityForegroundService : LifecycleService() {
 
         val ideas = ServiceLocator.dateIdeaRepository.getAll()
         for (idea in ideas) {
-            if (idea.deleted) continue
+            // A completed idea (checked off, which moves it into the Completed section) no longer needs
+            // reminding about - an alert for it firing after it was already done is exactly the bug this
+            // guards against. Re-checked on every tick, so an idea checked off before its threshold is
+            // simply never announced, and one un-checked later becomes eligible again.
+            if (!isReminderEligibleIdea(idea)) continue
             val minutes = idea.remindAfterTogetherMinutes ?: continue
             val key = "idea:${idea.id}"
             if (key in alreadyFired) continue
@@ -1246,5 +1255,11 @@ class ProximityForegroundService : LifecycleService() {
          * which would otherwise fire on literally the first tick of every together-session). */
         private fun listReminderThresholdCrossed(thresholdMinutes: Int, elapsedTogetherMillis: Long): Boolean =
             thresholdMinutes > 0 && elapsedTogetherMillis >= thresholdMinutes * 60_000L
+
+        /** Whether a DateIdea may still fire its own "remind me after we're together" alert. Deleted ideas and
+         * completed (done) ideas never do: an idea that's already been checked off is finished, so reminding
+         * about it is noise. Pure and internal so it can be unit-tested directly. */
+        internal fun isReminderEligibleIdea(idea: com.ssbmedia.twogether.data.db.DateIdea): Boolean =
+            !idea.deleted && !idea.done
     }
 }

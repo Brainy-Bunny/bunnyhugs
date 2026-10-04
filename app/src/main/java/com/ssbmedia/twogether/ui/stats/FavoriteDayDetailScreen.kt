@@ -31,6 +31,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ssbmedia.twogether.ServiceLocator
+import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.EmptyState
 import com.ssbmedia.twogether.ui.components.SimpleViewModelFactory
@@ -60,10 +61,13 @@ fun FavoriteDayDetailScreen(onBack: () -> Unit) {
     val vm: FavoriteDayDetailViewModel = viewModel(factory = SimpleViewModelFactory { FavoriteDayDetailViewModel() })
     val sessions by vm.sessions.collectAsState()
     val proximityState by vm.proximityState.collectAsState()
+    val settings by ServiceLocator.settingsStore.settings.collectAsState(initial = AppSettings())
     val zone = remember { ZoneId.systemDefault() }
 
-    val countsByWeekday = remember(sessions, proximityState.lastSeenAt) {
-        val qualifyingDays = StatsCalculator.buildDailyMinuteMap(sessions, zone = zone, lastSeenAt = proximityState.lastSeenAt).keys
+    val countsByWeekday = remember(sessions, proximityState.lastSeenAt, settings.dayStartHour) {
+        val qualifyingDays = StatsCalculator.buildDailyMinuteMap(
+            sessions, zone = zone, lastSeenAt = proximityState.lastSeenAt, dayStartHour = settings.dayStartHour
+        ).keys
         val weekdayOrder = listOf(
             DayOfWeek.MONDAY, DayOfWeek.TUESDAY, DayOfWeek.WEDNESDAY, DayOfWeek.THURSDAY,
             DayOfWeek.FRIDAY, DayOfWeek.SATURDAY, DayOfWeek.SUNDAY

@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -37,6 +38,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -137,6 +139,12 @@ class SettingsViewModel : ViewModel() {
                 AppEvents.requestManualSync()
             }
         }
+    }
+
+    /** The "Day starts at" row's dialog calls this. Per-device and local-only (see AppSettings.dayStartHour),
+     * so unlike the couple-level settings above there's no sync nudge to request. */
+    fun setDayStartHour(hour: Int) {
+        viewModelScope.launch { ServiceLocator.settingsStore.setDayStartHour(hour) }
     }
 
     fun setNotificationsEnabled(enabled: Boolean) {
@@ -335,6 +343,7 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
     var showPhotoReminderDialog by remember { mutableStateOf(false) }
     var showSessionGraceDialog by remember { mutableStateOf(false) }
     var showReunionThresholdDialog by remember { mutableStateOf(false) }
+    var showDayStartDialog by remember { mutableStateOf(false) }
     // Item 1 (deferred UX fix, 4-model advisory audit): "Paired with" row's edit dialog toggle.
     var showEditPartnerDialog by remember { mutableStateOf(false) }
 
@@ -469,6 +478,12 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                     subtitle = "Apart ${settings.reunionThresholdMinutes}+ min counts as a real reunion. Changing this only affects future reunions, never past ones."
                 ) {
                     TextButton(onClick = { showReunionThresholdDialog = true }) { Text("Change") }
+                }
+                SettingsRow(
+                    label = "Day starts at",
+                    subtitle = "A new day begins at ${DateFormats.formatTime(java.time.LocalTime.of(settings.dayStartHour, 0))}, so a late night still counts as one day. Only affects how days are counted on this phone."
+                ) {
+                    TextButton(onClick = { showDayStartDialog = true }) { Text("Change") }
                 }
             }
 
@@ -797,6 +812,14 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
         )
     }
 
+    if (showDayStartDialog) {
+        DayStartDialog(
+            current = settings.dayStartHour,
+            onDismiss = { showDayStartDialog = false },
+            onSave = { vm.setDayStartHour(it); showDayStartDialog = false }
+        )
+    }
+
     if (showPinDialog) {
         SetPinDialog(onDismiss = { showPinDialog = false }, onSave = { pin, onResult -> vm.setPin(pin, onResult) })
     }
@@ -1109,6 +1132,50 @@ private fun ReunionThresholdDialog(current: Int, onDismiss: () -> Unit, onSave: 
             }
         },
         confirmButton = { TextButton(onClick = { onSave((text.toIntOrNull() ?: current).coerceIn(1, 720)) }) { Text("Save") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
+/** "Day starts at": picks the local hour (0-23) a new day begins at - see AppSettings.dayStartHour. A
+ * scrollable radio list rather than a free-text field, since there are only 24 valid choices and a typo
+ * here would silently shift every day boundary. */
+@Composable
+private fun DayStartDialog(current: Int, onDismiss: () -> Unit, onSave: (Int) -> Unit) {
+    var selected by remember { mutableStateOf(current) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Day starts at") },
+        text = {
+            Column {
+                Text(
+                    "Stats and streaks count a day from this time to the same time the next morning. Pick 12:00 AM for calendar midnight.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Column(
+                    modifier = Modifier
+                        .padding(top = 8.dp)
+                        .heightIn(max = 360.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    (0..23).forEach { hour ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { selected = hour }
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(selected = selected == hour, onClick = null)
+                            Text(
+                                DateFormats.formatTime(java.time.LocalTime.of(hour, 0)),
+                                modifier = Modifier.padding(start = 8.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { onSave(selected) }) { Text("Save") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
     )
 }
