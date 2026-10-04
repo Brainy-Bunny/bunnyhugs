@@ -32,6 +32,8 @@ a shared space for date ideas, memories, and streaks.
 - **Home** — live "together" status with a pulsing heart, streaks at a glance.
 - **Stats** — total hours together, daily & weekly streaks (shown separately),
   longest session, reunions, days together, favorite day of the week.
+  A day starts at 4 AM by default (adjustable in Settings), so a date night
+  that runs past midnight still counts as one day.
 - **Calendar** — a month view with your together-days highlighted.
 - **Photo reminder** — after 15 minutes continuously together, a gentle nudge
   to snap a photo (snoozable to any length you want).

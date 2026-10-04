@@ -946,6 +946,7 @@ class ProximityForegroundService : LifecycleService() {
             val minutes = list.defaultRemindAfterTogetherMinutes ?: continue
             val key = "list:${list.id}"
             if (key in alreadyFired) continue
+            if (!listDefaultReminderHasOpenItems(list.id, ideas)) continue
             if (!listReminderThresholdCrossed(minutes, elapsedMillis)) continue
             if (Notifications.showListReminder(this, list.id, list.name)) {
                 newlyFired += key
@@ -1273,5 +1274,17 @@ class ProximityForegroundService : LifecycleService() {
          * about it is noise. Pure and internal so it can be unit-tested directly. */
         internal fun isReminderEligibleIdea(idea: com.ssbmedia.twogether.data.db.DateIdea): Boolean =
             !idea.deleted && !idea.done
+
+        /** Whether a list's own default "remind me after we're together" alert should fire. A list whose items
+         * have all been checked off has nothing left to remind about, so it stays quiet - the same rule the
+         * per-item reminder follows. A list with no items at all (or only deleted ones) is left as it was:
+         * the alert still fires, since it was never tied to any item being done. Pure and internal for tests. */
+        internal fun listDefaultReminderHasOpenItems(
+            listId: String,
+            ideas: List<com.ssbmedia.twogether.data.db.DateIdea>,
+        ): Boolean {
+            val liveItems = ideas.filter { it.listId == listId && !it.deleted }
+            return liveItems.isEmpty() || liveItems.any { isReminderEligibleIdea(it) }
+        }
     }
 }
