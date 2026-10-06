@@ -31,6 +31,8 @@ import androidx.exifinterface.media.ExifInterface
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.data.db.TogetherSession
+import com.ssbmedia.twogether.util.DateFormats
+import com.ssbmedia.twogether.util.RelativeTime
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.DatePickerField
@@ -79,6 +81,10 @@ fun GalleryImportHost(
     val scope = rememberCoroutineScope()
     val settings by ServiceLocator.settingsStore.settings.collectAsState(initial = AppSettings())
     val dayStartHour = settings.dayStartHour
+    // Sessions and last-seen time loaded when a photo is picked, so the date dialog can show what the app
+    // already tracked on the chosen day (see StatsCalculator.togetherOnDay).
+    var existingSessions by remember { mutableStateOf<List<TogetherSession>>(emptyList()) }
+    var lastSeenAt by remember { mutableStateOf(0L) }
     var pendingUri by remember { mutableStateOf<Uri?>(null) }
     var suggestedDate by remember { mutableStateOf<LocalDate?>(null) }
     // UX-FIX-PLAN.md Phase 2 item 12: the photo's own EXIF time-of-day (if it had one), kept separate
@@ -98,6 +104,10 @@ fun GalleryImportHost(
     val pickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null) {
             pendingUri = uri
+            scope.launch {
+                existingSessions = withContext(Dispatchers.IO) { ServiceLocator.sessionRepository.getAll() }
+                lastSeenAt = ServiceLocator.proximityStateStore.current().lastSeenAt
+            }
             val exifDateTime = readExifDateTime(context, uri)
             suggestedDate = exifDateTime?.date
             exifTime = exifDateTime?.time
@@ -113,10 +123,12 @@ fun GalleryImportHost(
         BackfillPhotoDateDialog(
             suggestedDate = suggestedDate,
             dayStartHour = dayStartHour,
+            existingSessions = existingSessions,
+            lastSeenAt = lastSeenAt,
             isSaving = isSaving,
             saveError = saveError,
             onDismiss = { if (!isSaving) pendingUri = null },
-            onConfirm = { date, togetherRange ->
+            onConfirm = { date, togetherRange, trackedAnchorMillis ->
                 isSaving = true
                 saveError = null
                 scope.launch {
@@ -154,10 +166,15 @@ fun GalleryImportHost(
                         // resolveImportedPhotoSessionId's own doc.
                         val allSessions = ServiceLocator.sessionRepository.getAll()
                         val lastSeenAt = ServiceLocator.proximityStateStore.current().lastSeenAt
+                        // "Use that time" with no manual copy: link the photo to the tracked session the window
+                        // starts in, so a photo whose own time falls outside that window still reads "Together".
+                        val trackedSessionId = trackedAnchorMillis?.let { anchor ->
+                            StatsCalculator.sessionContaining(allSessions, anchor, System.currentTimeMillis(), lastSeenAt)?.id
+                        }
                         val sessionIdForMoment = resolveImportedPhotoSessionId(
                             sessions = allSessions,
                             takenAt = takenAt,
-                            manualSessionId = manualSessionId,
+                            manualSessionId = manualSessionId ?: trackedSessionId,
                             lastSeenAt = lastSeenAt
                         )
                         ServiceLocator.momentRepository.add(savedFile.absolutePath, sessionIdForMoment, takenAt)
@@ -302,10 +319,12 @@ private fun extensionFor(resolver: ContentResolver, uri: Uri): String {
 private fun BackfillPhotoDateDialog(
     suggestedDate: LocalDate?,
     dayStartHour: Int,
+    existingSessions: List<TogetherSession>,
+    lastSeenAt: Long,
     isSaving: Boolean,
     saveError: String? = null,
     onDismiss: () -> Unit,
-    onConfirm: (LocalDate, Pair<Long, Long>?) -> Unit
+    onConfirm: (LocalDate, Pair<Long, Long>?, Long?) -> Unit
 ) {
     val zone = remember { ZoneId.systemDefault() }
     val today = remember { LocalDate.now(zone) }
@@ -318,6 +337,13 @@ private fun BackfillPhotoDateDialog(
     var wasTogether by remember { mutableStateOf(false) }
     var fromTime by remember { mutableStateOf(LocalTime.of(9, 0)) }
     var toTime by remember { mutableStateOf(LocalTime.of(10, 0)) }
+    // If the app already tracked together time on this day, offer that instead of adding a copy as a manual
+    // session. Unticking it falls back to the manual "We were together" entry below.
+    val tracked = remember(date, existingSessions, lastSeenAt, dayStartHour) {
+        StatsCalculator.togetherOnDay(existingSessions, date, zone, lastSeenAt, dayStartHour = dayStartHour)
+    }
+    var useTracked by remember(tracked) { mutableStateOf(tracked != null) }
+    val usingTracked = tracked != null && useTracked
 
     val dateError: String? = when {
         date.isAfter(today) -> "Date can't be in the future"
@@ -336,7 +362,7 @@ private fun BackfillPhotoDateDialog(
 
     // Only evaluated/shown when wasTogether is checked - a blank/invalid time range must never block
     // saving the photo itself, since the together-time part is optional.
-    val togetherError: String? = if (!wasTogether) null else when {
+    val togetherError: String? = if (!wasTogether || usingTracked) null else when {
         !toTime.isAfter(fromTime) -> "\"To\" must be after \"From\""
         nowTimeToday != null && toTime.isAfter(nowTimeToday) -> "\"To\" can't be later than the current time"
         else -> null
@@ -374,6 +400,25 @@ private fun BackfillPhotoDateDialog(
                     )
                 }
 
+                tracked?.let { t ->
+                    val zoneForTime = ZoneId.systemDefault()
+                    val from = DateFormats.formatTime(Instant.ofEpochMilli(t.firstStartMillis).atZone(zoneForTime).toLocalTime())
+                    val to = DateFormats.formatTime(Instant.ofEpochMilli(t.lastEndMillis).atZone(zoneForTime).toLocalTime())
+                    Text(
+                        "The app already tracked ${RelativeTime.formatDuration(t.totalMillis)} together that day, $from to $to.",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 12.dp)
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(checked = useTracked, onCheckedChange = { useTracked = it }, enabled = !isSaving)
+                        Text("Use that time (no copy added)", style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+
+                if (!usingTracked) {
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -413,6 +458,7 @@ private fun BackfillPhotoDateDialog(
                         )
                     }
                 }
+                }
                 saveError?.let {
                     Text(
                         it,
@@ -427,12 +473,12 @@ private fun BackfillPhotoDateDialog(
             TextButton(
                 enabled = error == null && !isSaving,
                 onClick = {
-                    val togetherRange = if (wasTogether) {
+                    val togetherRange = if (wasTogether && !usingTracked) {
                         val startedAt = date.atTime(fromTime).atZone(zone).toInstant().toEpochMilli()
                         val endedAt = date.atTime(toTime).atZone(zone).toInstant().toEpochMilli()
                         startedAt to endedAt
                     } else null
-                    onConfirm(date, togetherRange)
+                    onConfirm(date, togetherRange, if (usingTracked) tracked?.firstStartMillis else null)
                 }
             ) { Text(if (isSaving) "Saving…" else "Save") }
         },

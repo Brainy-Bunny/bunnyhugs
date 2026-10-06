@@ -560,6 +560,23 @@ object StatsCalculator {
         )
     }
 
+    /** The together window the app already tracked on [day] (a logical day, honouring [dayStartHour]), or null.
+     * Used by the photo-backfill dialog to offer the tracked time instead of creating a duplicate manual entry.
+     * Reuses [togetherToday] with `now` set to the last instant of [day], so the same clipping and absence rules
+     * apply as on the Home card. */
+    fun togetherOnDay(
+        sessions: List<TogetherSession>,
+        day: LocalDate,
+        zone: ZoneId = ZoneId.systemDefault(),
+        lastSeenAt: Long = 0L,
+        absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS,
+        dayStartHour: Int = 0
+    ): TogetherToday? {
+        val dayEnd = logicalDayStartMillis(day.plusDays(1), zone, dayStartHour) - 1
+        return togetherToday(sessions, now = dayEnd, zone = zone, lastSeenAt = lastSeenAt,
+            absenceTimeoutMillis = absenceTimeoutMillis, dayStartHour = dayStartHour)
+    }
+
     private fun computeDailyStreaks(qualifyingDays: Set<LocalDate>, today: LocalDate): Pair<Int, Int> {
         if (qualifyingDays.isEmpty()) return 0 to 0
 
