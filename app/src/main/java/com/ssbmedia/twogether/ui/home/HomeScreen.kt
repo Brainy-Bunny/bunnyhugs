@@ -1416,7 +1416,9 @@ private fun UsStatusCard(
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.padding(top = 8.dp)
                 )
-                if (todayTogether != null) {
+                // Under a minute (a clipped few-seconds stretch right after the day start) would read "0m", so
+                // it's left out - the card just shows "Apart right now" until there's a real amount to show.
+                if (todayTogether != null && todayTogether.totalMillis >= 60_000L) {
                     val zone = ZoneId.systemDefault()
                     val from = DateFormats.formatTime(Instant.ofEpochMilli(todayTogether.firstStartMillis).atZone(zone).toLocalTime())
                     val to = DateFormats.formatTime(Instant.ofEpochMilli(todayTogether.lastEndMillis).atZone(zone).toLocalTime())

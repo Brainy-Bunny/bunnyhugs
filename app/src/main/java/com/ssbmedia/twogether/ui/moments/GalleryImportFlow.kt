@@ -17,6 +17,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -28,6 +29,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.exifinterface.media.ExifInterface
 import com.ssbmedia.twogether.ServiceLocator
+import com.ssbmedia.twogether.data.datastore.AppSettings
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.events.AppEvents
 import com.ssbmedia.twogether.stats.StatsCalculator
@@ -75,6 +77,8 @@ fun GalleryImportHost(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val settings by ServiceLocator.settingsStore.settings.collectAsState(initial = AppSettings())
+    val dayStartHour = settings.dayStartHour
     var pendingUri by remember { mutableStateOf<Uri?>(null) }
     var suggestedDate by remember { mutableStateOf<LocalDate?>(null) }
     // UX-FIX-PLAN.md Phase 2 item 12: the photo's own EXIF time-of-day (if it had one), kept separate
@@ -108,6 +112,7 @@ fun GalleryImportHost(
     pendingUri?.let { uri ->
         BackfillPhotoDateDialog(
             suggestedDate = suggestedDate,
+            dayStartHour = dayStartHour,
             isSaving = isSaving,
             saveError = saveError,
             onDismiss = { if (!isSaving) pendingUri = null },
@@ -296,6 +301,7 @@ private fun extensionFor(resolver: ContentResolver, uri: Uri): String {
 @Composable
 private fun BackfillPhotoDateDialog(
     suggestedDate: LocalDate?,
+    dayStartHour: Int,
     isSaving: Boolean,
     saveError: String? = null,
     onDismiss: () -> Unit,
@@ -303,7 +309,12 @@ private fun BackfillPhotoDateDialog(
 ) {
     val zone = remember { ZoneId.systemDefault() }
     val today = remember { LocalDate.now(zone) }
-    var date by remember(suggestedDate) { mutableStateOf(suggestedDate ?: today) }
+    // The default suggestion is the logical day (so a late-night photo pre-fills the same day the app
+    // counts it under, with the user's day-start setting). The future rule below still uses the calendar
+    // today, same as CalendarScreen's backfill dialog, so a calendar-today entry before the day start is
+    // never blocked.
+    val logicalToday = remember(dayStartHour) { StatsCalculator.logicalDayOf(System.currentTimeMillis(), zone, dayStartHour) }
+    var date by remember(suggestedDate, logicalToday) { mutableStateOf(suggestedDate ?: logicalToday) }
     var wasTogether by remember { mutableStateOf(false) }
     var fromTime by remember { mutableStateOf(LocalTime.of(9, 0)) }
     var toTime by remember { mutableStateOf(LocalTime.of(10, 0)) }

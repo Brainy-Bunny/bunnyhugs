@@ -6,6 +6,8 @@ import com.ssbmedia.twogether.BuildConfig
 import com.ssbmedia.twogether.ServiceLocator
 import com.ssbmedia.twogether.notif.Notifications
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
@@ -78,7 +80,18 @@ object UpdateChecker {
      * versionCode than this build's own, downloads the release's APK asset and posts the "Update
      * available" notification. Never throws - every failure path is folded into [CheckOutcome].
      */
-    suspend fun checkAndNotify(context: Context): CheckOutcome = withContext(Dispatchers.IO) {
+    /** Serialises whole check-and-download runs. The app-start check, the foreground service's periodic check
+     * and UpdateWorker can all fire close together, and each one downloads into the same fixed `.part` file -
+     * without this, a second run could rename or delete the file the first run was still writing (seen on
+     * device as "NoSuchFileException: twogether-update.apk.part"). One at a time, so the second run simply
+     * waits and then finds the update already downloaded or up to date. */
+    private val checkLock = Mutex()
+
+    suspend fun checkAndNotify(context: Context): CheckOutcome = checkLock.withLock {
+        checkAndNotifyLocked(context)
+    }
+
+    private suspend fun checkAndNotifyLocked(context: Context): CheckOutcome = withContext(Dispatchers.IO) {
         // fetchLatestRelease() returning null is ambiguous between "network/parse failure" and "no
         // releases published yet" - both are correctly reported as CheckFailed to the manual-check
         // UI (there's nothing actionable to tell the user apart between those two cases).
