@@ -123,4 +123,21 @@ class UpdateCheckerUrlValidationAuditTest {
     fun `the exact release-asset CDN host is still trusted`() {
         assertTrue(isTrusted("https://objects.githubusercontent.com/some/signed/path/Twogether-2.5.apk"))
     }
+
+    /** Regression (v3.7): GitHub's current download redirect target for release assets. Rejecting it made
+     * every update download fail silently in the background and report "download manually" when checked. */
+    @Test
+    fun `release-assets-githubusercontent-com redirect target is trusted`() {
+        assertTrue(isTrusted("https://release-assets.githubusercontent.com/github-production-release-asset/1321206879/x?sig=abc"))
+    }
+
+    @Test
+    fun `a lookalike of release-assets host is rejected`() {
+        assertFalse(isTrusted("https://release-assets.githubusercontent.com.evil.net/Twogether-3.7.apk"))
+    }
+
+    @Test
+    fun `a subdomain of release-assets host that is not the exact host is rejected`() {
+        assertFalse(isTrusted("https://evil.release-assets.githubusercontent.com/Twogether-3.7.apk"))
+    }
 }

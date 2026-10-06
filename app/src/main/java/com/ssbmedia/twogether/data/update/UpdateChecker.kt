@@ -219,9 +219,16 @@ object UpdateChecker {
         // at `raw.githubusercontent.com/<their account>/.../evil.apk` and the old broad suffix accepted
         // it. Narrowed to the EXACT host `objects.githubusercontent.com` - the specific redirect-signing
         // CDN GitHub itself returns for a genuine release asset, never user-populated.
+        // FIX (v3.7 release-download regression): GitHub now redirects a release-asset download from
+        // github.com to `release-assets.githubusercontent.com` (the exact host seen in the 302 Location for
+        // this project's own releases). That hop was rejected by the check above, so every automatic and
+        // manual update download failed with "download it manually" and no notification was ever posted.
+        // Added as an exact host, same reasoning as objects.githubusercontent.com: release assets only,
+        // never user-populated raw/gist content.
         return uri.scheme.equals("https", ignoreCase = true) &&
             (host.equals("github.com", ignoreCase = true) ||
-                host.equals("objects.githubusercontent.com", ignoreCase = true))
+                host.equals("objects.githubusercontent.com", ignoreCase = true) ||
+                host.equals("release-assets.githubusercontent.com", ignoreCase = true))
     }
 
     private fun httpGetJson(urlString: String): JSONObject? {
