@@ -93,14 +93,14 @@ class SettingsViewModel : ViewModel() {
     val settings = ServiceLocator.settingsStore.settings
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), AppSettings())
 
-    fun setSnoozeMinutes(min: Int) {
-        viewModelScope.launch { ServiceLocator.settingsStore.setDefaultSnoozeMinutes(min) }
-    }
-
-    /** Item 24 (UX-FIX-PLAN.md): the "Photo reminder interval" row's Change dialog calls this - mirrors
-     * setSnoozeMinutes' own pattern exactly. */
+    /** Item 24 (UX-FIX-PLAN.md): the "Photo reminder interval" row's Change dialog calls this. */
     fun setPhotoReminderMinutes(minutes: Int) {
         viewModelScope.launch { ServiceLocator.settingsStore.setPhotoReminderMinutes(minutes) }
+    }
+
+    /** The "Snooze length" row's Change dialog calls this. */
+    fun setSnoozeMinutes(minutes: Int) {
+        viewModelScope.launch { ServiceLocator.settingsStore.setDefaultSnoozeMinutes(minutes) }
     }
 
     /** Reunion-count non-retroactivity feature: the "Together-timer grace window" row's Change dialog
@@ -339,8 +339,8 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
     // with zero friction, without needing to know the existing PIN at all. See PinVerifyPurpose's doc.
     var pinVerifyPurpose by remember { mutableStateOf<PinVerifyPurpose?>(null) }
     var showUnpairConfirm by remember { mutableStateOf(false) }
-    var showSnoozeDialog by remember { mutableStateOf(false) }
     var showPhotoReminderDialog by remember { mutableStateOf(false) }
+    var showSnoozeDialog by remember { mutableStateOf(false) }
     var showSessionGraceDialog by remember { mutableStateOf(false) }
     var showReunionThresholdDialog by remember { mutableStateOf(false) }
     var showDayStartDialog by remember { mutableStateOf(false) }
@@ -453,11 +453,11 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                     Switch(checked = settings.notificationsEnabled, onCheckedChange = { vm.setNotificationsEnabled(it) })
                 }
                 // Item 24 (UX-FIX-PLAN.md): was hardcoded at 15 minutes - now configurable, same UI
-                // pattern as "Default snooze length" right below it.
+                // pattern as the rows around it.
                 SettingsRow(label = "Photo reminder interval", subtitle = "${settings.photoReminderMinutes} minutes") {
                     TextButton(onClick = { showPhotoReminderDialog = true }) { Text("Change") }
                 }
-                SettingsRow(label = "Default snooze length", subtitle = "${settings.defaultSnoozeMinutes} minutes") {
+                SettingsRow(label = "Snooze length", subtitle = "${settings.defaultSnoozeMinutes} minutes") {
                     TextButton(onClick = { showSnoozeDialog = true }) { Text("Change") }
                 }
             }
@@ -781,7 +781,7 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
     }
 
     if (showSnoozeDialog) {
-        SnoozeDefaultDialog(
+        SnoozeLengthDialog(
             current = settings.defaultSnoozeMinutes,
             onDismiss = { showSnoozeDialog = false },
             onSave = { vm.setSnoozeMinutes(it); showSnoozeDialog = false }
@@ -1024,19 +1024,26 @@ private fun EditPartnerInfoDialog(
     )
 }
 
+/** How long the photo alarm waits after a snooze before ringing again. Clamped to 1-720 minutes. */
 @Composable
-private fun SnoozeDefaultDialog(current: Int, onDismiss: () -> Unit, onSave: (Int) -> Unit) {
+private fun SnoozeLengthDialog(current: Int, onDismiss: () -> Unit, onSave: (Int) -> Unit) {
     var text by remember { mutableStateOf(current.toString()) }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Default snooze length") },
+        title = { Text("Snooze length") },
         text = {
-            OutlinedTextField(
-                value = text,
-                onValueChange = { text = it.filter { c -> c.isDigit() }.take(4) },
-                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.Number),
-                modifier = Modifier.fillMaxWidth()
-            )
+            Column {
+                Text(
+                    "How long Snooze holds the photo alarm before it rings again, if no photo has been taken.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it.filter { c -> c.isDigit() }.take(4) },
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                )
+            }
         },
         confirmButton = { TextButton(onClick = { onSave((text.toIntOrNull() ?: current).coerceIn(1, 720)) }) { Text("Save") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
@@ -1044,7 +1051,7 @@ private fun SnoozeDefaultDialog(current: Int, onDismiss: () -> Unit, onSave: (In
 }
 
 /** Item 24 (UX-FIX-PLAN.md): "Photo reminder interval" - the configurable replacement for the old
- * hardcoded 15-minute photo nudge. Same input pattern as [SnoozeDefaultDialog] right above it. */
+ * hardcoded 15-minute photo nudge. */
 @Composable
 private fun PhotoReminderDialog(current: Int, onDismiss: () -> Unit, onSave: (Int) -> Unit) {
     var text by remember { mutableStateOf(current.toString()) }
@@ -1072,7 +1079,7 @@ private fun PhotoReminderDialog(current: Int, onDismiss: () -> Unit, onSave: (In
 
 /** Reunion-count non-retroactivity feature: "Together-timer grace window" - the configurable replacement
  * for the old hardcoded ProximityForegroundService.SESSION_GRACE_MILLIS (10 min). Same input pattern as
- * [PhotoReminderDialog]/[SnoozeDefaultDialog] above it. Purely a live setting (see
+ * [PhotoReminderDialog] above it. Purely a live setting (see
  * AppSettings.sessionGraceMinutes' own doc) - no non-retroactivity copy needed here, unlike
  * [ReunionThresholdDialog] below. */
 @Composable
@@ -1102,7 +1109,7 @@ private fun SessionGraceDialog(current: Int, onDismiss: () -> Unit, onSave: (Int
 
 /** Reunion-count non-retroactivity feature: "Reunion threshold" - the configurable replacement for the
  * old hardcoded StatsCalculator.REUNION_GAP_MILLIS (60 min). Same input pattern as [PhotoReminderDialog]/
- * [SnoozeDefaultDialog] above it, but with an explicit non-retroactivity disclosure in the body copy -
+ * [PhotoReminderDialog] above it, but with an explicit non-retroactivity disclosure in the body copy -
  * this is the one setting in the app where a user could reasonably (and wrongly) expect their whole
  * history to be reinterpreted under the new value, so the UI says outright that it won't be. See
  * AppSettings.reunionThresholdMinutes' own doc for the full guarantee this copy is describing. */

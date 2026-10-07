@@ -55,4 +55,18 @@ class ReminderEligibilityTest {
     @Test fun emptyListStillFires() {
         assertTrue(ProximityForegroundService.listDefaultReminderHasOpenItems("L1", emptyList()))
     }
+
+    /** The photo-alarm-as-alarm spec: an expired snooze rings again as a normal snooze while still together. */
+    @Test fun expiredSnoozeRingsAgainWhileTogether() {
+        assertTrue(ProximityForegroundService.isStillTogetherForSnoozeRing(isTogether = true))
+    }
+
+    /** The reported case: snoozed for 10, actually apart by the time it runs out. One final "you missed your
+     * chance" ring, no snooze option. Fable review round 2: this must NOT be swallowed by the session-grace
+     * window (pendingApartSince > 0) - that window defaults to about the same length as the snooze itself,
+     * which made this branch unreachable in practice. isTogether alone is the right signal: the state machine
+     * only flips it after absenceTimeoutMillis (~100s) of confirmed absence, so it's already debounced. */
+    @Test fun expiredSnoozeIsFinalRingWhenGenuinelyApart() {
+        assertFalse(ProximityForegroundService.isStillTogetherForSnoozeRing(isTogether = false))
+    }
 }

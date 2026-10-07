@@ -909,7 +909,7 @@ object BackupManager {
 
             val s = parsed.settingsJson
             ServiceLocator.settingsStore.restoreRaw(
-                defaultSnoozeMinutes = s.optInt("defaultSnoozeMinutes", 15),
+                defaultSnoozeMinutes = s.optInt("defaultSnoozeMinutes", 10),
                 notificationsEnabled = s.optBoolean("notificationsEnabled", true),
                 pinHash = null,
                 pinEnabled = false,

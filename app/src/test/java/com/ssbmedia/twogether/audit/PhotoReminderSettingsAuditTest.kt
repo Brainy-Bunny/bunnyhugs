@@ -57,7 +57,7 @@ class PhotoReminderSettingsAuditTest {
         // Sanity: an unrelated field with its own key untouched here still reads its own default -
         // guards against a copy/paste key-mixup inside fromPreferences accidentally wiring
         // PHOTO_REMINDER_MINUTES to some other field, or vice versa.
-        assertEquals(15, settings.defaultSnoozeMinutes)
+        assertEquals(10, settings.defaultSnoozeMinutes)
         assertEquals(true, settings.notificationsEnabled)
     }
 }

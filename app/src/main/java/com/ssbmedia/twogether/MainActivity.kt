@@ -80,6 +80,9 @@ class MainActivity : FragmentActivity() {
         RestorePickerHost.launchPicker = { restorePickerLauncher.launch(arrayOf("*/*")) }
 
         if (intent?.getBooleanExtra(Notifications.EXTRA_OPEN_CAMERA, false) == true) {
+            // Tapping the photo alarm opens the camera, so the ring stops here. A photo taken from it still
+            // counts through MomentRepository.add.
+            com.ssbmedia.twogether.notif.AlarmRinger.stop()
             cameraTrigger.intValue = 1
         }
         intent?.getStringExtra(Notifications.EXTRA_OPEN_MILESTONE_ID)?.let { milestoneTrigger.value = it }
@@ -254,6 +257,7 @@ class MainActivity : FragmentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         if (intent.getBooleanExtra(Notifications.EXTRA_OPEN_CAMERA, false)) {
+            com.ssbmedia.twogether.notif.AlarmRinger.stop()
             cameraTrigger.intValue += 1
         }
         intent.getStringExtra(Notifications.EXTRA_OPEN_MILESTONE_ID)?.let { milestoneTrigger.value = it }

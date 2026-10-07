@@ -47,6 +47,6 @@ class BiometricUnlockSettingsAuditTest {
         val settings = SettingsStore.fromPreferences(prefs)
         assertEquals(true, settings.biometricUnlockEnabled)
         assertFalse(settings.pinEnabled)
-        assertEquals(15, settings.defaultSnoozeMinutes)
+        assertEquals(10, settings.defaultSnoozeMinutes)
     }
 }

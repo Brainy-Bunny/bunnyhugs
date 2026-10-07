@@ -32,12 +32,17 @@ object Notifications {
      * Disturb access (ACCESS_NOTIFICATION_POLICY / NotificationManager.isNotificationPolicyAccessGranted) -
      * see util/DndAccess.kt and the item-22 notification-inbox panel, which explicitly asks for that grant
      * rather than silently relying on this flag alone. */
-    const val CHANNEL_REMINDERS = "reminders_v2"
+    const val CHANNEL_REMINDERS = "reminders_v3"
+    /** The v2 channel (IMPORTANCE_HIGH, notification sound). Replaced by v3 so the photo reminder can ring on the
+     * alarm audio stream - channel sound can't change in place. Deleted in ensureChannels(). */
+    private const val CHANNEL_REMINDERS_V2 = "reminders_v2"
     /** The pre-item-23 channel id (IMPORTANCE_DEFAULT, no DND bypass) - see CHANNEL_REMINDERS' own doc for
      * why this can't just be upgraded in place. Deleted in ensureChannels() on every app start;
      * deleteNotificationChannel is a harmless no-op for an install that never had this channel. */
     private const val CHANNEL_REMINDERS_LEGACY = "reminders"
     const val CHANNEL_MILESTONES = "milestones"
+    /** The photo-reminder alarm's own silent channel - see AlarmRinger for the sound. */
+    const val CHANNEL_PHOTO_ALARM = "photo_alarm_v1"
     /** Item 14 (update-nag reach fix): bumped from IMPORTANCE_DEFAULT to IMPORTANCE_HIGH so a granted-
      * permission "Update available" notification actually heads-up-pops instead of sitting quietly in
      * the shade - a real user shipped v2.7 (a genuine data-loss bug fix) and went days without noticing
@@ -153,6 +158,16 @@ object Notifications {
                     .build()
             )
         }
+        // The photo reminder is an alarm (see AlarmRinger), which plays its own looping sound and vibration. This
+        // channel is silent so the sound isn't doubled up by the notification.
+        val photoAlarmChannel = NotificationChannel(
+            CHANNEL_PHOTO_ALARM, "Photo alarm", NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "Rings when you've been together a while and haven't taken a photo yet"
+            setSound(null, null)
+            enableVibration(false)
+            setBypassDnd(true)
+        }
         val milestoneChannel = NotificationChannel(
             CHANNEL_MILESTONES, "Anniversaries & milestones", NotificationManager.IMPORTANCE_DEFAULT
         ).apply {
@@ -181,6 +196,7 @@ object Notifications {
         }
         manager.createNotificationChannel(statusChannel)
         manager.createNotificationChannel(reminderChannel)
+        manager.createNotificationChannel(photoAlarmChannel)
         manager.createNotificationChannel(milestoneChannel)
         manager.createNotificationChannel(updatesChannel)
         manager.createNotificationChannel(batteryChannel)
@@ -194,6 +210,7 @@ object Notifications {
         // See CHANNEL_REMINDERS_LEGACY's doc - same reasoning, for the old DEFAULT-importance "reminders"
         // channel this item-23 loud/DND-bypassing channel replaces.
         manager.deleteNotificationChannel(CHANNEL_REMINDERS_LEGACY)
+        manager.deleteNotificationChannel(CHANNEL_REMINDERS_V2)
     }
 
     fun buildStatusNotification(context: Context, contentText: String): Notification {
@@ -222,7 +239,7 @@ object Notifications {
      * a hardcoded "15 minutes". Returns true iff the reminder was actually posted, so callers don't mark
      * a one-per-session reminder as "fired" when nothing was shown (e.g. notification permission denied
      * on API 33+). */
-    fun showPhotoReminder(context: Context, minutes: Int): Boolean {
+    fun showPhotoReminder(context: Context, minutes: Int, snoozeMinutes: Int, apart: Boolean = false): Boolean {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return false
 
         val cameraIntent = Intent(context, MainActivity::class.java).apply {
@@ -234,22 +251,24 @@ object Notifications {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val snoozeIntent = Intent(context, SnoozeActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK
-        }
-        val snoozePendingIntent = PendingIntent.getActivity(
-            context, 2, snoozeIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
         val minutesLabel = if (minutes == 1) "1 minute" else "$minutes minutes"
-        val notification = NotificationCompat.Builder(context, CHANNEL_REMINDERS)
+        val builder = NotificationCompat.Builder(context, CHANNEL_PHOTO_ALARM)
             .setSmallIcon(R.drawable.ic_notification_heart)
-            .setContentTitle("You've been together for $minutesLabel 💛")
-            .setContentText("Snap a photo?")
             .setAutoCancel(true)
             .setContentIntent(cameraPendingIntent)
-            .addAction(0, "Snooze", snoozePendingIntent)
+            // Swiping the alarm away silences it, same as Stop.
+            .setDeleteIntent(actionIntent(context, SnoozeActivity.ACTION_STOP, 4))
+        if (apart) {
+            // Last ring: the chance has passed, so there's nothing to snooze and nothing to stop.
+            builder.setContentTitle("You're apart now 💔")
+                .setContentText("You missed your chance to take a photo together.")
+        } else {
+            builder.setContentTitle("You've been together for $minutesLabel 💛")
+                .setContentText("Snap a photo? Snooze for $snoozeMinutes min, or stop.")
+                .addAction(0, "Snooze $snoozeMinutes min", actionIntent(context, SnoozeActivity.ACTION_SNOOZE, 2))
+                .addAction(0, "Stop", actionIntent(context, SnoozeActivity.ACTION_STOP, 3))
+        }
+        val notification = builder
             // UX-FIX-PLAN.md Phase 3 item 23: CATEGORY_REMINDER (tells the system/OEM what KIND of
             // notification this is, independent of the channel's own importance) + PRIORITY_HIGH (the
             // pre-O fallback NotificationCompat still reads on API < 26, harmless no-op on this app's real
@@ -264,7 +283,21 @@ object Notifications {
         // session's one-shot reminder as "fired" when nothing was actually shown.
         if (!BlePermissions.hasNotificationPermission(context)) return false
         manager.notify(REMINDER_NOTIFICATION_ID, notification)
+        AlarmRinger.start(context)
         return true
+    }
+
+    /** A notification button that opens [SnoozeActivity] with [action] (ACTION_SNOOZE or ACTION_STOP). That activity
+     * has no screen of its own; it acts on the tap and closes. */
+    private fun actionIntent(context: Context, action: String, requestCode: Int): PendingIntent {
+        val intent = Intent(context, SnoozeActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            putExtra(SnoozeActivity.EXTRA_ACTION, action)
+        }
+        return PendingIntent.getActivity(
+            context, requestCode, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
     }
 
     fun cancelPhotoReminder(context: Context) {

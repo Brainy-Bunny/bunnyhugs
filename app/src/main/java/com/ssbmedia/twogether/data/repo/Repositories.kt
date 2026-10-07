@@ -2,6 +2,11 @@ package com.ssbmedia.twogether.data.repo
 
 import android.content.Context
 import androidx.room.withTransaction
+import com.ssbmedia.twogether.ServiceLocator
+import com.ssbmedia.twogether.data.datastore.afterPhotoTaken
+import com.ssbmedia.twogether.data.datastore.isPhotoForThisStretch
+import com.ssbmedia.twogether.notif.AlarmRinger
+import com.ssbmedia.twogether.notif.Notifications
 import com.ssbmedia.twogether.data.db.AppDatabase
 import com.ssbmedia.twogether.data.db.DEFAULT_LIST_ID
 import com.ssbmedia.twogether.data.db.DateIdea
@@ -568,8 +573,17 @@ class MomentRepository(private val dao: MomentDao, private val context: Context)
      * (GalleryImportFlow) passes the date the user picked instead, so the resulting Moment groups under
      * that PAST day everywhere takenAt is read (MomentsScreen's day grouping, CalendarScreen's
      * daysWithPhotos), never under today. */
-    suspend fun add(photoUri: String, sessionId: Long?, takenAt: Long = System.currentTimeMillis()): Long =
-        dao.insert(Moment(photoUri = photoUri, takenAt = takenAt, sessionId = sessionId, updatedAt = System.currentTimeMillis()))
+    suspend fun add(photoUri: String, sessionId: Long?, takenAt: Long = System.currentTimeMillis()): Long {
+        val id = dao.insert(Moment(photoUri = photoUri, takenAt = takenAt, sessionId = sessionId, updatedAt = System.currentTimeMillis()))
+        // A photo from this together-stretch stops the photo alarm. An older photo (a gallery backfill) doesn't -
+        // see isPhotoForThisStretch.
+        if (ServiceLocator.proximityStateStore.current().isPhotoForThisStretch(takenAt)) {
+            ServiceLocator.proximityStateStore.update { it.afterPhotoTaken(takenAt) }
+            AlarmRinger.stop()
+            Notifications.cancelPhotoReminder(context)
+        }
+        return id
+    }
 
     /** Feature 2: called once GattSyncManager has fully received a photo's bytes, written them to a temp
      * file, and successfully renamed that into place at the Moment's real photoUri - see

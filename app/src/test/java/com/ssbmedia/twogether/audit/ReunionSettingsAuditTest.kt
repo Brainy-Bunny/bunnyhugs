@@ -53,7 +53,7 @@ class ReunionSettingsAuditTest {
         // Sanity: an unrelated sibling default is untouched - guards against a copy/paste key-mixup
         // accidentally wiring one of these two new keys to some other field, or vice versa.
         assertEquals(15, settings.photoReminderMinutes)
-        assertEquals(15, settings.defaultSnoozeMinutes)
+        assertEquals(10, settings.defaultSnoozeMinutes)
     }
 
     @Test

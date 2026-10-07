@@ -28,6 +28,7 @@ import com.ssbmedia.twogether.badges.BadgeCatalog
 import com.ssbmedia.twogether.data.datastore.ProximityPersistedState
 import com.ssbmedia.twogether.data.update.UpdateChecker
 import com.ssbmedia.twogether.events.AppEvents
+import com.ssbmedia.twogether.notif.AlarmRinger
 import com.ssbmedia.twogether.notif.Notifications
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.util.BatteryOptimization
@@ -424,10 +425,12 @@ class ProximityForegroundService : LifecycleService() {
             checkGraceExpiry(now)
         }
 
+        // The photo reminder runs even when apart: a snooze that runs out while we're apart still gets its
+        // one final "you missed it" ring (see checkPhotoReminder). Everything else inside it is together-only.
+        checkPhotoReminder(now)
         if (stateMachine.isTogether) {
-            checkPhotoReminder(now)
             // Item 24 (UX-FIX-PLAN.md): same "only while genuinely together" gate as the photo reminder
-            // just above - see checkListReminders' own doc.
+            // - see checkListReminders' own doc.
             checkListReminders(now)
         }
 
@@ -740,8 +743,11 @@ class ProximityForegroundService : LifecycleService() {
                 // value rather than the untouched original.
                 continuousTogetherSince = continuousTogetherSinceMillis,
                 currentSessionId = sessionId,
-                reminderFiredForSession = false,
-                snoozeUntil = 0L,
+                // Resuming inside the grace window (a short Bluetooth dropout) keeps this stretch's reminder state, so
+                // a Stop or an already-rung alarm stays done. A genuinely new stretch starts unfired, except that a
+                // pending snooze still covers it, so the threshold doesn't ring a second time.
+                reminderFiredForSession = if (resumableSession != null) it.reminderFiredForSession else it.snoozeUntil > 0L,
+                snoozeUntil = it.snoozeUntil,
                 pendingApartSince = 0L,
                 pendingReunionCelebration = it.pendingReunionCelebration || isReunion,
                 // Item 24 (UX-FIX-PLAN.md): a fresh continuous-together session gets a clean slate of
@@ -815,8 +821,10 @@ class ProximityForegroundService : LifecycleService() {
                 // here in the (edge-case) event there was no open session to begin with, so this can never
                 // drift to point at nothing.
                 currentSessionId = if (openSession != null) it.currentSessionId else -1L,
-                reminderFiredForSession = false,
-                snoozeUntil = 0L,
+                // reminderFiredForSession is left alone here: a split may be a short dropout that resumes inside the
+                // grace window, and the resume path above decides it for a genuinely new stretch.
+                // A pending snooze survives the split: it still rings if its time runs out while we're apart.
+                snoozeUntil = it.snoozeUntil,
                 // A reunion celebration that was never displayed belongs to the together-stretch that just
                 // ended. Clearing it here stops it from firing on a later app open taken while apart, or
                 // from carrying over into an unrelated future together-stretch (HomeScreen's own guard
@@ -830,6 +838,10 @@ class ProximityForegroundService : LifecycleService() {
             )
         }
         Notifications.cancelPhotoReminder(this)
+        // Fable review, round 2: without this, a partner walking away within RING_LIMIT_MILLIS (2 min) of the
+        // alarm firing left the sound looping with no Snooze/Stop/swipe affordance left to silence it - the
+        // notification above is gone, but the ringer kept going until its own auto-stop timer.
+        AlarmRinger.stop()
         gattReadyForSession = false
         gattSync.stopServer()
         gattSync.disconnectClient()
@@ -876,6 +888,27 @@ class ProximityForegroundService : LifecycleService() {
         val settings = ServiceLocator.settingsStore.current()
         if (!settings.notificationsEnabled) return
         val persisted = ServiceLocator.proximityStateStore.current()
+
+        // A snooze that has run out. Still together: ring again, with snooze options. Parted in the meantime:
+        // one final ring saying the chance has passed, with no snooze. Only consume the snooze once it actually
+        // posted (same POST_NOTIFICATIONS retry reasoning as the first reminder below).
+        // Deliberately NOT using pendingApartSince/the session-grace window here (Fable review, round 2): that
+        // window is ~10 minutes by default, the same order of magnitude as the snooze itself, so treating
+        // "inside grace" as "still together" made the final apart ring effectively unreachable with default
+        // settings - a genuinely-apart user kept getting the normal ring with Snooze/Stop buttons instead. Plain
+        // isTogether is already debounced upstream (the state machine only flips it after absenceTimeoutMillis,
+        // ~100s, of confirmed absence - see handleBecameApart's own comment), so there's no "instant blip" risk
+        // in reading it directly here.
+        if (persisted.snoozeUntil > 0L && now >= persisted.snoozeUntil) {
+            val posted = if (isStillTogetherForSnoozeRing(persisted.isTogether)) {
+                Notifications.showPhotoReminder(this, settings.photoReminderMinutes, settings.defaultSnoozeMinutes)
+            } else {
+                Notifications.showPhotoReminder(this, settings.photoReminderMinutes, snoozeMinutes = 0, apart = true)
+            }
+            if (posted) ServiceLocator.proximityStateStore.update { it.copy(snoozeUntil = 0L) }
+            return
+        }
+
         if (!persisted.isTogether || persisted.continuousTogetherSince <= 0L) return
 
         // Item 24 (UX-FIX-PLAN.md): was a hardcoded FIFTEEN_MINUTES_MILLIS constant - now reads the
@@ -883,19 +916,13 @@ class ProximityForegroundService : LifecycleService() {
         // coerceAtLeast(1) is defensive against a stray 0/negative value (shouldn't normally happen, the
         // Settings dialog itself validates) ever making this fire immediately/every tick.
         val reminderThresholdMillis = settings.photoReminderMinutes.coerceAtLeast(1) * 60_000L
-        if (!persisted.reminderFiredForSession) {
-            if (now - persisted.continuousTogetherSince >= reminderThresholdMillis) {
-                // Only consume the one-per-session reminder if it actually posted (e.g. not silently
-                // skipped for lack of POST_NOTIFICATIONS) - otherwise a denied permission would burn
-                // this session's only reminder for nothing, and the ticker naturally retries every 5s
-                // until permission is granted or the session ends.
-                if (Notifications.showPhotoReminder(this, settings.photoReminderMinutes)) {
-                    ServiceLocator.proximityStateStore.update { it.copy(reminderFiredForSession = true) }
-                }
-            }
-        } else if (persisted.snoozeUntil > 0L && now >= persisted.snoozeUntil) {
-            if (Notifications.showPhotoReminder(this, settings.photoReminderMinutes)) {
-                ServiceLocator.proximityStateStore.update { it.copy(snoozeUntil = 0L) }
+        if (!persisted.reminderFiredForSession && now - persisted.continuousTogetherSince >= reminderThresholdMillis) {
+            // Only consume the one-per-session reminder if it actually posted (e.g. not silently skipped for
+            // lack of POST_NOTIFICATIONS) - otherwise a denied permission would burn this session's only
+            // reminder for nothing, and the ticker naturally retries every 5s until permission is granted or
+            // the session ends.
+            if (Notifications.showPhotoReminder(this, settings.photoReminderMinutes, settings.defaultSnoozeMinutes)) {
+                ServiceLocator.proximityStateStore.update { it.copy(reminderFiredForSession = true) }
             }
         }
     }
@@ -1286,5 +1313,13 @@ class ProximityForegroundService : LifecycleService() {
             val liveItems = ideas.filter { it.listId == listId && !it.deleted }
             return liveItems.isEmpty() || liveItems.any { isReminderEligibleIdea(it) }
         }
+
+        /** Whether an expired photo-alarm snooze should ring again as a normal snooze (with "Snooze"/"Stop"
+         * buttons) rather than as the final no-buttons "you're apart now, you missed your chance" ring. Just
+         * [isTogether] - see checkPhotoReminder's own doc on why this deliberately does NOT also treat
+         * pendingApartSince > 0 (inside the session-grace window) as "still together": that window defaults to
+         * about the same length as the snooze itself, which made the final ring practically unreachable (Fable
+         * review, round 2). Pure and internal so it can be unit-tested directly. */
+        internal fun isStillTogetherForSnoozeRing(isTogether: Boolean): Boolean = isTogether
     }
 }

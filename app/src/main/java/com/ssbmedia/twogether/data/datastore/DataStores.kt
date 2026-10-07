@@ -423,7 +423,7 @@ class PairingStore(private val context: Context) {
 enum class ThemeMode { SYSTEM, LIGHT, DARK }
 
 data class AppSettings(
-    val defaultSnoozeMinutes: Int = 15,
+    val defaultSnoozeMinutes: Int = 10,
     val notificationsEnabled: Boolean = true,
     val pinHash: String? = null,
     val pinEnabled: Boolean = false,
@@ -601,7 +601,7 @@ class SettingsStore(private val context: Context) {
          * photoReminderMinutes; see PhotoReminderSettingsAuditTest for the round-trip coverage this
          * enables. */
         internal fun fromPreferences(p: Preferences): AppSettings = AppSettings(
-            defaultSnoozeMinutes = p[Keys.SNOOZE_MIN] ?: 15,
+            defaultSnoozeMinutes = p[Keys.SNOOZE_MIN] ?: 10,
             notificationsEnabled = p[Keys.NOTIFS] ?: true,
             pinHash = p[Keys.PIN_HASH],
             pinEnabled = p[Keys.PIN_ENABLED] ?: false,
@@ -1070,6 +1070,17 @@ class ProximityStateStore(private val context: Context) {
         }
     }
 }
+
+/** True when a photo taken at [takenAt] belongs to the current together-stretch, i.e. it was taken at or after the
+ * moment this stretch began. Earlier photos (a gallery backfill of an older day) don't count, so they can't stop the
+ * photo alarm. */
+fun ProximityPersistedState.isPhotoForThisStretch(takenAt: Long): Boolean =
+    continuousTogetherSince > 0L && takenAt >= continuousTogetherSince
+
+/** Pure rule behind "a photo from this stretch stops the photo alarm": cancels any pending snooze and marks this
+ * stretch's reminder as done. Any other photo returns the state unchanged. Kept separate so it's unit-testable. */
+fun ProximityPersistedState.afterPhotoTaken(takenAt: Long): ProximityPersistedState =
+    if (isPhotoForThisStretch(takenAt)) copy(snoozeUntil = 0L, reminderFiredForSession = true) else this
 
 /** Persists the first-unlocked-at timestamp for each badge (keyed by Badge.id), so the Badges screen
  * can show "locked vs unlocked with unlock date" instead of just "Unlocked" with no date - BadgeCatalog
