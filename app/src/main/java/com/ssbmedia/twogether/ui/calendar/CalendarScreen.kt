@@ -62,6 +62,7 @@ import com.ssbmedia.twogether.data.db.DayNote
 import com.ssbmedia.twogether.data.db.Milestone
 import com.ssbmedia.twogether.data.db.TogetherSession
 import com.ssbmedia.twogether.ui.milestones.safeDateForYear
+import com.ssbmedia.twogether.ble.GattSyncManager
 import com.ssbmedia.twogether.ble.ProximityStateMachine
 import com.ssbmedia.twogether.stats.StatsCalculator
 import com.ssbmedia.twogether.ui.components.DatePickerField
@@ -212,8 +213,14 @@ fun CalendarScreen(
     val daysWithPhotos = remember(moments, dayStartHour) {
         moments.map { StatsCalculator.logicalDayOf(it.takenAt, zone, dayStartHour) }.toSet()
     }
+    // Bucketed via daySegments (every day the entry actually credits), NOT logicalDayOf(startedAt) alone -
+    // otherwise an overnight/early-morning manual entry would draw its dot on a day whose minute total and
+    // detail list (both daySegments-based) show nothing, the exact self-contradiction the day-detail dialog
+    // is meant to avoid.
     val daysWithManualEntry = remember(sessions, dayStartHour) {
-        sessions.filter { it.isManual }.map { StatsCalculator.logicalDayOf(it.startedAt, zone, dayStartHour) }.toSet()
+        sessions.filter { it.isManual }.flatMap { s ->
+            StatsCalculator.daySegments(s.startedAt, s.endedAt ?: s.startedAt, zone, dayStartHour).map { it.date }
+        }.toSet()
     }
     // UX-FIX-PLAN.md Phase 4 item 25: [DayNote.date] is already an epoch-day Long, so this is a plain
     // wrap rather than a zone-derived conversion like the maps above.
@@ -428,15 +435,30 @@ fun CalendarScreen(
                         Text("No sessions", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
                     } else {
                         daySessions.forEach { s ->
-                            val start = Instant.ofEpochMilli(s.startedAt).atZone(zone).toLocalTime()
-                            val end = s.endedAt?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalTime() }
+                            val startZdt = Instant.ofEpochMilli(s.startedAt).atZone(zone)
+                            val endZdt = s.endedAt?.let { Instant.ofEpochMilli(it).atZone(zone) }
                             val manualTag = if (s.isManual) " (added manually)" else ""
+                            // A session is shown UNCLIPPED on every logical day it touches (see
+                            // sessionsOverlapping), so for an overnight that spans more than one calendar
+                            // day the bare "9:00 AM – 10:00 AM" would read as a short same-day session on
+                            // both days. Show the date on each end in that case so it's unambiguous.
+                            val spansDays = endZdt != null && startZdt.toLocalDate() != endZdt.toLocalDate()
+                            val startLabel = if (spansDays) {
+                                "${DateFormats.formatDate(startZdt.toLocalDate())} ${DateFormats.formatTime(startZdt.toLocalTime())}"
+                            } else {
+                                DateFormats.formatTime(startZdt.toLocalTime())
+                            }
+                            val endLabel = when {
+                                endZdt == null -> "now"
+                                spansDays -> "${DateFormats.formatDate(endZdt.toLocalDate())} ${DateFormats.formatTime(endZdt.toLocalTime())}"
+                                else -> DateFormats.formatTime(endZdt.toLocalTime())
+                            }
                             Row(
                                 modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    "• ${DateFormats.formatTime(start)} – ${end?.let { DateFormats.formatTime(it) } ?: "now"}$manualTag",
+                                    "• $startLabel – $endLabel$manualTag",
                                     style = MaterialTheme.typography.bodySmall,
                                     modifier = Modifier.weight(1f)
                                 )
@@ -872,18 +894,20 @@ private fun sessionsOverlapping(
 ): List<DaySessionRow> {
     // The logical day's window (see StatsCalculator.logicalDayOf), not calendar midnight, so the detail list
     // agrees with the grid's day-together dots for the same cell.
-    val dayStart = StatsCalculator.logicalDayStartMillis(day, zone, dayStartHour)
-    val dayEnd = StatsCalculator.logicalDayStartMillis(day.plusDays(1), zone, dayStartHour)
     val now = System.currentTimeMillis()
-    val overlapping = sessions.filter { s ->
-        // Same clamp as StatsCalculator.effectiveOpenSessionEnd: an open session's displayed end must
-        // never be credited past its newest confirmed sighting + the absence timeout. Computed per row
-        // because the no-lastSeenAt fallback is bounded by that row's own startedAt.
-        val end = s.endedAt ?: StatsCalculator.effectiveOpenSessionEnd(s.startedAt, now, lastSeenAt)
-        s.startedAt < dayEnd && end > dayStart
-    }
-    val (manual, nonManual) = overlapping.partition { it.isManual }
-    val manualRows = manual.map { DaySessionRow(it.startedAt, it.endedAt, isManual = true, manualSession = it) }
+    // "Belongs to this day" goes through the SAME per-day bucketing (StatsCalculator.daySegments) the grid
+    // dots and every stat use - so the detail list can never show a session a day's dot doesn't (or vice
+    // versa) across the midnight-split / pre-dawn-fold overnight rule. Membership is by the credited day;
+    // the row itself still shows the session's true unclipped span. The open-session end is clamped the
+    // same way StatsCalculator.effectiveOpenSessionEnd does (never past the newest sighting + absence
+    // timeout), computed per row since the no-lastSeenAt fallback is bounded by that row's own startedAt.
+    fun touchesDay(startedAt: Long, end: Long): Boolean =
+        StatsCalculator.daySegments(startedAt, end, zone, dayStartHour).any { it.date == day }
+
+    val (manual, nonManual) = sessions.partition { it.isManual }
+    val manualRows = manual.filter { s ->
+        touchesDay(s.startedAt, s.endedAt ?: StatsCalculator.effectiveOpenSessionEnd(s.startedAt, now, lastSeenAt))
+    }.map { DaySessionRow(it.startedAt, it.endedAt, isManual = true, manualSession = it) }
     // A merged interval's end always comes out as a concrete clamped timestamp (mergedIntervals clamps
     // every open row's end via effectiveOpenSessionEnd internally) - but the ORIGINAL per-row render
     // showed "now" (endedAt = null) for a session still actively in progress, not a clock time. A merged
@@ -893,6 +917,7 @@ private fun sessionsOverlapping(
         .map { StatsCalculator.effectiveOpenSessionEnd(it.startedAt, now, lastSeenAt) }
         .toSet()
     val mergedNonManualRows = StatsCalculator.mergedIntervals(nonManual, now, lastSeenAt, ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS)
+        .filter { touchesDay(it.start, it.end) }
         .map { DaySessionRow(it.start, if (it.end in openEnds) null else it.end, isManual = false, manualSession = null) }
     return (manualRows + mergedNonManualRows).sortedBy { it.startedAt }
 }
@@ -913,17 +938,27 @@ private fun sessionsOverlapping(
  * midnight the moment someone edits an unrelated field. [existing] null means "add"; non-null means "edit",
  * pre-filling date/start/end from its startedAt/endedAt and switching the title/confirm-button copy.
  *
- * Still capped at one calendar day (end time must be on the same date, after the start time) - same
- * invariant the old midnight+duration shape enforced structurally, now enforced by validation instead
- * since a picker can't express "spans past midnight" here in the first place.
+ * Overnight / multi-day (user request): the END has its OWN date field, so a session can legitimately
+ * run past midnight (e.g. an overnight stay, 11:04 AM Fri -> 12:49 PM Sat, or a weekend away) instead of
+ * being capped to one calendar day as it was before. The span is still bounded to
+ * [GattSyncManager.MAX_PLAUSIBLE_SESSION_DURATION_MILLIS] (30 days): a locally-added entry longer than
+ * that would be silently dropped by [StatsCalculator.mergedIntervals] (and rejected by the sync/backup
+ * validators), so it would count toward nothing - the picker's own maxDate plus the error backstop make
+ * that un-enterable here in the first place.
+ *
+ * [onSaveAnother], when non-null (the Manual-entries manager's bulk flow), adds a secondary
+ * "Save & add another" action that persists the entry and resets the times for the next one WITHOUT
+ * dismissing, so several past sessions can be punched in back-to-back. The plain Calendar caller leaves
+ * it null and gets the single Add/Save + Cancel shape.
  */
 @Composable
-private fun AddManualSessionDialog(
+internal fun AddManualSessionDialog(
     zone: ZoneId,
     dayStartHour: Int,
     existing: TogetherSession? = null,
     onDismiss: () -> Unit,
-    onSave: (startedAt: Long, endedAt: Long) -> Unit
+    onSave: (startedAt: Long, endedAt: Long) -> Unit,
+    onSaveAnother: ((startedAt: Long, endedAt: Long) -> Unit)? = null
 ) {
     // Pre-selected date follows the logical day, so at 1 AM the default is still the day the couple is in.
     // The pre-selected date is the logical day (before the day start it is still yesterday's day), but the
@@ -934,8 +969,9 @@ private fun AddManualSessionDialog(
     val existingStart = remember(existing) { existing?.let { Instant.ofEpochMilli(it.startedAt).atZone(zone) } }
     val existingEnd = remember(existing) { existing?.endedAt?.let { Instant.ofEpochMilli(it).atZone(zone) } }
 
-    var date by remember { mutableStateOf(existingStart?.toLocalDate() ?: today) }
+    var startDate by remember { mutableStateOf(existingStart?.toLocalDate() ?: today) }
     var startTime by remember { mutableStateOf(existingStart?.toLocalTime() ?: LocalTime.of(9, 0)) }
+    var endDate by remember { mutableStateOf(existingEnd?.toLocalDate() ?: existingStart?.toLocalDate() ?: today) }
     var endTime by remember { mutableStateOf(existingEnd?.toLocalTime() ?: LocalTime.of(10, 0)) }
 
     // MINOR fix (test-code-allmodels final clean-room pass, Opus): this dialog previously had no lower
@@ -950,19 +986,26 @@ private fun AddManualSessionDialog(
     val minPlausibleDate = remember {
         Instant.ofEpochMilli(SessionBoundsValidator.MIN_PLAUSIBLE_TIMESTAMP_MILLIS).atZone(zone).toLocalDate()
     }
+    val maxSpanDays = remember { GattSyncManager.MAX_PLAUSIBLE_SESSION_DURATION_MILLIS / (24L * 60 * 60 * 1000) }
 
-    // For a same-day (today) entry, an end time later than the actual current wall-clock time must be
-    // rejected rather than silently clipped - same reasoning as this dialog always had, just re-expressed
-    // against a real end TIME instead of a duration-from-midnight.
-    // Wall-clock cap applies only to the calendar date it actually is now. The logical "today" (before the day
-    // start) can be yesterday's calendar date, whose evening times are all in the past and must not be capped.
-    val nowTimeToday = remember(date) { if (date == LocalDate.now(zone)) LocalTime.now(zone) else null }
+    val startMillis = startDate.atTime(startTime).atZone(zone).toInstant().toEpochMilli()
+    val endMillis = endDate.atTime(endTime).atZone(zone).toInstant().toEpochMilli()
+    val now = System.currentTimeMillis()
 
     val error: String? = when {
-        date.isAfter(calendarToday) -> "Date can't be in the future"
-        date.isBefore(minPlausibleDate) -> "Date can't be before ${DateFormats.formatDateLong(minPlausibleDate)}"
-        !endTime.isAfter(startTime) -> "End time must be after start time"
-        nowTimeToday != null && endTime.isAfter(nowTimeToday) -> "End time can't be later than the current time"
+        startDate.isAfter(calendarToday) -> "Start date can't be in the future"
+        startDate.isBefore(minPlausibleDate) -> "Date can't be before ${DateFormats.formatDateLong(minPlausibleDate)}"
+        // Check the exact instant, not just the date: west of UTC the earliest tappable date can still map
+        // to a startMillis below MIN_PLAUSIBLE, which StatsCalculator.mergedIntervals would silently drop.
+        startMillis < SessionBoundsValidator.MIN_PLAUSIBLE_TIMESTAMP_MILLIS -> "Date can't be before ${DateFormats.formatDateLong(minPlausibleDate)}"
+        endDate.isBefore(startDate) -> "End date can't be before the start date"
+        endMillis <= startMillis -> "End must be after the start"
+        // A future START time on today's date would otherwise fall through to the end-time check and show
+        // the misleading "End can't be later than now" - name the real problem.
+        startMillis > now -> "Start can't be in the future"
+        endMillis > now -> "End can't be later than now"
+        endMillis - startMillis > GattSyncManager.MAX_PLAUSIBLE_SESSION_DURATION_MILLIS ->
+            "A single entry can't be longer than $maxSpanDays days"
         else -> null
     }
 
@@ -972,47 +1015,70 @@ private fun AddManualSessionDialog(
         text = {
             Column {
                 Text(
-                    "For time together before you installed the app, or a day it missed.",
+                    "For time together before you installed the app, or a day it missed. " +
+                        "An overnight can run into the next day: just set the end date.",
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(bottom = 12.dp)
                 )
                 DatePickerField(
-                    label = "Date",
-                    date = date,
-                    onDateChange = { date = it },
+                    label = "Start date",
+                    date = startDate,
+                    onDateChange = {
+                        startDate = it
+                        // Keep the end from ever sitting before the start as the start moves forward.
+                        if (endDate.isBefore(it)) endDate = it
+                    },
                     minDate = minPlausibleDate,
                     maxDate = calendarToday,
                     modifier = Modifier.fillMaxWidth()
                 )
-                Row(modifier = Modifier.fillMaxWidth().padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TimePickerField(
-                        label = "Start",
-                        time = startTime,
-                        onTimeChange = { startTime = it },
-                        modifier = Modifier.weight(1f)
-                    )
-                    TimePickerField(
-                        label = "End",
-                        time = endTime,
-                        onTimeChange = { endTime = it },
-                        modifier = Modifier.weight(1f)
-                    )
-                }
+                TimePickerField(
+                    label = "Start time",
+                    time = startTime,
+                    onTimeChange = { startTime = it },
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                )
+                DatePickerField(
+                    label = "End date",
+                    date = endDate,
+                    onDateChange = { endDate = it },
+                    // End can be the same day or later, never earlier, and never so far out that the span
+                    // exceeds the 30-day plausibility cap the stats/sync layers enforce.
+                    minDate = startDate,
+                    maxDate = minOf(calendarToday, startDate.plusDays(maxSpanDays)),
+                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp)
+                )
+                TimePickerField(
+                    label = "End time",
+                    time = endTime,
+                    onTimeChange = { endTime = it },
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                )
                 error?.let {
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
                 }
             }
         },
         confirmButton = {
-            TextButton(
-                enabled = error == null,
-                onClick = {
-                    val startedAt = date.atTime(startTime).atZone(zone).toInstant().toEpochMilli()
-                    val endedAt = date.atTime(endTime).atZone(zone).toInstant().toEpochMilli()
-                    onSave(startedAt, endedAt)
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (onSaveAnother != null && existing == null) {
+                    TextButton(
+                        enabled = error == null,
+                        onClick = {
+                            onSaveAnother(startMillis, endMillis)
+                            // Reset the times for the next entry but keep the dates - a bulk backfill is
+                            // usually several sessions around the same era/day.
+                            startTime = LocalTime.of(9, 0)
+                            endTime = LocalTime.of(10, 0)
+                        }
+                    ) { Text("Save & add another") }
                 }
-            ) { Text(if (existing == null) "Add" else "Save") }
+                TextButton(
+                    enabled = error == null,
+                    onClick = { onSave(startMillis, endMillis) }
+                ) { Text(if (existing == null) "Add" else "Save") }
+            }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+        dismissButton = { TextButton(onClick = onDismiss) { Text(if (onSaveAnother != null && existing == null) "Done" else "Cancel") } }
     )
 }

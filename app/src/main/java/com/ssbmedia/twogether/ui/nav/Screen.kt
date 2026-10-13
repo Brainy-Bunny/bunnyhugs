@@ -57,6 +57,10 @@ sealed class Screen(val route: String) {
     data object Milestones : Screen("milestones")
     data object Settings : Screen("settings")
 
+    /** Persistent, synced manager for all manually-backfilled sessions: add (single or several in a row),
+     * review every manual entry in one place, edit or delete a wrong one. Reached from Settings. */
+    data object ManualEntries : Screen("manual_entries")
+
     /** Feature 1: "Hours together" card drill-down - a horizontally-paged bar chart of hours/day. */
     data object HoursDetail : Screen("hours_detail")
 

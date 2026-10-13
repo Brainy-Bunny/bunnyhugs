@@ -308,7 +308,7 @@ class SettingsViewModel : ViewModel() {
 }
 
 @Composable
-fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
+fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit, onOpenManualEntries: () -> Unit = {}) {
     val vm: SettingsViewModel = viewModel(factory = SimpleViewModelFactory { SettingsViewModel() })
     val settings by vm.settings.collectAsState()
     var partnerName by remember { mutableStateOf("") }
@@ -481,9 +481,15 @@ fun SettingsScreen(onBack: () -> Unit, onUnpaired: () -> Unit) {
                 }
                 SettingsRow(
                     label = "Day starts at",
-                    subtitle = "A new day begins at ${DateFormats.formatTime(java.time.LocalTime.of(settings.dayStartHour, 0))}, so a late night still counts as one day. Only affects how days are counted on this phone."
+                    subtitle = "A late night that ends before ${DateFormats.formatTime(java.time.LocalTime.of(settings.dayStartHour, 0))} still counts as the day before; a real overnight (still together past it) splits at midnight. Only affects how days are counted on this phone."
                 ) {
                     TextButton(onClick = { showDayStartDialog = true }) { Text("Change") }
+                }
+                SettingsRow(
+                    label = "Manual entries",
+                    subtitle = "Add past time together, one by one or several in a row, and review, fix or delete any entry. Shared with your partner."
+                ) {
+                    TextButton(onClick = onOpenManualEntries) { Text("Open") }
                 }
             }
 
@@ -1156,7 +1162,7 @@ private fun DayStartDialog(current: Int, onDismiss: () -> Unit, onSave: (Int) ->
         text = {
             Column {
                 Text(
-                    "Stats and streaks count a day from this time to the same time the next morning. Pick 12:00 AM for calendar midnight.",
+                    "A late night that ends before this time counts as the day before, so an evening out past midnight stays one day. A real overnight (still together past this time) splits at midnight instead, giving each date its own time. Pick 12:00 AM to always split at midnight.",
                     style = MaterialTheme.typography.bodySmall
                 )
                 Column(

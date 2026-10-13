@@ -84,14 +84,29 @@ class DayStartHourTest {
     }
 
     @Test
-    fun togetherToday_clipsToNowAndDayStart() {
-        // Session 3:00 AM to 6:00 AM Sat, now 5:00 AM: only 4:00-5:00 AM is inside the day that started at 4 AM.
+    fun togetherToday_earlyMorningSession_clipsToNowNotDayStart() {
+        // Session 3:00-6:00 AM Sat, now 5:00 AM. This session STARTS on Saturday and runs past the 4 AM
+        // day start, so it is Saturday's (not a pre-dawn tail of a Friday overnight folding back) - all of
+        // 3:00 AM onward counts toward today, clipped to now: 3:00-5:00 AM = 2h. (The old 4 AM-clip rule
+        // would have shown only 4:00-5:00; the new midnight/fold rule credits the whole session's day.)
         val s = session(t(2026, 10, 3, 3, 0), t(2026, 10, 3, 6, 0))
         val today = StatsCalculator.togetherToday(listOf(s), now = t(2026, 10, 3, 5, 0), zone = ist, dayStartHour = 4)
         assertNotNull(today)
-        assertEquals(60L * 60_000L, today!!.totalMillis)
-        assertEquals(t(2026, 10, 3, 4, 0), today.firstStartMillis)
+        assertEquals(120L * 60_000L, today!!.totalMillis)
+        assertEquals(t(2026, 10, 3, 3, 0), today.firstStartMillis)
         assertEquals(t(2026, 10, 3, 5, 0), today.lastEndMillis)
+    }
+
+    @Test
+    fun togetherToday_ongoingOvernight_countsFromMidnight() {
+        // A real overnight, Fri 6 PM -> Sat 10 AM, now Sat 10 AM. Because it ran past the 4 AM day start it
+        // is a genuine overnight, so Saturday is credited from MIDNIGHT (not 4 AM): 00:00-10:00 = 10h.
+        val s = session(t(2026, 10, 2, 18, 0), t(2026, 10, 3, 10, 0))
+        val today = StatsCalculator.togetherToday(listOf(s), now = t(2026, 10, 3, 10, 0), zone = ist, dayStartHour = 4)
+        assertNotNull(today)
+        assertEquals(600L * 60_000L, today!!.totalMillis)
+        assertEquals(t(2026, 10, 3, 0, 0), today.firstStartMillis)
+        assertEquals(t(2026, 10, 3, 10, 0), today.lastEndMillis)
     }
 
     @Test
@@ -106,14 +121,34 @@ class DayStartHourTest {
     }
 
     @Test
-    fun sessionSpanningThreeLogicalDays_splitsAtEachDayStart() {
-        // Oct 2 10:00 AM to Oct 4 10:00 AM with a 4 AM day start:
-        // Oct 2 gets 10:00 AM -> Oct 3 4:00 AM = 18h, Oct 3 gets a full 24h, Oct 4 gets 4:00 AM -> 10:00 AM = 6h.
+    fun sessionSpanningThreeDays_splitsAtMidnight() {
+        // Oct 2 10:00 AM to Oct 4 10:00 AM, 4 AM day start. A continuous multi-day stay splits at MIDNIGHT
+        // (it's a real overnight each night): Oct 2 = 10:00 AM -> midnight = 14h, Oct 3 = a full 24h,
+        // Oct 4 = midnight -> 10:00 AM = 10h (ends well past 4 AM, so nothing folds back).
         val s = session(t(2026, 10, 2, 10, 0), t(2026, 10, 4, 10, 0))
         val map = StatsCalculator.buildDailyMinuteMap(listOf(s), zone = ist, dayStartHour = 4)
-        assertEquals(1080L, map[LocalDate.of(2026, 10, 2)])
+        assertEquals(840L, map[LocalDate.of(2026, 10, 2)])
         assertEquals(1440L, map[LocalDate.of(2026, 10, 3)])
-        assertEquals(360L, map[LocalDate.of(2026, 10, 4)])
+        assertEquals(600L, map[LocalDate.of(2026, 10, 4)])
+    }
+
+    @Test
+    fun overnightIntoNextDay_splitsAtMidnight_notDayStart() {
+        // The user's sleepover case: Fri 6 PM -> Sat 12:49 PM, 4 AM day start. Because it is still together
+        // past 4 AM it is a genuine overnight, so it splits at MIDNIGHT: Friday 6 PM->midnight = 6h (360m),
+        // Saturday midnight->12:49 PM = 12h49m (769m). NOT the old 4 AM split (which gave Friday until 4 AM).
+        val s = session(t(2026, 10, 2, 18, 0), t(2026, 10, 3, 12, 49))
+        val map = StatsCalculator.buildDailyMinuteMap(listOf(s), zone = ist, dayStartHour = 4)
+        assertEquals(setOf(LocalDate.of(2026, 10, 2), LocalDate.of(2026, 10, 3)), map.keys)
+        assertEquals(360L, map[LocalDate.of(2026, 10, 2)])
+        assertEquals(769L, map[LocalDate.of(2026, 10, 3)])
+    }
+
+    @Test
+    fun overnightIntoNextDay_countsAsTwoTogetherDays() {
+        val s = session(t(2026, 10, 2, 18, 0), t(2026, 10, 3, 12, 49))
+        val stats = StatsCalculator.compute(listOf(s), now = t(2026, 10, 3, 13, 0), zone = ist, dayStartHour = 4)
+        assertEquals(2, stats.totalDaysTogether)
     }
 
     @Test

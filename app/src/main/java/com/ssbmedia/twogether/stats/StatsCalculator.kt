@@ -185,6 +185,48 @@ object StatsCalculator {
     internal fun logicalDayStartMillis(day: LocalDate, zone: ZoneId, dayStartHour: Int): Long =
         day.atTime(dayStartHour.coerceIn(0, 23), 0).atZone(zone).toInstant().toEpochMilli()
 
+    /** One per-day slice of a together-interval: the logical [date] its minutes are credited to, and the
+     * millis sub-range [[start], [end]) on that date. See [daySegments]. */
+    internal data class DaySegment(val date: LocalDate, val start: Long, val end: Long)
+
+    /**
+     * Splits the interval [[start], [end]) into per-day slices under the "overnight" rule the user chose:
+     * slices break at CALENDAR MIDNIGHT, so a genuine overnight (still together into the next morning)
+     * credits each calendar day from midnight - e.g. a sleepover Fri 6 PM -> Sat 12:49 PM gives Friday
+     * 6 PM->midnight and Saturday midnight->12:49 PM.
+     *
+     * The one exception is a late night that fizzles out in the small hours: if the interval's FINAL
+     * slice ends before [dayStartHour] (e.g. a date night home by 1 AM, with the 4 AM default), that
+     * trailing slice is folded back onto the previous calendar day, so the night still counts as a single
+     * day rather than spilling a sliver onto the next date. [dayStartHour] is therefore ONLY ever a
+     * fold-back threshold here, never the split point. Only the final slice can ever qualify - every
+     * earlier slice ends exactly at a midnight by construction.
+     *
+     * Consistency guarantees this file leans on:
+     *  - For the final (possibly still-open) slice ending at `now`, this credits the same day as
+     *    [logicalDayOf]`(now, dayStartHour)` (the fold threshold IS that boundary), so the live "current
+     *    day" the streak and Home card use never disagrees with how an ongoing session is bucketed.
+     *  - With [dayStartHour] 0 (plain calendar midnight) nothing can ever fold, so this reduces EXACTLY to
+     *    the old calendar-day split - every existing non-4-AM caller/test is unaffected.
+     */
+    internal fun daySegments(start: Long, end: Long, zone: ZoneId, dayStartHour: Int): List<DaySegment> {
+        if (end <= start) return emptyList()
+        val segments = mutableListOf<DaySegment>()
+        var cursor = start
+        while (cursor < end) {
+            val calDate = logicalDayOf(cursor, zone, 0)
+            val nextMidnight = logicalDayStartMillis(calDate.plusDays(1), zone, 0)
+            val segEnd = minOf(end, nextMidnight)
+            segments.add(DaySegment(calDate, cursor, segEnd))
+            cursor = segEnd
+        }
+        val last = segments.last()
+        if (last.end <= logicalDayStartMillis(last.date, zone, dayStartHour)) {
+            segments[segments.lastIndex] = last.copy(date = last.date.minusDays(1))
+        }
+        return segments
+    }
+
     fun compute(
         sessions: List<TogetherSession>,
         now: Long = System.currentTimeMillis(),
@@ -250,11 +292,23 @@ object StatsCalculator {
         // real together-time already inside the new week/month - a real, reproducible under-count on
         // every single week rollover. See StatsCalculatorAuditTest's "BUG - totalHoursThisWeek..." test.
         val today = logicalDayOf(now, zone, dayStartHour)
-        val startOfWeek = logicalDayStartMillis(today.with(java.time.DayOfWeek.MONDAY), zone, dayStartHour)
         val startOfMonth = logicalDayStartMillis(today.withDayOfMonth(1), zone, dayStartHour)
 
-        val totalHoursThisWeek = merged.sumOf { clippedIntervalMillis(it, startOfWeek, now) } / 3_600_000.0
-        val totalHoursThisMonth = merged.sumOf { clippedIntervalMillis(it, startOfMonth, now) } / 3_600_000.0
+        // totalHoursThisWeek/Month are summed from the SAME per-day bucketing (daySegments) the Calendar
+        // and the daily map use, NOT a raw clip at the dayStartHour week/month boundary. Otherwise, with a
+        // non-midnight day start, an overnight straddling the week/month boundary would attribute the
+        // aggregate "this week/month" hours differently from the per-day view - a real
+        // two-numbers-on-one-screen mismatch, since the Stats screen shows totalHoursThisMonth right next
+        // to mostHoursMonth (which comes from the daily map) and MonthlyDetail charts the daily map. Slices
+        // are clipped to `now` so an open session can't count past it, and coerced non-negative. At
+        // dayStartHour 0 this reduces exactly to the old millis clip at calendar midnight.
+        val weekStartDate = today.with(java.time.DayOfWeek.MONDAY)
+        val daySlices = merged.flatMap { daySegments(it.start, it.end, zone, dayStartHour) }
+        fun hoursFrom(fromDateInclusive: LocalDate): Double =
+            daySlices.filter { !it.date.isBefore(fromDateInclusive) && !it.date.isAfter(today) }
+                .sumOf { (minOf(it.end, now) - it.start).coerceAtLeast(0L) } / 3_600_000.0
+        val totalHoursThisWeek = hoursFrom(weekStartDate)
+        val totalHoursThisMonth = hoursFrom(today.withDayOfMonth(1))
 
         val minutesPerDay = buildDailyMinuteMap(sessions, now, zone, lastSeenAt, absenceTimeoutMillis, dayStartHour)
 
@@ -462,10 +516,10 @@ object StatsCalculator {
         return (end - start).coerceAtLeast(0L)
     }
 
-    /** Splits every (overlap-merged) together-interval across the logical days it spans and sums
-     * minutes-together per day. Public so the Calendar screen can reuse it. A session running past
-     * midnight but not past [dayStartHour] stays in ONE day here - that is the whole point of the
-     * configurable day start (see [logicalDayOf]). */
+    /** Splits every (overlap-merged) together-interval across the days it spans (see [daySegments] for the
+     * exact midnight-split / pre-dawn-tail-fold rule) and sums minutes-together per day. Public so the
+     * Calendar screen can reuse it. A genuine overnight splits at midnight so each date is credited from
+     * midnight; a late night that ends before [dayStartHour] still counts as the single starting day. */
     fun buildDailyMinuteMap(
         sessions: List<TogetherSession>,
         now: Long = System.currentTimeMillis(),
@@ -479,14 +533,8 @@ object StatsCalculator {
         val merged = mergedIntervals(sessions, now, lastSeenAt, absenceTimeoutMillis)
         val map = HashMap<LocalDate, Long>()
         for (interval in merged) {
-            var cursor = interval.start
-            while (cursor < interval.end) {
-                val day = logicalDayOf(cursor, zone, dayStartHour)
-                val dayEndMillis = logicalDayStartMillis(day.plusDays(1), zone, dayStartHour)
-                val segmentEnd = minOf(interval.end, dayEndMillis)
-                val minutes = (segmentEnd - cursor) / 60_000L
-                map[day] = (map[day] ?: 0L) + minutes
-                cursor = segmentEnd
+            for (seg in daySegments(interval.start, interval.end, zone, dayStartHour)) {
+                map[seg.date] = (map[seg.date] ?: 0L) + (seg.end - seg.start) / 60_000L
             }
         }
         return map
@@ -548,15 +596,21 @@ object StatsCalculator {
         absenceTimeoutMillis: Long = ProximityStateMachine.DEFAULT_ABSENCE_TIMEOUT_MILLIS,
         dayStartHour: Int = 0
     ): TogetherToday? {
-        val dayStart = logicalDayStartMillis(logicalDayOf(now, zone, dayStartHour), zone, dayStartHour)
-        val clipped = mergedIntervals(sessions, now, lastSeenAt, absenceTimeoutMillis)
-            .filter { it.end > dayStart && it.start < now }
-            .map { Interval(maxOf(it.start, dayStart), minOf(it.end, now)) }
-        if (clipped.isEmpty()) return null
+        val targetDay = logicalDayOf(now, zone, dayStartHour)
+        // The slices the day-bucketing (see daySegments) credits to today's logical day, clipped to now,
+        // so the Home "together today" card always matches exactly what Calendar/stats attribute to this
+        // same day - overnight rule included (an ongoing overnight counts today from midnight, not 4 AM).
+        val slices = mergedIntervals(sessions, now, lastSeenAt, absenceTimeoutMillis)
+            .flatMap { daySegments(it.start, it.end, zone, dayStartHour) }
+            .filter { it.date == targetDay }
+            .map { Interval(it.start, minOf(it.end, now)) }
+            .filter { it.end > it.start }
+            .sortedBy { it.start }
+        if (slices.isEmpty()) return null
         return TogetherToday(
-            totalMillis = clipped.sumOf { it.end - it.start },
-            firstStartMillis = clipped.first().start,
-            lastEndMillis = clipped.last().end
+            totalMillis = slices.sumOf { it.end - it.start },
+            firstStartMillis = slices.first().start,
+            lastEndMillis = slices.last().end
         )
     }
 

@@ -31,6 +31,7 @@ import com.ssbmedia.twogether.ui.home.HomeScreen
 import com.ssbmedia.twogether.ui.milestones.MilestonesScreen
 import com.ssbmedia.twogether.ui.moments.MomentsScreen
 import com.ssbmedia.twogether.ui.settings.SettingsScreen
+import com.ssbmedia.twogether.ui.manual.ManualEntriesScreen
 import com.ssbmedia.twogether.ui.stats.FavoriteDayDetailScreen
 import com.ssbmedia.twogether.ui.stats.GapsDetailScreen
 import com.ssbmedia.twogether.ui.stats.HoursDetailScreen
@@ -318,7 +319,16 @@ fun TwogetherNavHost(
                     onOpenCalendar = { day -> navController.navigate(Screen.Calendar.withArgs(jumpToEpochDay = day)) }
                 )
             }
-            composable(Screen.Settings.route) { SettingsScreen(onBack = { navController.popBackStack() }, onUnpaired = onUnpaired) }
+            composable(Screen.Settings.route) {
+                SettingsScreen(
+                    onBack = { navController.popBackStack() },
+                    onUnpaired = onUnpaired,
+                    onOpenManualEntries = { navController.navigate(Screen.ManualEntries.route) }
+                )
+            }
+            composable(Screen.ManualEntries.route) {
+                ManualEntriesScreen(onBack = { navController.popBackStack() })
+            }
             composable(Screen.Camera.route) {
                 CameraScreen(
                     onSaved = { navController.popBackStack(Screen.Home.route, false) },
