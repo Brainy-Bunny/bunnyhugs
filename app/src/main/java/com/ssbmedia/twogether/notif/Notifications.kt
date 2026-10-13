@@ -256,6 +256,12 @@ object Notifications {
             .setSmallIcon(R.drawable.ic_notification_heart)
             .setAutoCancel(true)
             .setContentIntent(cameraPendingIntent)
+            // VISIBILITY_PUBLIC so the alarm's title and its Snooze/Stop buttons stay fully visible on the
+            // lock screen even when the phone is set to hide sensitive notification content there - the whole
+            // point of the alarm is to be acted on without unlocking. The channel's own lockscreenVisibility is
+            // left at the default VISIBILITY_NO_OVERRIDE (ensureChannels never sets it), so this per-notification
+            // value is the one the system honours. There is nothing private in a "take a photo together" nudge.
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             // Swiping the alarm away silences it, same as Stop.
             .setDeleteIntent(actionIntent(context, SnoozeActivity.ACTION_STOP, 4))
         if (apart) {

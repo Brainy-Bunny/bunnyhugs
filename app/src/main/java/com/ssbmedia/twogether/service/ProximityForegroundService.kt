@@ -772,6 +772,16 @@ class ProximityForegroundService : LifecycleService() {
             AppEvents.emitReunion()
         }
 
+        // A photo alarm left over from the stretch that just ended is no longer relevant now the couple is
+        // back together. Specifically the "You're apart now 💔, you missed your chance" final ring:
+        // checkPhotoReminder posts that AFTER handleBecameApart has already run (once a snooze expires while
+        // still apart), so handleBecameApart's own cancel couldn't have cleared it - it only gets cleared here,
+        // on reunion. Without this it sat in the tray (and, within AlarmRinger's 2-min ring limit, kept
+        // sounding) right through the reunion until the next threshold ring happened to replace it. Clearing
+        // both the notification and the ringer. (Fable v3.11 live-test observation, fixed in v3.12.)
+        Notifications.cancelPhotoReminder(this)
+        AlarmRinger.stop()
+
         startGattSyncIfNeeded(device, tieBreak)
         updateNotification(now)
     }
