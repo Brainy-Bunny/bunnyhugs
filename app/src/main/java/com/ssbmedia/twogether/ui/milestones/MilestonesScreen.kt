@@ -59,6 +59,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -245,7 +246,8 @@ fun MilestonesScreen(
         } else {
             LazyColumn(
                 modifier = Modifier.fillMaxSize().padding(padding),
-                contentPadding = PaddingValues(16.dp),
+                // Bottom inset so the Add FAB never covers the last milestone's actions (FAB ~56dp + margin).
+                contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 88.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 items(milestones, key = { it.id }) { milestone ->
@@ -298,7 +300,9 @@ fun MilestonesScreen(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
+                            // weight(1f) so a long label can never push the Edit/Delete icons (the Row
+                            // below) off the card edge where they'd be clipped and unreachable.
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
                                 if (hasLinkedPhoto) {
                                     // MINOR fix (independent audit): this was a bare `model = photoUri`
                                     // with no cache-bust key at all - PhotoEditor.cacheBustKey's own doc
@@ -319,7 +323,7 @@ fun MilestonesScreen(
                                     )
                                 }
                                 Column(modifier = Modifier.padding(start = if (hasLinkedPhoto) 10.dp else 0.dp)) {
-                                    Text(milestone.label, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                                    Text(milestone.label, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                     Text(
                                         text = monthDayLabel(milestone.month, milestone.day) + (milestone.year?.let { " · since $it" } ?: ""),
                                         style = MaterialTheme.typography.bodySmall
@@ -411,7 +415,7 @@ private fun AddMilestoneDialog(
         onDismissRequest = onDismiss,
         title = { Text("Add a milestone") },
         text = {
-            Column {
+            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                 OutlinedTextField(
                     value = label,
                     onValueChange = { label = it },
@@ -609,7 +613,7 @@ private fun EditMilestoneDialog(
         onDismissRequest = onDismiss,
         title = { Text("Edit milestone") },
         text = {
-            Column {
+            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                 OutlinedTextField(
                     value = label,
                     onValueChange = { label = it },

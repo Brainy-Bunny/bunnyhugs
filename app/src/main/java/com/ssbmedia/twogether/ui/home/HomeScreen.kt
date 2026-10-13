@@ -6,6 +6,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
@@ -991,7 +993,7 @@ fun HomeScreen(
             onDismissRequest = {},
             title = { Text("Is this your partner?") },
             text = {
-                Column {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                     Text(
                         "A device tried to use your pairing code but doesn't match who ${
                             pairingInfo.partnerName.ifBlank { "your partner" }
@@ -1481,8 +1483,10 @@ private fun NotificationInboxSheet(
     onItemClick: (InboxItemKind) -> Unit
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
+        // Scrollable: the inbox can hold several cards at once (permission + battery + DND + pairing +
+        // resync + update), which on a short phone would otherwise clip the last card off the sheet.
         Column(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Text("Notifications", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)

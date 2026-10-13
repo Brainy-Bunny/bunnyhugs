@@ -333,7 +333,8 @@ fun OurListsScreen(
             } else {
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(16.dp),
+                    // Bottom inset so the New-list FAB never covers the last list's actions (FAB ~56dp + margin).
+                    contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 88.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     items(lists, key = { it.id }) { list ->

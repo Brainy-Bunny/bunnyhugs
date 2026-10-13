@@ -266,7 +266,9 @@ fun MomentsScreen(
                             } while (event.changes.any { it.pressed })
                         }
                     },
-                contentPadding = PaddingValues(16.dp),
+                // Bottom inset clears the stacked gallery + camera FABs so the last day's photos/actions
+                // aren't hidden behind them (SmallFAB 40 + 12 gap + FAB 56 + 16 margin = 124, so 128dp).
+                contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 128.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 grouped.forEach { (day, dayMoments) ->

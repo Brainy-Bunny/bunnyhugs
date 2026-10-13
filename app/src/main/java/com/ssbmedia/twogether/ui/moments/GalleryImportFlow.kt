@@ -7,6 +7,8 @@ import android.webkit.MimeTypeMap
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -373,7 +375,9 @@ private fun BackfillPhotoDateDialog(
         onDismissRequest = { if (!isSaving) onDismiss() },
         title = { Text("When was this taken?") },
         text = {
-            Column {
+            // Scrollable so the From/To pickers and any error text stay reachable on a short screen
+            // (the "we were together" branch makes this body tall) - a dialog text slot doesn't scroll.
+            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                 Text(
                     if (suggestedDate != null) {
                         "We read this date from the photo - edit it if it's wrong."

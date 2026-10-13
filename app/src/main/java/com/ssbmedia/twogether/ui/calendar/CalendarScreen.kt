@@ -3,19 +3,19 @@ package com.ssbmedia.twogether.ui.calendar
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -264,7 +264,10 @@ fun CalendarScreen(
             }
         }
     ) { padding ->
-        Column(modifier = Modifier.fillMaxSize().padding(padding).padding(16.dp)) {
+        // verticalScroll so the whole month (a 6-row grid + stats cards + legend) stays reachable on
+        // shorter screens / larger font scales, and the trailing Spacer keeps the last week clear of the
+        // "+" FAB instead of letting it float on top of the final row.
+        Column(modifier = Modifier.fillMaxSize().padding(padding).padding(16.dp).verticalScroll(rememberScrollState())) {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Card(
                     modifier = Modifier.weight(1f),
@@ -331,36 +334,45 @@ fun CalendarScreen(
             val daysInMonth = yearMonth.lengthOfMonth()
             val firstDayOffset = (firstOfMonth.dayOfWeek.value % 7) // Sunday=0..Saturday=6 (dayOfWeek.value: Mon=1..Sun=7)
 
-            LazyVerticalGrid(columns = GridCells.Fixed(7), modifier = Modifier.padding(top = 12.dp)) {
-                items(listOf("S", "M", "T", "W", "T", "F", "S")) { label ->
-                    Box(modifier = Modifier.aspectRatio(1f), contentAlignment = Alignment.Center) {
-                        Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+            // A plain Column of weighted Rows (not a LazyVerticalGrid) so the whole month can live inside
+            // the outer verticalScroll above - a lazy grid has an unbounded scroll axis and can't. The
+            // month is at most 6 rows (+ header), so there's nothing to lazily virtualize anyway.
+            Column(modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    listOf("S", "M", "T", "W", "T", "F", "S").forEach { label ->
+                        Box(modifier = Modifier.weight(1f).aspectRatio(1f), contentAlignment = Alignment.Center) {
+                            Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                        }
                     }
                 }
-                items(firstDayOffset) {
-                    Box(modifier = Modifier.aspectRatio(1f))
-                }
-                items(daysInMonth) { index ->
-                    val day = firstOfMonth.plusDays(index.toLong())
-                    val minutes = minutesPerDay[day] ?: 0L
-                    val hasTogetherTime = day in minutesPerDay
-                    val hasPhoto = day in daysWithPhotos
-                    val hasManualEntry = day in daysWithManualEntry
-                    val hasNote = day in daysWithNotes
-                    val hasMilestone = milestones.any { milestoneMatchesDay(it, day) }
-                    val isStreakHighlight = highlightRange != null &&
-                        !day.isBefore(highlightRange.first) && !day.isAfter(highlightRange.second)
-                    DayCell(
-                        day = day,
-                        hasTogetherTime = hasTogetherTime,
-                        hasPhoto = hasPhoto,
-                        hasManualEntry = hasManualEntry,
-                        hasNote = hasNote,
-                        hasMilestone = hasMilestone,
-                        isToday = day == logicalToday,
-                        isStreakHighlight = isStreakHighlight,
-                        onClick = { selectedDay = day }
-                    )
+                val totalCells = firstDayOffset + daysInMonth
+                val weekCount = (totalCells + 6) / 7
+                for (week in 0 until weekCount) {
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        for (dow in 0 until 7) {
+                            val dayNumber = week * 7 + dow - firstDayOffset
+                            if (dayNumber < 0 || dayNumber >= daysInMonth) {
+                                Box(modifier = Modifier.weight(1f).aspectRatio(1f))
+                            } else {
+                                val day = firstOfMonth.plusDays(dayNumber.toLong())
+                                val isStreakHighlight = highlightRange != null &&
+                                    !day.isBefore(highlightRange.first) && !day.isAfter(highlightRange.second)
+                                Box(modifier = Modifier.weight(1f)) {
+                                    DayCell(
+                                        day = day,
+                                        hasTogetherTime = day in minutesPerDay,
+                                        hasPhoto = day in daysWithPhotos,
+                                        hasManualEntry = day in daysWithManualEntry,
+                                        hasNote = day in daysWithNotes,
+                                        hasMilestone = milestones.any { milestoneMatchesDay(it, day) },
+                                        isToday = day == logicalToday,
+                                        isStreakHighlight = isStreakHighlight,
+                                        onClick = { selectedDay = day }
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -385,6 +397,8 @@ fun CalendarScreen(
                     )
                 }
             }
+            // Clears the "+" FAB so the last week row is never hidden behind it when the month is scrolled.
+            Spacer(Modifier.height(88.dp))
         }
     }
 
@@ -419,7 +433,10 @@ fun CalendarScreen(
             // single day"/"Together since" cards), where the missing year made the title ambiguous.
             title = { Text(DateFormats.formatDateWithWeekdayLong(day)) },
             text = {
-                Column {
+                // Scrollable: with a note field (keyboard up), several session rows, a partner's note and a
+                // photos row, the body can exceed the dialog's max height and clip the Save note / edit /
+                // "View photos" controls - an AlertDialog text slot does not scroll on its own.
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                     // BUG fix (user-reported): shown first - a milestone is the more notable fact about
                     // this day than the plain hours/minutes line below it.
                     milestonesForDay.forEach { milestone ->
@@ -466,20 +483,14 @@ fun CalendarScreen(
                                 // genuine BLE-detected session is the app's real historical record and
                                 // must stay untouchable, so neither icon is even rendered for it.
                                 if (s.isManual) {
-                                    IconButton(
-                                        onClick = { sessionPendingEdit = s.manualSession },
-                                        modifier = Modifier.size(32.dp)
-                                    ) {
+                                    IconButton(onClick = { sessionPendingEdit = s.manualSession }) {
                                         Icon(
                                             imageVector = Icons.Filled.Edit,
                                             contentDescription = "Edit this entry",
                                             modifier = Modifier.size(18.dp)
                                         )
                                     }
-                                    IconButton(
-                                        onClick = { sessionPendingDelete = s.manualSession },
-                                        modifier = Modifier.size(32.dp)
-                                    ) {
+                                    IconButton(onClick = { sessionPendingDelete = s.manualSession }) {
                                         Icon(
                                             imageVector = Icons.Filled.Delete,
                                             contentDescription = "Delete this entry",

@@ -130,7 +130,9 @@ fun ManualEntriesScreen(onBack: () -> Unit) {
         } else {
             LazyColumn(
                 modifier = Modifier.fillMaxSize().padding(padding),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+                // Bottom inset clears the Add-entry FAB so the last row's edit/delete icons are never
+                // hidden behind it (a FAB is ~56dp + 16dp margin; 88dp leaves the last item fully tappable).
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 88.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 item {
