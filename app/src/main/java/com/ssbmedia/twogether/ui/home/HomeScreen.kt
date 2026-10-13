@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -725,6 +726,7 @@ fun HomeScreen(
     // genuinely cover the top bar too.
     Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
+        contentWindowInsets = WindowInsets(0),
         topBar = {
             CenterAlignedTopAppBar(
                 title = { Text("Twogether", fontWeight = FontWeight.Bold) },

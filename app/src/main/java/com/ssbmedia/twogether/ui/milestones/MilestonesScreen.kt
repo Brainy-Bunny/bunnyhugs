@@ -1,5 +1,6 @@
 package com.ssbmedia.twogether.ui.milestones
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -224,6 +226,7 @@ fun MilestonesScreen(
     }
 
     Scaffold(
+        contentWindowInsets = WindowInsets(0),
         topBar = {
             CenterAlignedTopAppBar(
                 title = { Text("Milestones") },
@@ -722,6 +725,9 @@ private fun MilestoneRetrospective(
     onDismiss: () -> Unit,
     onOpenCalendar: (jumpToEpochDay: Long) -> Unit = {}
 ) {
+    // This retrospective is a full-screen Box overlay (not a Dialog), so without this the system Back
+    // gesture/button would pop the whole Milestones screen instead of just closing the overlay.
+    BackHandler { onDismiss() }
     // "Throughout the years": every Moment whose takenAt falls on this same month+day, in any year,
     // grouped by year - the whole point being it works even across many years of photos.
     val settings by ServiceLocator.settingsStore.settings.collectAsState(initial = com.ssbmedia.twogether.data.datastore.AppSettings())

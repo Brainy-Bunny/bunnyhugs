@@ -3,25 +3,29 @@ package com.ssbmedia.twogether.ui.dateideas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.FloatingActionButton
@@ -274,6 +278,7 @@ fun OurListsScreen(
     }
 
     Scaffold(
+        contentWindowInsets = WindowInsets(0),
         topBar = {
             CenterAlignedTopAppBar(
                 title = { Text("Our Lists") },
@@ -497,6 +502,7 @@ private fun ListCategoryCard(
     onRenameIdea: (DateIdea) -> Unit,
     onReminderIdeaClick: (DateIdea) -> Unit
 ) {
+    var menuExpanded by remember { mutableStateOf(false) }
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.large
@@ -531,21 +537,10 @@ private fun ListCategoryCard(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                // UX-FIX-PLAN.md Phase 3 item 19: renaming is allowed for every list, INCLUDING the
-                // default one - only its delete tombstone is specially blocked (see
-                // ListCategoryRepository.rename's own doc, "Any NON-delete update to it still applies
-                // normally").
-                IconButton(onClick = onRenameClick) {
-                    Icon(Icons.Filled.Edit, contentDescription = "Rename list")
-                }
-                // The default "Date Ideas" list is the permanent fallback DateIdeaRepository.reassignOrphans
-                // relies on always existing (see its doc) - deleting it would let a future orphaned idea get
-                // reassigned into a list that itself doesn't resolve, reproducing the exact "invisible
-                // forever" bug that mechanism exists to prevent. No delete affordance for it at all, rather
-                // than a tap that would silently no-op against ListCategoryRepository.delete's own guard.
-                // Item 24 (UX-FIX-PLAN.md): "remind me about this list every time we've been together
-                // X+ minutes" - tinted primary when a default reminder is already set, so the state is
-                // visible at a glance without opening the dialog.
+                // Reminder stays a direct icon because its tint shows, at a glance, whether a reminder is
+                // already set (Item 24: "remind me about this list every X+ min together"). Rename and
+                // Delete moved into an overflow menu - user-reported crowding: three icons + the chevron
+                // squeezed a longer list name down to two lines on a narrow phone.
                 IconButton(onClick = onReminderClick) {
                     Icon(
                         Icons.Filled.Notifications,
@@ -553,9 +548,24 @@ private fun ListCategoryCard(
                         tint = if (list.defaultRemindAfterTogetherMinutes != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                if (list.id != DEFAULT_LIST_ID) {
-                    IconButton(onClick = onDeleteClick) {
-                        Icon(Icons.Filled.Delete, contentDescription = "Delete list")
+                Box {
+                    IconButton(onClick = { menuExpanded = true }) {
+                        Icon(Icons.Filled.MoreVert, contentDescription = "More options")
+                    }
+                    DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                        // Renaming is allowed for every list, including the default one.
+                        DropdownMenuItem(
+                            text = { Text("Rename") },
+                            onClick = { menuExpanded = false; onRenameClick() }
+                        )
+                        // The default "Date Ideas" list is the permanent fallback reassignOrphans relies on
+                        // always existing (see ListCategoryRepository.delete's guard), so it has no delete.
+                        if (list.id != DEFAULT_LIST_ID) {
+                            DropdownMenuItem(
+                                text = { Text("Delete") },
+                                onClick = { menuExpanded = false; onDeleteClick() }
+                            )
+                        }
                     }
                 }
                 Icon(

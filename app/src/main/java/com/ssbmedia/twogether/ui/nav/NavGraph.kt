@@ -1,6 +1,10 @@
 package com.ssbmedia.twogether.ui.nav
 
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.systemBars
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -164,6 +168,14 @@ fun TwogetherNavHost(
     }
 
     Scaffold(
+        // Edge-to-edge groundwork (no-op at targetSdk 34, where all insets are 0): this OUTER Scaffold has
+        // no topBar, so it must NOT consume the status-bar (top) inset - each screen's own
+        // CenterAlignedTopAppBar owns that. It owns only the BOTTOM inset (the bottom nav on tab routes, the
+        // system nav-bar inset on non-tab routes). Combined with contentWindowInsets = WindowInsets(0) on
+        // every inner Scaffold, this avoids the double status-bar/nav-bar inset once edge-to-edge is enabled.
+        // When targetSdk is bumped to 35, this still needs a real device pass (and the non-Scaffold screens -
+        // Pairing, PinLock, Camera, the Moments viewer - need their own inset handling).
+        contentWindowInsets = WindowInsets.systemBars.only(WindowInsetsSides.Bottom),
         bottomBar = {
             if (bottomItems.any { it.screen.route == currentRoute }) {
                 NavigationBar {
